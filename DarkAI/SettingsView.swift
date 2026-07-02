@@ -364,6 +364,13 @@ struct SettingsView: View {
                                     .font(.system(size: 14, weight: .bold))
                                     .foregroundColor(.white)
                                 Spacer()
+                                Text(personalityManager.databaseSizeString)
+                                    .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                    .foregroundColor(Theme.accentRose)
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 4)
+                                    .background(Theme.accentRose.opacity(0.15))
+                                    .cornerRadius(6)
                             }
                             
                             Text("DarkAI slowly learns your speech patterns and builds a unique persona over time. Resetting will erase all learned personality traits for the currently loaded model.")

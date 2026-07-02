@@ -59,7 +59,38 @@ class MemoryManager: ObservableObject {
         matchPrefix(lower, message, prefix: "i'm from ", format: { "User is from \($0)." })
         matchPrefix(lower, message, prefix: "i am from ", format: { "User is from \($0)." })
         matchPrefix(lower, message, prefix: "i'm based in ", format: { "User is based in \($0)." })
-        matchPrefix(lower, message, prefix: "i am ", format: { val in val.count < 60 ? "User is \(val)." : nil })
+        
+        // — Family & Pets —
+        matchPrefix(lower, message, prefix: "my wife is ", format: { "User's wife is \($0)." })
+        matchPrefix(lower, message, prefix: "my husband is ", format: { "User's husband is \($0)." })
+        matchPrefix(lower, message, prefix: "my partner is ", format: { "User's partner is \($0)." })
+        matchPrefix(lower, message, prefix: "my girlfriend is ", format: { "User's girlfriend is \($0)." })
+        matchPrefix(lower, message, prefix: "my boyfriend is ", format: { "User's boyfriend is \($0)." })
+        matchPrefix(lower, message, prefix: "my son is ", format: { "User's son is \($0)." })
+        matchPrefix(lower, message, prefix: "my daughter is ", format: { "User's daughter is \($0)." })
+        matchPrefix(lower, message, prefix: "my dog is ", format: { "User's dog is \($0)." })
+        matchPrefix(lower, message, prefix: "my cat is ", format: { "User's cat is \($0)." })
+        matchPrefix(lower, message, prefix: "my pet is ", format: { "User's pet is \($0)." })
+
+        // — Ownership & Tech —
+        matchPrefix(lower, message, prefix: "i have a ", format: { "User has a \($0)." })
+        matchPrefix(lower, message, prefix: "i have an ", format: { "User has an \($0)." })
+        matchPrefix(lower, message, prefix: "i own a ", format: { "User owns a \($0)." })
+        matchPrefix(lower, message, prefix: "my car is a ", format: { "User's car is a \($0)." })
+        matchPrefix(lower, message, prefix: "my computer is a ", format: { "User's computer is a \($0)." })
+        matchPrefix(lower, message, prefix: "my phone is a ", format: { "User's phone is a \($0)." })
+
+        // — Skills & Education —
+        matchPrefix(lower, message, prefix: "i know how to ", format: { "User knows how to \($0)." })
+        matchPrefix(lower, message, prefix: "i am learning ", format: { "User is learning \($0)." })
+        matchPrefix(lower, message, prefix: "i'm learning ", format: { "User is learning \($0)." })
+        matchPrefix(lower, message, prefix: "i am studying ", format: { "User is studying \($0)." })
+        matchPrefix(lower, message, prefix: "i'm studying ", format: { "User is studying \($0)." })
+        matchPrefix(lower, message, prefix: "my job is ", format: { "User's job is \($0)." })
+        
+        // — Health & Traits —
+        matchPrefix(lower, message, prefix: "i am allergic to ", format: { "User is allergic to \($0)." })
+        matchPrefix(lower, message, prefix: "i'm allergic to ", format: { "User is allergic to \($0)." })
 
         // — Likes / Dislikes —
         matchPrefix(lower, message, prefix: "i love ", format: { "User loves \($0)." })
@@ -76,6 +107,34 @@ class MemoryManager: ObservableObject {
         matchPrefix(lower, message, prefix: "i always ", format: { val in val.count < 80 ? "User always \(val)." : nil })
         matchPrefix(lower, message, prefix: "i usually ", format: { val in val.count < 80 ? "User usually \(val)." : nil })
         matchPrefix(lower, message, prefix: "i never ", format: { val in val.count < 80 ? "User never \(val)." : nil })
+
+        // — Plans & To-Dos —
+        matchPrefix(lower, message, prefix: "i plan to ", format: { "User plans to \($0)." })
+        matchPrefix(lower, message, prefix: "i'm planning to ", format: { "User is planning to \($0)." })
+        matchPrefix(lower, message, prefix: "i am planning to ", format: { "User is planning to \($0)." })
+        matchPrefix(lower, message, prefix: "i want to ", format: { "User wants to \($0)." })
+        matchPrefix(lower, message, prefix: "i'm going to ", format: { "User is going to \($0)." })
+        matchPrefix(lower, message, prefix: "i am going to ", format: { "User is going to \($0)." })
+        matchPrefix(lower, message, prefix: "i have to ", format: { "User has to \($0)." })
+        matchPrefix(lower, message, prefix: "i need to ", format: { "User needs to \($0)." })
+        matchPrefix(lower, message, prefix: "i must ", format: { "User must \($0)." })
+        matchPrefix(lower, message, prefix: "i've got to ", format: { "User has got to \($0)." })
+        matchPrefix(lower, message, prefix: "i should ", format: { "User should \($0)." })
+        
+        // — Interests & Hobbies —
+        matchPrefix(lower, message, prefix: "i'm interested in ", format: { "User is interested in \($0)." })
+        matchPrefix(lower, message, prefix: "i am interested in ", format: { "User is interested in \($0)." })
+        matchPrefix(lower, message, prefix: "i'm fascinated by ", format: { "User is fascinated by \($0)." })
+        matchPrefix(lower, message, prefix: "i am fascinated by ", format: { "User is fascinated by \($0)." })
+        matchPrefix(lower, message, prefix: "my hobby is ", format: { "User's hobby is \($0)." })
+        matchPrefix(lower, message, prefix: "i collect ", format: { "User collects \($0)." })
+        
+        // — Past & History —
+        matchPrefix(lower, message, prefix: "i went to ", format: { "User went to \($0)." })
+        matchPrefix(lower, message, prefix: "i used to ", format: { "User used to \($0)." })
+        matchPrefix(lower, message, prefix: "i grew up in ", format: { "User grew up in \($0)." })
+        matchPrefix(lower, message, prefix: "i studied at ", format: { "User studied at \($0)." })
+        matchPrefix(lower, message, prefix: "i graduated from ", format: { "User graduated from \($0)." })
 
         // — Favorite X is Y pattern —
         if let range = lower.range(of: "my favorite ") {

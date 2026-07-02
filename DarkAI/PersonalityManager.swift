@@ -23,6 +23,22 @@ class PersonalityManager: ObservableObject {
         }
     }
     
+    var databaseSizeString: String {
+        guard let data = UserDefaults.standard.data(forKey: storageKey) else {
+            return "0 B"
+        }
+        let bytes = Double(data.count)
+        if bytes < 1024 {
+            return "\(Int(bytes)) B"
+        } else if bytes < 1024 * 1024 {
+            return String(format: "%.1f KB", bytes / 1024)
+        } else if bytes < 1024 * 1024 * 1024 {
+            return String(format: "%.2f MB", bytes / (1024 * 1024))
+        } else {
+            return String(format: "%.2f GB", bytes / (1024 * 1024 * 1024))
+        }
+    }
+    
     func resetPersonality(for modelName: String) {
         modelPersonalities.removeValue(forKey: modelName)
         savePersonalities()

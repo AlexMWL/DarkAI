@@ -183,7 +183,9 @@ actor LlamaRunner {
 
         let maxPromptTokens = max(1, nCtxTokens - min(maxTokens, nCtxTokens / 2))
         if promptTokens.count > maxPromptTokens {
-            LogManager.shared.log("LlamaRunner: Warning - Prompt tokens (\(promptTokens.count)) exceed safe threshold (\(maxPromptTokens)).")
+            LogManager.shared.log("LlamaRunner: Warning - Prompt tokens (\(promptTokens.count)) exceed safe threshold (\(maxPromptTokens)). Truncating.")
+            let bos = promptTokens[0]
+            promptTokens = [bos] + Array(promptTokens.suffix(maxPromptTokens - 1))
         }
 
         // 2. Clear KV cache to prevent crashes across multiple prompts
@@ -191,25 +193,34 @@ actor LlamaRunner {
             llama_memory_clear(mem, true)
         }
 
-        // 3. Prefill (evaluate the prompt)
-        var batch = llama_batch_init(Int32(promptTokens.count), 0, 1)
+        // 3. Prefill (evaluate the prompt) in chunks of n_batch
+        let batchSize = Int(llama_n_batch(ctx))
+        var batch = llama_batch_init(Int32(batchSize), 0, 1)
         defer { llama_batch_free(batch) }
-
-        for (i, token) in promptTokens.enumerated() {
-            batch.token[i] = token
-            batch.pos[i] = Int32(i)
-            batch.n_seq_id[i] = 1
-            if let seqIdPtr = batch.seq_id[i] {
-                seqIdPtr.pointee = 0
+        
+        var batchStart = 0
+        while batchStart < promptTokens.count {
+            let chunkEnd = min(promptTokens.count, batchStart + batchSize)
+            let chunkLen = chunkEnd - batchStart
+            
+            for i in 0..<chunkLen {
+                let tokenIdx = batchStart + i
+                batch.token[i] = promptTokens[tokenIdx]
+                batch.pos[i] = Int32(tokenIdx)
+                batch.n_seq_id[i] = 1
+                if let seqIdPtr = batch.seq_id[i] {
+                    seqIdPtr.pointee = 0
+                }
+                batch.logits[i] = (tokenIdx == promptTokens.count - 1) ? 1 : 0
             }
-            batch.logits[i] = (i == promptTokens.count - 1) ? 1 : 0
-        }
-        batch.n_tokens = Int32(promptTokens.count)
-
-        if llama_decode(ctx, batch) != 0 {
-            continuation.yield("[Error: prefill decode failed]")
-            continuation.finish()
-            return
+            batch.n_tokens = Int32(chunkLen)
+            
+            if llama_decode(ctx, batch) != 0 {
+                continuation.yield("[Error: prefill decode failed]")
+                continuation.finish()
+                return
+            }
+            batchStart += batchSize
         }
 
         // 4. Autoregressive decoding with temperature + top-p sampling to prevent repetition

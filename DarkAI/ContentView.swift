@@ -291,16 +291,15 @@ struct ContentView: View {
                 .foregroundColor(Theme.accent)
                 .neonGlow(color: Theme.accent, radius: 10)
             
-            Text("LOCAL RUNNER v5.7")
+            Text("LOCAL RUNNER v5.7.3")
                 .font(.system(size: 15, weight: .bold))
                 .foregroundColor(.white)
                 .kerning(1.5)
             
             VStack(alignment: .leading, spacing: 10) {
-                Text("• Fully local, offline text generation.")
-                Text("• Bypasses all standard App Store constraints.")
-                Text("• Document sharing allows GGUF file imports.")
-                Text("• Built-in memory safety limits validator.")
+                Text("• Local & offline text generation active.")
+                Text("• RAG document storage active.")
+                Text("• Memory safety limits validator active.")
             }
             .font(.system(size: 12))
             .foregroundColor(Theme.textSecondary)
@@ -364,24 +363,26 @@ struct ContentView: View {
     @ViewBuilder
     private func filterThoughts(from text: String) -> String {
         var filtered = text
-        let tags = ["channel thoughts", "think", "thought", "thinking"]
+        let tags = ["channel thoughts", "think", "thought", "thinking", "|channel>thought", "channel>thought", "self-correction", "self_correction", "correction"]
         for tag in tags {
-            if let startRange = filtered.range(of: "<\(tag)", options: .caseInsensitive) {
+            while let startRange = filtered.range(of: "<\(tag)", options: .caseInsensitive) {
                 if let endRange = filtered.range(of: "</\(tag)>", options: .caseInsensitive) {
                     filtered.removeSubrange(startRange.lowerBound..<endRange.upperBound)
                 } else {
                     filtered.removeSubrange(startRange.lowerBound..<filtered.endIndex)
+                    break
                 }
             }
         }
         
         let plaintextTags = ["Thinking Process:", "Thought Process:"]
         for pt in plaintextTags {
-            if let startRange = filtered.range(of: pt, options: .caseInsensitive) {
+            while let startRange = filtered.range(of: pt, options: .caseInsensitive) {
                 if let endRange = filtered.range(of: "Response:", options: .caseInsensitive) {
                     filtered.removeSubrange(startRange.lowerBound..<endRange.upperBound)
                 } else {
                     filtered.removeSubrange(startRange.lowerBound..<filtered.endIndex)
+                    break
                 }
             }
         }
@@ -410,9 +411,12 @@ struct ContentView: View {
                     .background(Theme.border.opacity(0.4))
                     .clipShape(Circle())
                 
-                Text(filterThoughts(from: message.text))
+                let filteredText = filterThoughts(from: message.text)
+                let isThinking = filteredText.isEmpty && llmManager.isGenerating
+                
+                Text(isThinking ? "Thinking..." : (filteredText.isEmpty ? "..." : filteredText))
                     .font(.system(size: 14, design: .monospaced))
-                    .foregroundColor(Theme.textPrimary)
+                    .foregroundColor(isThinking ? Theme.textSecondary : Theme.textPrimary)
                     .padding(.horizontal, 14)
                     .padding(.vertical, 10)
                     .background(Theme.cardBackground)
@@ -486,7 +490,8 @@ struct ContentView: View {
             }
             
             // Text Entry
-            TextField(isModelActive ? "Execute prompt..." : "Model unloaded...", text: $inputText)
+            TextField(isModelActive ? "Execute prompt..." : "Model unloaded...", text: $inputText, axis: .vertical)
+                .lineLimit(1...8)
                 .font(.system(size: 14))
                 .foregroundColor(.white)
                 .padding(.horizontal, 14)
