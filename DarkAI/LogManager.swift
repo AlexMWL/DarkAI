@@ -1,10 +1,3 @@
-//
-//  LogManager.swift
-//  DarkAI
-//
-//  Created by Antigravity on 7/1/26.
-//
-
 import Foundation
 import Combine
 

@@ -1,10 +1,3 @@
-//
-//  ContentView.swift
-//  DarkAI
-//
-//  Created by VMware on 6/28/26.
-//
-
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -13,12 +6,16 @@ struct ContentView: View {
     @StateObject private var memoryManager = MemoryManager()
     @StateObject private var ragManager = RAGManager()
     @StateObject private var conversationManager = ConversationManager()
+    @StateObject private var personalityManager = PersonalityManager()
     
     @AppStorage("customInstructions") private var customInstructions: String = "You are DarkAI, a local assistant. Respond with precise, helpful answers."
     @State private var enableRAG = true
     @State private var enableMemories = true
     
     @State private var showFileImporter = false
+    @State private var showAutoLoadAlert = false
+    @State private var pendingAttachmentName: String? = nil
+    @State private var pendingAttachmentText: String? = nil
     
     @State private var inputText: String = ""
     @State private var showSettings = false
@@ -29,9 +26,6 @@ struct ContentView: View {
     
     var body: some View {
         ZStack {
-            GlitchBackgroundView()
-                .ignoresSafeArea()
-            
             // MAIN VIEW
             VStack(spacing: 0) {
                 
@@ -81,6 +75,7 @@ struct ContentView: View {
                 // Chat input area
                 inputArea
             }
+            .background(GlitchBackgroundView().ignoresSafeArea())
             .blur(radius: showDrawer ? 4 : 0)
             .disabled(showDrawer)
             
@@ -104,6 +99,7 @@ struct ContentView: View {
                 llmManager: llmManager,
                 memoryManager: memoryManager,
                 ragManager: ragManager,
+                personalityManager: personalityManager,
                 customInstructions: $customInstructions,
                 enableRAG: $enableRAG,
                 enableMemories: $enableMemories
@@ -128,6 +124,22 @@ struct ContentView: View {
             } else {
                 conversationManager.createConversation()
             }
+            
+            if llmManager.lastUsedModelPath != nil && llmManager.activeModelURL == nil {
+                showAutoLoadAlert = true
+            }
+        }
+        .alert(isPresented: $showAutoLoadAlert) {
+            Alert(
+                title: Text("Load Previous Model?"),
+                message: Text("Would you like to auto-load the last used model?"),
+                primaryButton: .default(Text("Load")) {
+                    if let path = llmManager.lastUsedModelPath {
+                        llmManager.loadModel(at: URL(fileURLWithPath: path))
+                    }
+                },
+                secondaryButton: .cancel(Text("No"))
+            )
         }
     }
     
@@ -279,7 +291,7 @@ struct ContentView: View {
                 .foregroundColor(Theme.accent)
                 .neonGlow(color: Theme.accent, radius: 10)
             
-            Text("LOCAL RUNNER v1.0")
+            Text("LOCAL RUNNER v5.7")
                 .font(.system(size: 15, weight: .bold))
                 .foregroundColor(.white)
                 .kerning(1.5)
@@ -350,6 +362,33 @@ struct ContentView: View {
     
     // Bubble UI
     @ViewBuilder
+    private func filterThoughts(from text: String) -> String {
+        var filtered = text
+        let tags = ["channel thoughts", "think", "thought", "thinking"]
+        for tag in tags {
+            if let startRange = filtered.range(of: "<\(tag)", options: .caseInsensitive) {
+                if let endRange = filtered.range(of: "</\(tag)>", options: .caseInsensitive) {
+                    filtered.removeSubrange(startRange.lowerBound..<endRange.upperBound)
+                } else {
+                    filtered.removeSubrange(startRange.lowerBound..<filtered.endIndex)
+                }
+            }
+        }
+        
+        let plaintextTags = ["Thinking Process:", "Thought Process:"]
+        for pt in plaintextTags {
+            if let startRange = filtered.range(of: pt, options: .caseInsensitive) {
+                if let endRange = filtered.range(of: "Response:", options: .caseInsensitive) {
+                    filtered.removeSubrange(startRange.lowerBound..<endRange.upperBound)
+                } else {
+                    filtered.removeSubrange(startRange.lowerBound..<filtered.endIndex)
+                }
+            }
+        }
+        
+        return filtered.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     private func messageBubble(for message: ChatMessage) -> some View {
         HStack(alignment: .top, spacing: 12) {
             if message.isUser {
@@ -371,7 +410,7 @@ struct ContentView: View {
                     .background(Theme.border.opacity(0.4))
                     .clipShape(Circle())
                 
-                Text(message.text)
+                Text(filterThoughts(from: message.text))
                     .font(.system(size: 14, design: .monospaced))
                     .foregroundColor(Theme.textPrimary)
                     .padding(.horizontal, 14)
@@ -390,19 +429,44 @@ struct ContentView: View {
     // Input Area View
     @ViewBuilder
     private var inputArea: some View {
-        HStack(spacing: 10) {
+        VStack(alignment: .leading, spacing: 8) {
             
-            // Upload Document / Image — only shown when model supports OCR/Vision
-            if llmManager.modelSupportsVision {
-                Button(action: { showFileImporter = true }) {
-                    Image(systemName: "paperclip")
+            // Pending Attachment Pill
+            if let attName = pendingAttachmentName {
+                HStack {
+                    Image(systemName: "doc.text.image")
                         .foregroundColor(Theme.accentCyan)
-                        .font(.system(size: 18))
-                        .frame(width: 40, height: 40)
-                        .background(Theme.accentCyan.opacity(0.15))
-                        .clipShape(Circle())
-                        .overlay(Circle().stroke(Theme.accentCyan.opacity(0.4), lineWidth: 1))
+                    Text(attName)
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundColor(.white)
+                        .lineLimit(1)
+                    Spacer()
+                    Button(action: {
+                        pendingAttachmentName = nil
+                        pendingAttachmentText = nil
+                    }) {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundColor(.gray)
+                    }
                 }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(Theme.cardBackground)
+                .cornerRadius(12)
+                .overlay(RoundedRectangle(cornerRadius: 12).stroke(Theme.border, lineWidth: 1))
+            }
+            
+            HStack(spacing: 10) {
+            
+            // Universal OCR / Vision Upload Button (Always available for all models via iOS Native Vision)
+            Button(action: { showFileImporter = true }) {
+                Image(systemName: "paperclip")
+                    .foregroundColor(Theme.accentCyan)
+                    .font(.system(size: 18))
+                    .frame(width: 40, height: 40)
+                    .background(Theme.accentCyan.opacity(0.15))
+                    .clipShape(Circle())
+                    .overlay(Circle().stroke(Theme.accentCyan.opacity(0.4), lineWidth: 1))
             }
             
             // Stealth Mode Toggle
@@ -448,6 +512,7 @@ struct ContentView: View {
                     .neonGlow(color: isModelActive ? Theme.accent : .clear, radius: 4)
             }
             .disabled(!isModelActive && !llmManager.isGenerating)
+            }
         }
         .padding()
         .background(Color.black.opacity(0.9))
@@ -578,33 +643,53 @@ struct ContentView: View {
         }
         
         let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return }
+        guard !text.isEmpty || pendingAttachmentText != nil else { return }
         
         inputText = ""
         
-        // 1. Capture history BEFORE adding the new user message to avoid duplication
         let history = conversationManager.activeConversation?.messages ?? []
         
-        // 2. Add user message to the conversation
-        conversationManager.addMessageToActive(isUser: true, text: text)
-        
-        // 3. Extract memories (if enabled)
-        if enableMemories {
-            memoryManager.extractMemories(from: text)
+        var promptText = text
+        if let attachmentName = pendingAttachmentName, let attachmentText = pendingAttachmentText {
+            let fileInfo = "\n\n[ATTACHED FILE: \(attachmentName)]\n\(attachmentText)\n[/ATTACHED FILE]"
+            if text.isEmpty {
+                promptText = "Please analyze the attached file." + fileInfo
+            } else {
+                promptText = text + fileInfo
+            }
+            
+            conversationManager.addMessageToActive(isUser: true, text: text.isEmpty ? "[Sent Attachment: \(attachmentName)]" : text + "\n[Sent Attachment: \(attachmentName)]")
+            
+            pendingAttachmentName = nil
+            pendingAttachmentText = nil
+        } else {
+            conversationManager.addMessageToActive(isUser: true, text: text)
         }
         
-        // 4. Retrieve context
+        if enableMemories && !text.isEmpty {
+            memoryManager.extractMemories(from: text)
+            if let activeModel = llmManager.activeModelURL?.lastPathComponent {
+                personalityManager.analyzeUserMessage(text, modelName: activeModel)
+            }
+        }
+        
         let ragContext = enableRAG ? ragManager.retrieveRelevantContext(query: text) : ""
         let memoriesContext = enableMemories ? memoryManager.getFormattedMemoriesForContext() : ""
         
-        // 5. Create empty assistant message for streaming
         conversationManager.addMessageToActive(isUser: false, text: "")
         
-        // 6. Trigger generation
+        var finalSystemPrompt = customInstructions
+        if let activeModel = llmManager.activeModelURL?.lastPathComponent {
+            let personality = personalityManager.getPersonality(for: activeModel)
+            if !personality.isEmpty {
+                finalSystemPrompt += "\n\nYour Unique Personality: " + personality
+            }
+        }
+        
         llmManager.generateResponse(
-            prompt: text,
+            prompt: promptText,
             history: history,
-            systemPrompt: customInstructions,
+            systemPrompt: finalSystemPrompt,
             memoriesContext: memoriesContext,
             ragContext: ragContext
         ) { token in

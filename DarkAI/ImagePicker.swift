@@ -1,10 +1,3 @@
-//
-//  ImagePicker.swift
-//  DarkAI
-//
-//  Created by Antigravity on 7/1/26.
-//
-
 import SwiftUI
 import PhotosUI
 import UniformTypeIdentifiers

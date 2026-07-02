@@ -1,10 +1,3 @@
-//
-//  DocumentProcessor.swift
-//  DarkAI
-//
-//  Created by Antigravity on 6/29/26.
-//
-
 import Foundation
 import UIKit
 import Vision
@@ -74,27 +67,46 @@ class DocumentProcessor {
         
         return try await withCheckedThrowingContinuation { continuation in
             let requestHandler = VNImageRequestHandler(cgImage: cgImage, options: [:])
-            let request = VNRecognizeTextRequest { (request, error) in
-                if let error = error {
-                    continuation.resume(throwing: error)
-                    return
-                }
-                
-                guard let observations = request.results as? [VNRecognizedTextObservation] else {
-                    continuation.resume(throwing: ProcessError.textExtractionFailed)
-                    return
-                }
-                
-                let extracted = observations.compactMap { $0.topCandidates(1).first?.string }.joined(separator: "\n")
-                continuation.resume(returning: extracted)
-            }
             
-            // Accurate recognition over fast
-            request.recognitionLevel = .accurate
-            request.usesLanguageCorrection = true
+            // 1. Text Recognition
+            let textRequest = VNRecognizeTextRequest()
+            textRequest.recognitionLevel = .accurate
+            textRequest.usesLanguageCorrection = true
+            
+            // 2. Image Classification
+            let classifyRequest = VNClassifyImageRequest()
             
             do {
-                try requestHandler.perform([request])
+                try requestHandler.perform([textRequest, classifyRequest])
+                
+                var result = ""
+                
+                // Process Classification
+                if let classObservations = classifyRequest.results as? [VNClassificationObservation] {
+                    // Get top 5 high-confidence labels
+                    let topLabels = classObservations
+                        .filter { $0.confidence > 0.6 }
+                        .prefix(5)
+                        .map { $0.identifier }
+                    
+                    if !topLabels.isEmpty {
+                        result += "Image Classification Tags: " + topLabels.joined(separator: ", ") + "\n\n"
+                    }
+                }
+                
+                // Process Text
+                if let textObservations = textRequest.results as? [VNRecognizedTextObservation] {
+                    let extracted = textObservations.compactMap { $0.topCandidates(1).first?.string }.joined(separator: "\n")
+                    if !extracted.isEmpty {
+                        result += "Extracted Text (OCR):\n" + extracted
+                    }
+                }
+                
+                if result.isEmpty {
+                    continuation.resume(returning: "No recognizable text or objects found.")
+                } else {
+                    continuation.resume(returning: result.trimmingCharacters(in: .whitespacesAndNewlines))
+                }
             } catch {
                 continuation.resume(throwing: error)
             }

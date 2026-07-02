@@ -1,10 +1,3 @@
-//
-//  SettingsView.swift
-//  DarkAI
-//
-//  Created by Antigravity on 6/28/26.
-//
-
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -13,6 +6,7 @@ struct SettingsView: View {
     @ObservedObject var llmManager: LLMManager
     @ObservedObject var memoryManager: MemoryManager
     @ObservedObject var ragManager: RAGManager
+    @ObservedObject var personalityManager: PersonalityManager
     
     @Binding var customInstructions: String
     @Binding var enableRAG: Bool
@@ -21,6 +15,10 @@ struct SettingsView: View {
     @State private var importedModels: [URL] = []
     @State private var showModelImporter = false
     @State private var showDocImporter = false
+    @State private var showResetPersonalityAlert = false
+    
+    // Context Warning
+    @State private var showContextWarningPopup = false
     
     // Failsafe Modal States
     @State private var showFailsafePopup = false
@@ -123,6 +121,57 @@ struct SettingsView: View {
                             
                             VStack(alignment: .leading, spacing: 8) {
                                 HStack {
+                                    Text("Context Window Limit:")
+                                        .font(.system(size: 13))
+                                        .foregroundColor(Theme.textSecondary)
+                                    Spacer()
+                                    Text("\(llmManager.contextTokenLimit) tokens")
+                                        .font(.system(size: 13, weight: .bold, design: .monospaced))
+                                        .foregroundColor(Theme.accent)
+                                }
+                                
+                                GeometryReader { geo in
+                                    ZStack(alignment: .leading) {
+                                        Slider(value: Binding(
+                                            get: { Double(llmManager.contextTokenLimit) },
+                                            set: { llmManager.contextTokenLimit = Int($0) }
+                                        ), in: 2048...32768, step: 512, onEditingChanged: { editing in
+                                            if !editing {
+                                                if llmManager.contextTokenLimit > llmManager.safeContextLimit {
+                                                    showContextWarningPopup = true
+                                                }
+                                            }
+                                        })
+                                        .accentColor(Theme.accent)
+                                        
+                                        let totalRange = 32768.0 - 2048.0
+                                        let safeValue = Double(llmManager.safeContextLimit)
+                                        let percentage = max(0, min(1, (safeValue - 2048.0) / totalRange))
+                                        let thumbWidth: CGFloat = 28
+                                        let trackWidth = geo.size.width - thumbWidth
+                                        let xOffset = (trackWidth * percentage) + (thumbWidth / 2)
+                                        
+                                        Rectangle()
+                                            .fill(Color.orange)
+                                            .frame(width: 2, height: 12)
+                                            .offset(x: xOffset - 1, y: (geo.size.height - 12) / 2)
+                                            .allowsHitTesting(false)
+                                    }
+                                }
+                                .frame(height: 28)
+                                
+                                if llmManager.contextTokenLimit > llmManager.safeContextLimit {
+                                    Text("⚠️ Warning: Based on your device memory and the loaded model size, setting the context limit above \(llmManager.safeContextLimit) tokens risks an Out-Of-Memory crash.")
+                                        .font(.system(size: 11))
+                                        .foregroundColor(.orange)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                            }
+                            
+                            Divider().background(Theme.border)
+                            
+                            VStack(alignment: .leading, spacing: 8) {
+                                HStack {
                                     Text("Max Output Limit:")
                                         .font(.system(size: 13))
                                         .foregroundColor(Theme.textSecondary)
@@ -135,8 +184,40 @@ struct SettingsView: View {
                                 Slider(value: Binding(
                                     get: { Double(llmManager.maxTokens) },
                                     set: { llmManager.maxTokens = Int($0) }
-                                ), in: 64...2048, step: 64)
+                                ), in: 64...8192, step: 128)
                                 .accentColor(Theme.accent)
+                            }
+                            
+                            Divider().background(Theme.border)
+                            
+                            VStack(alignment: .leading, spacing: 8) {
+                                HStack {
+                                    Text("Temperature (Creativity):")
+                                        .font(.system(size: 13))
+                                        .foregroundColor(Theme.textSecondary)
+                                    Spacer()
+                                    if llmManager.chaosModeEnabled {
+                                        Text("CHAOS (2.50)")
+                                            .font(.system(size: 13, weight: .bold, design: .monospaced))
+                                            .foregroundColor(.red)
+                                    } else {
+                                        Text(String(format: "%.2f", llmManager.temperature))
+                                            .font(.system(size: 13, weight: .bold, design: .monospaced))
+                                            .foregroundColor(Theme.accent)
+                                    }
+                                }
+                                
+                                Slider(value: $llmManager.temperature, in: 0.0...2.0, step: 0.05)
+                                    .accentColor(llmManager.chaosModeEnabled ? .gray : Theme.accent)
+                                    .disabled(llmManager.chaosModeEnabled)
+                                    .opacity(llmManager.chaosModeEnabled ? 0.5 : 1.0)
+                                    
+                                Toggle(isOn: $llmManager.chaosModeEnabled) {
+                                    Text("Chaos Mode (Max Creativity)")
+                                        .font(.system(size: 13))
+                                        .foregroundColor(llmManager.chaosModeEnabled ? .red : Theme.textSecondary)
+                                }
+                                .toggleStyle(SwitchToggleStyle(tint: .red))
                             }
                         }
                         .glassCard(cornerRadius: 16)
@@ -274,6 +355,55 @@ struct SettingsView: View {
                         }
                         .glassCard(cornerRadius: 16)
                         
+                        // Personality Reset Section
+                        VStack(alignment: .leading, spacing: 12) {
+                            HStack {
+                                Image(systemName: "person.text.rectangle")
+                                    .foregroundColor(Theme.accentRose)
+                                Text("Personality Matrix")
+                                    .font(.system(size: 14, weight: .bold))
+                                    .foregroundColor(.white)
+                                Spacer()
+                            }
+                            
+                            Text("DarkAI slowly learns your speech patterns and builds a unique persona over time. Resetting will erase all learned personality traits for the currently loaded model.")
+                                .font(.system(size: 13))
+                                .foregroundColor(Theme.textSecondary)
+                                .lineSpacing(4)
+                            
+                            Button(action: {
+                                showResetPersonalityAlert = true
+                            }) {
+                                HStack {
+                                    Image(systemName: "trash")
+                                    Text("Reset Current Model's Personality")
+                                }
+                                .font(.system(size: 13, weight: .bold))
+                                .foregroundColor(.white)
+                                .padding(.vertical, 10)
+                                .frame(maxWidth: .infinity)
+                                .background(Theme.accentRose.opacity(0.2))
+                                .cornerRadius(8)
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 8)
+                                        .stroke(Theme.accentRose.opacity(0.5), lineWidth: 1)
+                                )
+                            }
+                            .alert("Reset Personality?", isPresented: $showResetPersonalityAlert) {
+                                Button("Cancel", role: .cancel) { }
+                                Button("Reset", role: .destructive) {
+                                    if let currentModel = llmManager.activeModelURL?.lastPathComponent {
+                                        personalityManager.resetPersonality(for: currentModel)
+                                    }
+                                }
+                            } message: {
+                                Text("This will erase all learned speech patterns for the currently loaded model. This action cannot be undone.")
+                            }
+                            .disabled(llmManager.activeModelURL == nil)
+                            .opacity(llmManager.activeModelURL == nil ? 0.5 : 1.0)
+                        }
+                        .glassCard(cornerRadius: 16)
+                        
                         // Sideload info section
                         VStack(spacing: 8) {
                             Text("SIDELOAD STATUS: SYSTEM BYPASS ACTIVE")
@@ -281,7 +411,7 @@ struct SettingsView: View {
                                 .foregroundColor(Theme.accentCyan)
                                 .kerning(1.5)
                             
-                            Text("This application has been compiled with increased memory limit entitlement, enabling addressable RAM access beyond standard App Store caps. Ensure 'Developer Mode' is enabled in iOS Settings.")
+                            Text("This application has been compiled with increased memory limit entitlement, enabling addressable RAM access beyond standard App Store caps.")
                                 .font(.system(size: 11))
                                 .foregroundColor(Theme.textSecondary)
                                 .multilineTextAlignment(.center)
@@ -445,6 +575,18 @@ struct SettingsView: View {
                     .foregroundColor(Theme.accentCyan)
                     .font(.system(size: 16, weight: .bold))
                 }
+            }
+            .alert(isPresented: $showContextWarningPopup) {
+                Alert(
+                    title: Text("High Context Warning"),
+                    message: Text("Based on your device memory and the loaded model size, setting the context limit above \(llmManager.safeContextLimit) tokens risks an Out-Of-Memory crash. Please consider lowering it."),
+                    primaryButton: .default(Text("Revert to Safe Limit")) {
+                        llmManager.contextTokenLimit = llmManager.safeContextLimit
+                    },
+                    secondaryButton: .destructive(Text("Ignore & Keep")) {
+                        // User chooses to keep the limit
+                    }
+                )
             }
             .fileImporter(
                 isPresented: $showModelImporter,

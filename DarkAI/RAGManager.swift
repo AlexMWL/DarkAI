@@ -1,10 +1,3 @@
-//
-//  RAGManager.swift
-//  DarkAI
-//
-//  Created by Antigravity on 6/28/26.
-//
-
 import Foundation
 import Combine
 import SwiftUI

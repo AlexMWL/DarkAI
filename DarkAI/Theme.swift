@@ -1,10 +1,3 @@
-//
-//  Theme.swift
-//  DarkAI
-//
-//  Created by Antigravity on 6/28/26.
-//
-
 import SwiftUI
 
 struct Theme {

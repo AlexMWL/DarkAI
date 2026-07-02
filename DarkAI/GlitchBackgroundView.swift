@@ -1,10 +1,3 @@
-//
-//  GlitchBackgroundView.swift
-//  DarkAI
-//
-//  Created by Antigravity on 6/29/26.
-//
-
 import SwiftUI
 import Combine
 

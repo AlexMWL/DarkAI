@@ -1,10 +1,3 @@
-//
-//  DarkAIApp.swift
-//  DarkAI
-//
-//  Created by VMware on 6/28/26.
-//
-
 import SwiftUI
 
 @main
