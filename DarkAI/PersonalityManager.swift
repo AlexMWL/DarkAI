@@ -5,6 +5,7 @@ class PersonalityManager: ObservableObject {
     @Published var modelPersonalities: [String: String] = [:]
     
     private let storageKey = "DarkAI_ModelPersonalities"
+    private var messageBatch: [String] = []
     
     init() {
         loadPersonalities()
@@ -45,12 +46,23 @@ class PersonalityManager: ObservableObject {
     }
     
     func getPersonality(for modelName: String) -> String {
-        return modelPersonalities[modelName] ?? "You are DarkAI, a highly capable assistant. Provide concise, helpful answers."
+        let profile = modelPersonalities[modelName] ?? ""
+        if profile.isEmpty {
+            return "You are DarkAI, a highly capable assistant. Provide concise, helpful answers."
+        }
+        
+        return """
+        CRITICAL INSTRUCTION: DROP all AI formalities. FORGET perfect grammar and standard punctuation. You MUST explicitly mimic the user's exact typos, lowercase letters, missing punctuation, and slang. Respond exactly as the user texts.
+
+        USER PROFILE & STYLE INSTRUCTIONS:
+        \(profile)
+        """
     }
     
-    func analyzeUserMessage(_ message: String, modelName: String) {
+    func analyzeUserMessage(_ message: String, modelName: String, llmManager: LLMManager?) {
         guard !modelName.isEmpty else { return }
         
+        // --- 1. Basic Fast Extraction (Main Thread) ---
         var currentProfile = modelPersonalities[modelName] ?? ""
         let lower = message.lowercased()
         let words = lower.components(separatedBy: .punctuationCharacters).joined().components(separatedBy: .whitespaces)
@@ -63,32 +75,13 @@ class PersonalityManager: ObservableObject {
             }
         }
         
-        // If the user's message is entirely lowercase and decently long, they are a casual typer.
-        let isAllLowercase = (message == lower) && message.trimmingCharacters(in: .whitespacesAndNewlines).count > 8
-        let hasEmojis = message.unicodeScalars.contains { $0.properties.isEmojiPresentation }
-        let isVerbose = message.count > 200
-        
         var newTraits: [String] = []
-        
-        if isAllLowercase && !currentProfile.contains("all-lowercase") {
-            newTraits.append("Type in a casual, all-lowercase style without strict capitalization.")
-        }
-        
-        if hasEmojis && !currentProfile.contains("emojis") {
-            newTraits.append("Use emojis occasionally to match the user's energy.")
-        }
-        
-        if isVerbose && !currentProfile.contains("verbose") && !currentProfile.contains("detailed") {
-            newTraits.append("Provide highly detailed and verbose answers since the user likes long explanations.")
-        }
-        
         for slang in usedSlang {
             if !currentProfile.contains("'\(slang)'") {
                 newTraits.append("Occasionally use casual slang like '\(slang)'.")
             }
         }
         
-        // Aggressively extract facts, plans, and preferences
         let sentences = message.components(separatedBy: CharacterSet(charactersIn: ".!?\n"))
         let aggressiveTriggers = ["i like ", "i am ", "i plan to ", "i need to ", "i want to ", "my favorite ", "i have ", "my goal is ", "i love ", "i hate ", "im ", "i'm "]
         
@@ -109,20 +102,53 @@ class PersonalityManager: ObservableObject {
         
         if !newTraits.isEmpty {
             if currentProfile.isEmpty {
-                currentProfile = "You are an adaptive AI. Mirror the user's speech patterns and remember these facts:\n- " + newTraits.joined(separator: "\n- ")
+                currentProfile = newTraits.joined(separator: "\n- ")
             } else {
                 currentProfile += "\n- " + newTraits.joined(separator: "\n- ")
             }
-            
-            // Limit the persona block so it doesn't consume the entire context window over months of chatting
-            // Increased from 15 to 50 for more aggressive retention
-            let lines = currentProfile.components(separatedBy: "\n")
-            if lines.count > 50 {
-                currentProfile = ([lines[0]] + lines.suffix(49)).joined(separator: "\n")
-            }
-            
             modelPersonalities[modelName] = currentProfile
             savePersonalities()
+        }
+        
+        // --- 2. Batching & Background Style Analysis ---
+        messageBatch.append(message)
+        
+        if messageBatch.count >= 3, let llm = llmManager {
+            let batchedText = messageBatch.joined(separator: "\n\n")
+            messageBatch.removeAll() // Clear batch
+            
+            Task {
+                let analysisPrompt = """
+                Analyze the following user messages strictly for their communication style. Look specifically for:
+                1. Typos and misspellings
+                2. Lack of capitalization or punctuation
+                3. Run-on sentences
+                4. Distinct slang or vocabulary
+                
+                Respond ONLY with a bulleted list of strict instructions on how to mimic this style exactly. Do not include any filler text.
+                
+                User Messages:
+                \(batchedText)
+                """
+                
+                if let analysis = await llm.generateBackgroundAnalysis(prompt: analysisPrompt) {
+                    await MainActor.run {
+                        var updatedProfile = self.modelPersonalities[modelName] ?? ""
+                        if !updatedProfile.contains(analysis) {
+                            updatedProfile += "\n\n[STYLE ANALYSIS]\n" + analysis.trimmingCharacters(in: .whitespacesAndNewlines)
+                            
+                            // Limit size
+                            let lines = updatedProfile.components(separatedBy: "\n")
+                            if lines.count > 100 {
+                                updatedProfile = ([lines[0]] + lines.suffix(99)).joined(separator: "\n")
+                            }
+                            
+                            self.modelPersonalities[modelName] = updatedProfile
+                            self.savePersonalities()
+                        }
+                    }
+                }
+            }
         }
     }
 }

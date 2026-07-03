@@ -696,4 +696,30 @@ class LLMManager: ObservableObject {
             }
         }
     }
+
+    func generateBackgroundAnalysis(prompt: String) async -> String? {
+        guard case .loaded = loadState else { return nil }
+        
+        let msg = (role: "user", content: prompt)
+        
+        var accumulated = ""
+        
+        let stream = AsyncStream<String> { continuation in
+            Task {
+                await runner.generateStream(
+                    messages: [msg],
+                    maxTokens: 512, // Keep analysis reasonably bounded
+                    temperature: 0.3, // Low temp for analytical tasks
+                    continuation: continuation
+                )
+            }
+        }
+        
+        for await piece in stream {
+            accumulated += piece
+        }
+        
+        return accumulated
+    }
+
 }

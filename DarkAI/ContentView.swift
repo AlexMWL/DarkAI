@@ -686,7 +686,7 @@ struct ContentView: View {
         if enableMemories && !text.isEmpty {
             memoryManager.extractMemories(from: text)
             if let activeModel = llmManager.activeModelURL?.lastPathComponent {
-                personalityManager.analyzeUserMessage(text, modelName: activeModel)
+                personalityManager.analyzeUserMessage(text, modelName: activeModel, llmManager: llmManager)
             }
         }
         
