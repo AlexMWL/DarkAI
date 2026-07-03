@@ -156,20 +156,29 @@ actor LlamaRunner {
 
         // --- Apply Native Chat Template ---
         var chatStructs: [llama_chat_message] = []
+        var pointersToFree: [UnsafeMutablePointer<Int8>] = []
+
+        // 1. Properly bolt down the memory (strdup)
         for msg in messages {
-            let rolePtr = strdup(msg.role)
-            let contentPtr = strdup(msg.content)
-            chatStructs.append(llama_chat_message(role: rolePtr, content: contentPtr))
+            guard let rolePtr = strdup(msg.role),
+                  let contentPtr = strdup(msg.content) else { continue }
+            
+            pointersToFree.append(rolePtr)
+            pointersToFree.append(contentPtr)
+            
+            chatStructs.append(llama_chat_message(
+                role: UnsafePointer(rolePtr),
+                content: UnsafePointer(contentPtr)
+            ))
         }
 
         let tmpl = llama_model_chat_template(mdl, nil)
         var tmplBuf = [CChar](repeating: 0, count: 32768)
         let formattedLen = llama_chat_apply_template(tmpl, chatStructs, chatStructs.count, true, &tmplBuf, Int32(tmplBuf.count))
         
-        // Free the allocated strings
-        for chat in chatStructs {
-            free(UnsafeMutableRawPointer(mutating: chat.role))
-            free(UnsafeMutableRawPointer(mutating: chat.content))
+        // 2. Safely unbolt and clean up the memory (free)
+        for ptr in pointersToFree {
+            free(ptr)
         }
 
         let finalPrompt: String

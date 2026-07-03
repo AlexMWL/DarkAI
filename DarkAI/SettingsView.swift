@@ -798,7 +798,7 @@ struct SettingsView: View {
         isImporting = true
         importProgress = "Checking space..."
         
-        Task(priority: .background) {
+        Task.detached(priority: .background) {
             defer {
                 sourceURL.stopAccessingSecurityScopedResource()
             }

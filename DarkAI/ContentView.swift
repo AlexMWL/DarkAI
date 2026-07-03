@@ -108,7 +108,7 @@ struct ContentView: View {
         .fileImporter(
             isPresented: $showFileImporter,
             allowedContentTypes: [
-                .image, .pdf, .plainText, .rtf
+                .image, .pdf, .plainText
             ],
             allowsMultipleSelection: false
         ) { result in
@@ -383,6 +383,11 @@ struct ContentView: View {
                     break
                 }
             }
+        }
+        
+        let removeExact = ["[Response generation]", "*self-correction/review*"]
+        for exact in removeExact {
+            filtered = filtered.replacingOccurrences(of: exact, with: "")
         }
         
         return filtered.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -718,7 +723,8 @@ struct ContentView: View {
         ) { token in
             conversationManager.updateLastMessage(text: (conversationManager.activeConversation?.messages.last?.text ?? "") + token)
         } onComplete: { finalText in
-            conversationManager.updateLastMessage(text: finalText)
+            let cleanedText = self.filterThoughts(from: finalText)
+            conversationManager.updateLastMessage(text: cleanedText)
             conversationManager.saveConversations()
         }
     }
@@ -777,7 +783,8 @@ struct ContentView: View {
                             text: (conversationManager.activeConversation?.messages.last?.text ?? "") + token
                         )
                     } onComplete: { finalText in
-                        conversationManager.updateLastMessage(text: finalText)
+                        let cleanedText = self.filterThoughts(from: finalText)
+                        conversationManager.updateLastMessage(text: cleanedText)
                         conversationManager.saveConversations()
                     }
                 }
