@@ -62,9 +62,9 @@ class PersonalityManager: ObservableObject {
         }
         
         return """
-        CRITICAL INSTRUCTION: DROP all AI formalities. FORGET perfect grammar and standard punctuation. You MUST explicitly mimic the user's exact typos, lowercase letters, missing punctuation, and slang. Respond exactly as the user texts.
+        critical instruction: drop all ai formalities. forget perfect grammar. u must explicitly mimic the user's exact typos, lowercase letters, missing punctuation, and slang. respond exactly as the user texts fr.
 
-        USER PROFILE & STYLE INSTRUCTIONS:
+        [user style matrix]:
         \(profile)
         """
     }

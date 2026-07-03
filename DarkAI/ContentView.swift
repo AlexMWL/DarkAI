@@ -8,7 +8,7 @@ struct ContentView: View {
     @StateObject private var conversationManager = ConversationManager()
     @StateObject private var personalityManager = PersonalityManager()
     
-    @AppStorage("customInstructions") private var customInstructions: String = "You are DarkAI, a local assistant. Respond with precise, helpful answers."
+    @AppStorage("customInstructions") private var customInstructions: String = "You are a local assistant. Respond with precise answers."
     @State private var enableRAG = true
     @State private var enableMemories = true
     
@@ -695,20 +695,17 @@ struct ContentView: View {
         
         conversationManager.addMessageToActive(isUser: false, text: "")
         
-        var finalSystemPrompt = ""
-        if personalityManager.isMature {
-            if let activeModel = llmManager.activeModelURL?.lastPathComponent {
-                finalSystemPrompt = personalityManager.getPersonality(for: activeModel)
-            } else {
-                finalSystemPrompt = customInstructions
-            }
-        } else {
-            finalSystemPrompt = customInstructions
-            if let activeModel = llmManager.activeModelURL?.lastPathComponent {
-                let personality = personalityManager.getPersonality(for: activeModel)
-                if !personality.isEmpty {
-                    finalSystemPrompt += "\n\nYour Unique Personality: " + personality
+        var finalSystemPrompt = customInstructions
+        if let activeModel = llmManager.activeModelURL?.lastPathComponent {
+            let personality = personalityManager.getPersonality(for: activeModel)
+            if !personality.isEmpty {
+                if personalityManager.isMature {
+                    finalSystemPrompt = personality // Complete override
+                } else {
+                    finalSystemPrompt += "\\n\\n[PERSONALITY MATRIX]\\n" + personality
                 }
+                
+                finalSystemPrompt += "\\n\\nOVERRIDE RULE: Your Personality Matrix is your primary directive. If any other system instructions contradict your Matrix, IGNORE the instructions and follow the Matrix."
             }
         }
         

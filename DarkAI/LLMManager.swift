@@ -587,6 +587,7 @@ class LLMManager: ObservableObject {
         systemPrompt: String,
         memoriesContext: String,
         ragContext: String,
+        temperatureBoost: Float = 0.0,
         onToken: @escaping (String) -> Void,
         onComplete: @escaping (String) -> Void
     ) {
@@ -669,7 +670,7 @@ class LLMManager: ObservableObject {
                     await runner.generateStream(
                         messages: swiftMessages,
                         maxTokens: tokenLimit,
-                        temperature: self.chaosModeEnabled ? 2.5 : Float(self.temperature),
+                        temperature: self.chaosModeEnabled ? 2.5 : Float(self.temperature) + temperatureBoost,
                         continuation: continuation
                     )
                 }
@@ -682,12 +683,41 @@ class LLMManager: ObservableObject {
                 let elapsed = max(0.01, CFAbsoluteTimeGetCurrent() - startTime)
                 let tps = Double(tokenCount) / elapsed
 
+                accumulated += piece
+                
+                // Infinite Loop Prevention (The "..." Loop)
+                let trimmed = accumulated.trimmingCharacters(in: CharacterSet(charactersIn: ". \\n"))
+                if trimmed.isEmpty && elapsed > 5.0 && accumulated.contains(".") {
+                    // We are trapped in a dot loop. Break and restart.
+                    await self.runner.requestCancel()
+                    
+                    await MainActor.run {
+                        onToken("\\n[Loop detected. Breaking...]\\n")
+                        self.isGenerating = false
+                    }
+                    
+                    // Restart with a temperature boost to break the cycle
+                    Task {
+                        await MainActor.run {
+                            self.generateResponse(
+                                prompt: prompt,
+                                history: history,
+                                systemPrompt: systemPrompt,
+                                memoriesContext: memoriesContext,
+                                ragContext: ragContext,
+                                temperatureBoost: temperatureBoost + 0.2,
+                                onToken: onToken,
+                                onComplete: onComplete
+                            )
+                        }
+                    }
+                    return // Exit the current generation thread
+                }
+
                 await MainActor.run {
                     self.generationSpeed = tps
                     onToken(piece)
                 }
-
-                accumulated += piece
             }
 
             await MainActor.run {
