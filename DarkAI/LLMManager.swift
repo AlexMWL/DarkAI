@@ -94,7 +94,6 @@ actor LlamaRunner {
         if let mdl = model   { llama_model_free(mdl) }
         context = nil
         model   = nil
-        isCancelled = false
     }
 
     /// Full teardown — call only when the actor itself is being destroyed.
@@ -543,7 +542,7 @@ class LLMManager: ObservableObject {
 
                 let availMem = await MainActor.run { self.getPhysicalMemory() }
 
-                let currentContextLimit = self.contextTokenLimit
+                let currentContextLimit = min(self.contextTokenLimit, self.safeContextLimit)
                 try await runner.load(
                     path: url.path,
                     availableMemoryGB: availMem,

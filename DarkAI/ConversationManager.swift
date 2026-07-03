@@ -107,7 +107,6 @@ class ConversationManager: ObservableObject {
            !conversations[index].messages.isEmpty {
             let lastIndex = conversations[index].messages.count - 1
             conversations[index].messages[lastIndex].text = text
-            objectWillChange.send()
         }
     }
 }
