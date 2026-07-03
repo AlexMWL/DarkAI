@@ -14,7 +14,6 @@ struct SettingsView: View {
     
     @State private var importedModels: [URL] = []
     @State private var showModelImporter = false
-    @State private var showDocImporter = false
     @State private var showResetPersonalityAlert = false
     
     // Context Warning
@@ -214,57 +213,19 @@ struct SettingsView: View {
                             
                             if enableRAG {
                                 Divider().background(Theme.border)
-                                
-                                HStack {
-                                    Text("DOCUMENT INDEX")
-                                        .font(.system(size: 11, weight: .semibold))
-                                        .foregroundColor(Theme.textSecondary)
-                                    Spacer()
-                                    Button(action: { showDocImporter = true }) {
-                                        HStack(spacing: 4) {
-                                            Image(systemName: "doc.badge.plus")
-                                            Text("Add File")
-                                        }
-                                        .font(.system(size: 12, weight: .semibold))
-                                        .foregroundColor(Theme.accentCyan)
+                                NavigationLink(destination: MindscapeView(ragManager: ragManager)) {
+                                    HStack {
+                                        Image(systemName: "brain.filled.head.profile")
+                                            .foregroundColor(Theme.accentCyan)
+                                        Text("Open Mindscape")
+                                            .font(.system(size: 14, weight: .bold))
+                                            .foregroundColor(Theme.textPrimary)
+                                        Spacer()
+                                        Image(systemName: "chevron.right")
+                                            .foregroundColor(Theme.textSecondary)
+                                            .font(.system(size: 12))
                                     }
-                                }
-                                
-                                if ragManager.documents.isEmpty {
-                                    Text("No documents indexed. Add text files (.txt) to query local knowledge.")
-                                        .font(.system(size: 13))
-                                        .foregroundColor(Theme.textMuted)
-                                        .padding(.vertical, 8)
-                                } else {
-                                    VStack(alignment: .leading, spacing: 8) {
-                                        ForEach(ragManager.documents) { doc in
-                                            HStack {
-                                                Image(systemName: "doc.plaintext")
-                                                    .foregroundColor(Theme.textSecondary)
-                                                VStack(alignment: .leading, spacing: 2) {
-                                                    Text(doc.name)
-                                                        .font(.system(size: 13, weight: .medium))
-                                                        .foregroundColor(Theme.textPrimary)
-                                                    Text("\(doc.chunks.count) chunks indexed")
-                                                        .font(.system(size: 11))
-                                                        .foregroundColor(Theme.textMuted)
-                                                }
-                                                Spacer()
-                                                Button(action: {
-                                                    if let idx = ragManager.documents.firstIndex(where: { $0.id == doc.id }) {
-                                                        ragManager.deleteDocument(at: IndexSet(integer: idx))
-                                                    }
-                                                }) {
-                                                    Image(systemName: "trash")
-                                                        .foregroundColor(.red.opacity(0.8))
-                                                        .font(.system(size: 13))
-                                                }
-                                            }
-                                            .padding(8)
-                                            .background(Theme.background.opacity(0.4))
-                                            .cornerRadius(8)
-                                        }
-                                    }
+                                    .padding(.vertical, 8)
                                 }
                             }
                         }
@@ -617,20 +578,7 @@ struct SettingsView: View {
                     print("Model import error: \(error.localizedDescription)")
                 }
             }
-            .fileImporter(
-                isPresented: $showDocImporter,
-                allowedContentTypes: [.item],
-                allowsMultipleSelection: false
-            ) { result in
-                switch result {
-                case .success(let urls):
-                    if let firstUrl = urls.first {
-                        ingestRAGDocument(from: firstUrl)
-                    }
-                case .failure(let error):
-                    print("Document import error: \(error.localizedDescription)")
-                }
-            }
+
             .onAppear {
                 refreshModelList()
             }
@@ -797,38 +745,28 @@ struct SettingsView: View {
         }
     }
     
-    private func ingestRAGDocument(from sourceURL: URL) {
-        guard sourceURL.startAccessingSecurityScopedResource() else { return }
-        defer { sourceURL.stopAccessingSecurityScopedResource() }
-        
-        do {
-            let content = try String(contentsOf: sourceURL, encoding: .utf8)
-            ragManager.ingestDocument(name: sourceURL.lastPathComponent, content: content)
-        } catch {
-            print("Failed ingesting RAG document: \(error)")
-        }
-    }
 }
 
 struct LogExportView: View {
     @ObservedObject var logManager = LogManager.shared
-    @State private var logText: String = ""
 
     var body: some View {
         VStack {
-            TextEditor(text: $logText)
-                .font(.system(.caption, design: .monospaced))
-                .padding()
-                .background(Color.black)
-                .foregroundColor(.green)
-                .cornerRadius(10)
-                .disabled(true)
+            ScrollView {
+                Text(logManager.logs.joined(separator: "\n"))
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundColor(.green)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding()
+            }
+            .background(Color(white: 0.1))
+            .cornerRadius(10)
             
             Spacer()
             
             if #available(iOS 16.0, *) {
-                ShareLink(item: logText, preview: SharePreview("DarkAI Diagnostic Logs")) {
-                    Label("Export Logs", systemImage: "square.and.arrow.up")
+                ShareLink(item: logManager.getLogFileURL()) {
+                    Label("Export Logs to .txt", systemImage: "square.and.arrow.up")
                         .font(.headline)
                         .foregroundColor(.white)
                         .padding()
@@ -843,8 +781,117 @@ struct LogExportView: View {
         .background(Color.black.edgesIgnoringSafeArea(.all))
         .navigationTitle("Diagnostic Logs")
         .navigationBarTitleDisplayMode(.inline)
-        .onAppear {
-            logText = logManager.logs.joined(separator: "\n")
+    }
+}
+
+struct MindscapeView: View {
+    @ObservedObject var ragManager: RAGManager
+    @State private var showDocImporter = false
+
+    var body: some View {
+        VStack {
+            ScrollView {
+                VStack(spacing: 12) {
+                    if ragManager.documents.isEmpty {
+                        Text("No RAG entries found. Tap the button below to add text documents.")
+                            .foregroundColor(.gray)
+                            .padding()
+                    } else {
+                        ForEach(ragManager.documents) { doc in
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack {
+                                    Text(doc.name)
+                                        .font(.headline)
+                                        .foregroundColor(Theme.accentCyan)
+                                    Spacer()
+                                    Button(action: {
+                                        if let idx = ragManager.documents.firstIndex(where: { $0.id == doc.id }) {
+                                            ragManager.deleteDocument(at: IndexSet(integer: idx))
+                                        }
+                                    }) {
+                                        Image(systemName: "trash")
+                                            .foregroundColor(.red)
+                                    }
+                                }
+                                
+                                // Join all chunks into a scrollable text area for the user to view/export
+                                ScrollView(.vertical) {
+                                    Text(doc.chunks.joined(separator: "\n\n---\n\n"))
+                                        .font(.system(.caption, design: .monospaced))
+                                        .foregroundColor(.white)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                }
+                                .frame(height: 150)
+                                .padding(8)
+                                .background(Color(white: 0.1))
+                                .cornerRadius(8)
+                                
+                                if #available(iOS 16.0, *) {
+                                    ShareLink(item: doc.chunks.joined(separator: "\n\n---\n\n")) {
+                                        HStack {
+                                            Image(systemName: "square.and.arrow.up")
+                                            Text("Export")
+                                        }
+                                        .font(.system(size: 12, weight: .bold))
+                                        .foregroundColor(.white)
+                                        .padding(.vertical, 6)
+                                        .padding(.horizontal, 12)
+                                        .background(Theme.accent)
+                                        .cornerRadius(8)
+                                    }
+                                }
+                            }
+                            .padding()
+                            .background(Color.black)
+                            .cornerRadius(12)
+                            .overlay(RoundedRectangle(cornerRadius: 12).stroke(Theme.border, lineWidth: 1))
+                        }
+                    }
+                }
+                .padding()
+            }
+            
+            Button(action: { showDocImporter = true }) {
+                HStack {
+                    Image(systemName: "doc.badge.plus")
+                    Text("Import RAG Document")
+                }
+                .font(.headline)
+                .foregroundColor(.white)
+                .padding()
+                .frame(maxWidth: .infinity)
+                .background(Theme.accentCyan)
+                .cornerRadius(15)
+            }
+            .padding()
+        }
+        .background(Color(white: 0.05).edgesIgnoringSafeArea(.all))
+        .navigationTitle("Mindscape")
+        .navigationBarTitleDisplayMode(.inline)
+        .fileImporter(
+            isPresented: $showDocImporter,
+            allowedContentTypes: [.plainText],
+            allowsMultipleSelection: false
+        ) { result in
+            switch result {
+            case .success(let urls):
+                guard let firstUrl = urls.first else { return }
+                ingestRAGDocument(from: firstUrl)
+            case .failure(let error):
+                print("Error importing: \(error)")
+            }
+        }
+    }
+    
+    private func ingestRAGDocument(from sourceURL: URL) {
+        let isSecured = sourceURL.startAccessingSecurityScopedResource()
+        defer { if isSecured { sourceURL.stopAccessingSecurityScopedResource() } }
+        
+        do {
+            let content = try String(contentsOf: sourceURL, encoding: .utf8)
+            ragManager.ingestDocument(name: sourceURL.lastPathComponent, content: content)
+        } catch {
+            print("Failed ingesting RAG document: \(error)")
         }
     }
 }

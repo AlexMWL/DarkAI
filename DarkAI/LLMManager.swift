@@ -53,7 +53,8 @@ actor LlamaRunner {
         unloadModelOnly()
 
         var modelParams = llama_model_default_params()
-        modelParams.n_gpu_layers = 99 // Put everything on GPU
+        // Prevent Metal buffer zeros ("...") on Gemma's massive vocab by restricting GPU layers
+        modelParams.n_gpu_layers = path.lowercased().contains("gemma") ? 15 : 99
         modelParams.use_mmap = true
         modelParams.use_mlock = false
 
@@ -495,11 +496,7 @@ class LLMManager: ObservableObject {
     }
 
     func getPhysicalMemory() -> Double {
-        #if os(iOS)
-        return Double(os_proc_available_memory()) / (1024.0 * 1024.0 * 1024.0)
-        #else
         return Double(ProcessInfo.processInfo.physicalMemory) / (1024.0 * 1024.0 * 1024.0)
-        #endif
     }
 
     func getModelSizeGB(at url: URL) -> Double {
@@ -509,13 +506,10 @@ class LLMManager: ObservableObject {
 
     func checkMemorySafety(modelSizeGB: Double) -> MemorySafetyStatus {
         let total = systemMemoryGB
-        let required = modelSizeGB + 1.5
+        // We add 1.5 GB overhead for the app context and system tasks
+        let required = modelSizeGB + 1.5 
 
-        // Developer apps are capped at 6GB. Models under 6GB should not warn.
-        if modelSizeGB < 6.0 {
-            return .safe
-        }
-
+        // If the required memory takes up more than 90% of what's available, it's a no-go
         if required > total * 0.90 {
             return .dangerous(requiredGB: required, availableGB: total)
         } else if required > total * 0.70 {
