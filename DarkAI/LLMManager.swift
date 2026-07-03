@@ -155,24 +155,22 @@ actor LlamaRunner {
         let vocab = llama_model_get_vocab(mdl)
 
         // --- Apply Native Chat Template ---
-        var cStrings: [[CChar]] = []
-        for msg in messages {
-            cStrings.append(msg.role.cString(using: .utf8) ?? [])
-            cStrings.append(msg.content.cString(using: .utf8) ?? [])
-        }
-
         var chatStructs: [llama_chat_message] = []
-        for i in 0..<messages.count {
-            cStrings[i*2].withUnsafeBufferPointer { rPtr in
-                cStrings[i*2 + 1].withUnsafeBufferPointer { cPtr in
-                    chatStructs.append(llama_chat_message(role: rPtr.baseAddress, content: cPtr.baseAddress))
-                }
-            }
+        for msg in messages {
+            let rolePtr = strdup(msg.role)
+            let contentPtr = strdup(msg.content)
+            chatStructs.append(llama_chat_message(role: rolePtr, content: contentPtr))
         }
 
         let tmpl = llama_model_chat_template(mdl, nil)
         var tmplBuf = [CChar](repeating: 0, count: 32768)
         let formattedLen = llama_chat_apply_template(tmpl, chatStructs, chatStructs.count, true, &tmplBuf, Int32(tmplBuf.count))
+        
+        // Free the allocated strings
+        for chat in chatStructs {
+            free(UnsafeMutableRawPointer(mutating: chat.role))
+            free(UnsafeMutableRawPointer(mutating: chat.content))
+        }
 
         let finalPrompt: String
         if formattedLen > 0 && formattedLen < tmplBuf.count {

@@ -108,9 +108,7 @@ struct ContentView: View {
         .fileImporter(
             isPresented: $showFileImporter,
             allowedContentTypes: [
-                .image, .pdf, .plainText, .rtf,
-                UTType(filenameExtension: "doc")!,
-                UTType(filenameExtension: "docx")!
+                .image, .pdf, .plainText, .rtf
             ],
             allowsMultipleSelection: false
         ) { result in

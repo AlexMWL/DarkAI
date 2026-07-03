@@ -14,6 +14,8 @@ struct SettingsView: View {
     
     @State private var importedModels: [URL] = []
     @State private var showModelImporter = false
+    @State private var isImporting = false
+    @State private var importProgress = ""
     @State private var showResetPersonalityAlert = false
     
     // Context Warning
@@ -133,7 +135,13 @@ struct SettingsView: View {
                                     ZStack(alignment: .leading) {
                                         Slider(value: Binding(
                                             get: { Double(llmManager.contextTokenLimit) },
-                                            set: { llmManager.contextTokenLimit = Int($0) }
+                                            set: { newValue in
+                                                let val = Int(newValue)
+                                                llmManager.contextTokenLimit = val
+                                                if val >= Int(llmManager.safeContextLimit) {
+                                                    showContextWarningPopup = true
+                                                }
+                                            }
                                         ), in: 512...4096, step: 256)
                                         .accentColor(Theme.accent)
                                     }
@@ -726,22 +734,56 @@ struct SettingsView: View {
     }
     
     private func copyModelToAppDocuments(from sourceURL: URL) {
-        // Must start accessing security scoped resource
         guard sourceURL.startAccessingSecurityScopedResource() else { return }
-        defer { sourceURL.stopAccessingSecurityScopedResource() }
         
-        guard let docsUrl = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else { return }
+        let ext = sourceURL.pathExtension.lowercased()
+        guard ext == "gguf" else {
+            sourceURL.stopAccessingSecurityScopedResource()
+            print("Invalid file type.")
+            return
+        }
+        
+        guard let docsUrl = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
+            sourceURL.stopAccessingSecurityScopedResource()
+            return
+        }
+        
         let modelsDir = docsUrl.appendingPathComponent("Models")
         let destinationURL = modelsDir.appendingPathComponent(sourceURL.lastPathComponent)
         
-        do {
-            if FileManager.default.fileExists(atPath: destinationURL.path) {
-                try FileManager.default.removeItem(at: destinationURL)
+        isImporting = true
+        importProgress = "Checking space..."
+        
+        Task(priority: .background) {
+            defer {
+                sourceURL.stopAccessingSecurityScopedResource()
+                Task { @MainActor in self.isImporting = false }
             }
-            try FileManager.default.copyItem(at: sourceURL, to: destinationURL)
-            refreshModelList()
-        } catch {
-            print("Failed copying model file: \(error)")
+            
+            do {
+                let attrs = try FileManager.default.attributesOfItem(atPath: sourceURL.path)
+                let fileSize = attrs[.size] as? Int64 ?? 0
+                
+                let systemAttrs = try FileManager.default.attributesOfFileSystem(forPath: NSHomeDirectory())
+                let freeSpace = systemAttrs[.systemFreeSize] as? Int64 ?? 0
+                
+                if fileSize + (500 * 1024 * 1024) > freeSpace {
+                    await MainActor.run { importProgress = "Not enough storage!" }
+                    return
+                }
+                
+                await MainActor.run { importProgress = "Copying (Do not close)..." }
+                
+                if FileManager.default.fileExists(atPath: destinationURL.path) {
+                    try FileManager.default.removeItem(at: destinationURL)
+                }
+                try FileManager.default.copyItem(at: sourceURL, to: destinationURL)
+                
+                await MainActor.run { refreshModelList() }
+            } catch {
+                await MainActor.run { importProgress = "Failed." }
+                print("Failed copying model file: \(error)")
+            }
         }
     }
     
