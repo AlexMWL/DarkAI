@@ -145,7 +145,7 @@ actor LlamaRunner {
         maxTokens: Int,
         temperature: Float,
         continuation: AsyncStream<String>.Continuation
-    ) {
+    ) async {
         guard let ctx = context, let mdl = model else {
             continuation.finish()
             return
@@ -255,6 +255,7 @@ actor LlamaRunner {
         var accumulatedOutput = ""
 
         while generatedCount < maxTokens {
+            await Task.yield()
             guard !isCancelled else { break }
 
             guard let logitsPtr = llama_get_logits_ith(ctx, -1) else { break }
@@ -610,9 +611,6 @@ class LLMManager: ObservableObject {
         if !systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             systemBlock += systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines) + "\n\n"
         }
-        
-        // Block models (like Gemma IT / DeepSeek) from generating <think> or self-correction blocks that waste context window space
-        systemBlock += "CRITICAL INSTRUCTION: Do NOT output any internal thoughts, reasoning, or self-corrections (e.g. no <think> or <thought> tags). Provide only the final direct answer.\n\n"
         if !memoriesContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             systemBlock += memoriesContext.trimmingCharacters(in: .whitespacesAndNewlines) + "\n\n"
         }

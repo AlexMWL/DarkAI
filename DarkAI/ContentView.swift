@@ -291,7 +291,7 @@ struct ContentView: View {
                 .foregroundColor(Theme.accent)
                 .neonGlow(color: Theme.accent, radius: 10)
             
-            Text("LOCAL RUNNER v5.7.5")
+            Text("LOCAL RUNNER v5.7.6")
                 .font(.system(size: 15, weight: .bold))
                 .foregroundColor(.white)
                 .kerning(1.5)
@@ -715,6 +715,7 @@ struct ContentView: View {
             conversationManager.updateLastMessage(text: (conversationManager.activeConversation?.messages.last?.text ?? "") + token)
         } onComplete: { finalText in
             conversationManager.updateLastMessage(text: finalText)
+            conversationManager.saveConversations()
         }
     }
     
@@ -773,6 +774,7 @@ struct ContentView: View {
                         )
                     } onComplete: { finalText in
                         conversationManager.updateLastMessage(text: finalText)
+                        conversationManager.saveConversations()
                     }
                 }
 
