@@ -20,6 +20,7 @@ struct SettingsView: View {
     
     // Context Warning
     @State private var showContextWarningPopup = false
+    @State private var showInvalidFileTypeAlert = false
     
     // Failsafe Modal States
     @State private var showFailsafePopup = false
@@ -77,6 +78,25 @@ struct SettingsView: View {
                                         modelRow(for: url)
                                     }
                                 }
+                            }
+                            
+                            if isImporting {
+                                HStack {
+                                    ProgressView()
+                                        .progressViewStyle(CircularProgressViewStyle(tint: Theme.accentCyan))
+                                    Text(importProgress)
+                                        .font(.system(size: 13, weight: .medium))
+                                        .foregroundColor(Theme.textPrimary)
+                                        .padding(.leading, 8)
+                                    Spacer()
+                                }
+                                .padding()
+                                .background(Theme.background)
+                                .cornerRadius(12)
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 12)
+                                        .stroke(Theme.accentCyan.opacity(0.3), lineWidth: 1)
+                                )
                             }
                         }
                         .glassCard(cornerRadius: 16)
@@ -138,7 +158,7 @@ struct SettingsView: View {
                                             set: { newValue in
                                                 let val = Int(newValue)
                                                 llmManager.contextTokenLimit = val
-                                                if val >= Int(llmManager.safeContextLimit) {
+                                                if val > Int(llmManager.safeContextLimit) {
                                                     showContextWarningPopup = true
                                                 }
                                             }
@@ -580,8 +600,8 @@ struct SettingsView: View {
             }
             .alert(isPresented: $showContextWarningPopup) {
                 Alert(
-                    title: Text("High Context Warning"),
-                    message: Text("Based on your device memory and the loaded model size, setting the context limit above \(llmManager.safeContextLimit) tokens risks an Out-Of-Memory crash. Please consider lowering it."),
+                    title: Text("High RAM Usage Warning"),
+                    message: Text("You have set the context window higher than the safe limit for your device's available memory.\n\nThis dramatically increases the chance iOS will kill the app (crash) due to memory pressure.\n\nAre you sure you want to proceed?"),
                     primaryButton: .default(Text("Revert to Safe Limit")) {
                         llmManager.contextTokenLimit = llmManager.safeContextLimit
                     },
@@ -589,6 +609,11 @@ struct SettingsView: View {
                         // User chooses to keep the limit
                     }
                 )
+            }
+            .alert("Invalid File", isPresented: $showInvalidFileTypeAlert) {
+                Button("OK", role: .cancel) { }
+            } message: {
+                Text("Please select a valid .gguf model file.")
             }
             .fileImporter(
                 isPresented: $showModelImporter,
@@ -758,6 +783,7 @@ struct SettingsView: View {
         guard ext == "gguf" else {
             sourceURL.stopAccessingSecurityScopedResource()
             print("Invalid file type.")
+            showInvalidFileTypeAlert = true
             return
         }
         
@@ -775,7 +801,6 @@ struct SettingsView: View {
         Task(priority: .background) {
             defer {
                 sourceURL.stopAccessingSecurityScopedResource()
-                Task { @MainActor in self.isImporting = false }
             }
             
             do {
@@ -797,9 +822,15 @@ struct SettingsView: View {
                 }
                 try FileManager.default.copyItem(at: sourceURL, to: destinationURL)
                 
-                await MainActor.run { refreshModelList() }
+                await MainActor.run {
+                    refreshModelList()
+                    self.isImporting = false
+                }
             } catch {
-                await MainActor.run { importProgress = "Failed." }
+                await MainActor.run { 
+                    importProgress = "Failed."
+                    // Intentionally NOT setting isImporting = false here so the user can see the error
+                }
                 print("Failed copying model file: \(error)")
             }
         }

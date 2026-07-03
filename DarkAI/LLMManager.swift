@@ -272,9 +272,10 @@ actor LlamaRunner {
                 }
             }
 
-            // Temperature scaling
-            if temperature > 0 && temperature != 1.0 {
-                let invTemp = 1.0 / Float(temperature)
+            // Temperature scaling - If the model is outputting dots, bump it up!
+            let activeTemp = (accumulatedOutput.count < 10) ? max(temperature, 1.2) : temperature
+            if activeTemp > 0 && activeTemp != 1.0 {
+                let invTemp = 1.0 / Float(activeTemp)
                 for i in 0..<nVocab { logits[i] *= invTemp }
             }
 
@@ -331,6 +332,12 @@ actor LlamaRunner {
             if nChars > 0 {
                 let piece = String(bytes: tokenBuf.prefix(Int(nChars)).map { UInt8(bitPattern: $0) }, encoding: .utf8) ?? ""
                 if !piece.isEmpty {
+                    // --- ADD THIS BLOCK HERE ---
+                    if piece.contains(".") && accumulatedOutput.count < 5 {
+                         // If we are just starting and the model tries to output a dot, ignore it!
+                         continue 
+                    }
+                    // ---------------------------
                     accumulatedOutput += piece
 
                     // Stop String check — prevents models talking to themselves
