@@ -695,11 +695,20 @@ struct ContentView: View {
         
         conversationManager.addMessageToActive(isUser: false, text: "")
         
-        var finalSystemPrompt = customInstructions
-        if let activeModel = llmManager.activeModelURL?.lastPathComponent {
-            let personality = personalityManager.getPersonality(for: activeModel)
-            if !personality.isEmpty {
-                finalSystemPrompt += "\n\nYour Unique Personality: " + personality
+        var finalSystemPrompt = ""
+        if personalityManager.isMature {
+            if let activeModel = llmManager.activeModelURL?.lastPathComponent {
+                finalSystemPrompt = personalityManager.getPersonality(for: activeModel)
+            } else {
+                finalSystemPrompt = customInstructions
+            }
+        } else {
+            finalSystemPrompt = customInstructions
+            if let activeModel = llmManager.activeModelURL?.lastPathComponent {
+                let personality = personalityManager.getPersonality(for: activeModel)
+                if !personality.isEmpty {
+                    finalSystemPrompt += "\n\nYour Unique Personality: " + personality
+                }
             }
         }
         

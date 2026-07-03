@@ -308,6 +308,24 @@ struct SettingsView: View {
                                     .font(.system(size: 14, weight: .bold))
                                     .foregroundColor(.white)
                                 Spacer()
+                                if personalityManager.isMature {
+                                    Text("[MATURE: OVERRIDE ACTIVE]")
+                                        .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                        .foregroundColor(.white)
+                                        .padding(.horizontal, 8)
+                                        .padding(.vertical, 4)
+                                        .background(Theme.accentRose)
+                                        .cornerRadius(6)
+                                } else {
+                                    Text("[LEARNING...]")
+                                        .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                        .foregroundColor(Theme.textSecondary)
+                                        .padding(.horizontal, 8)
+                                        .padding(.vertical, 4)
+                                        .background(Theme.textSecondary.opacity(0.2))
+                                        .cornerRadius(6)
+                                }
+                                
                                 Text(personalityManager.databaseSizeString)
                                     .font(.system(size: 11, weight: .bold, design: .monospaced))
                                     .foregroundColor(Theme.accentRose)

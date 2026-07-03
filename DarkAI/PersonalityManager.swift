@@ -3,8 +3,11 @@ import Combine
 
 class PersonalityManager: ObservableObject {
     @Published var modelPersonalities: [String: String] = [:]
+    @Published var maturityScore: Double = 0.0
+    @Published var isMature: Bool = false
     
     private let storageKey = "DarkAI_ModelPersonalities"
+    private let maturityKey = "DarkAI_MaturityScore"
     private var messageBatch: [String] = []
     
     init() {
@@ -16,12 +19,17 @@ class PersonalityManager: ObservableObject {
            let decoded = try? JSONDecoder().decode([String: String].self, from: data) {
             self.modelPersonalities = decoded
         }
+        
+        let savedMaturity = UserDefaults.standard.double(forKey: maturityKey)
+        self.maturityScore = savedMaturity
+        self.isMature = savedMaturity >= 0.7
     }
     
     private func savePersonalities() {
         if let encoded = try? JSONEncoder().encode(modelPersonalities) {
             UserDefaults.standard.set(encoded, forKey: storageKey)
         }
+        UserDefaults.standard.set(maturityScore, forKey: maturityKey)
     }
     
     var databaseSizeString: String {
@@ -42,6 +50,8 @@ class PersonalityManager: ObservableObject {
     
     func resetPersonality(for modelName: String) {
         modelPersonalities.removeValue(forKey: modelName)
+        maturityScore = 0.0
+        isMature = false
         savePersonalities()
     }
     
@@ -102,11 +112,15 @@ class PersonalityManager: ObservableObject {
         
         if !newTraits.isEmpty {
             if currentProfile.isEmpty {
-                currentProfile = newTraits.joined(separator: "\n- ")
+                currentProfile = newTraits.joined(separator: "\\n- ")
             } else {
-                currentProfile += "\n- " + newTraits.joined(separator: "\n- ")
+                currentProfile += "\\n- " + newTraits.joined(separator: "\\n- ")
             }
             modelPersonalities[modelName] = currentProfile
+            
+            maturityScore = min(1.0, maturityScore + (Double(newTraits.count) * 0.05))
+            isMature = maturityScore >= 0.7
+            
             savePersonalities()
         }
         
@@ -144,6 +158,10 @@ class PersonalityManager: ObservableObject {
                             }
                             
                             self.modelPersonalities[modelName] = updatedProfile
+                            
+                            self.maturityScore = min(1.0, self.maturityScore + 0.10)
+                            self.isMature = self.maturityScore >= 0.7
+                            
                             self.savePersonalities()
                         }
                     }
