@@ -3,6 +3,7 @@ import Combine
 import LlamaSwift
 import os
 import UIKit
+import Darwin
 
 // MARK: - State Types
 
@@ -22,7 +23,10 @@ enum MemorySafetyStatus: Equatable {
 // MARK: - LlamaRunner Actor
 // Wraps the raw llama.cpp C-API in a background actor to keep inference off the main thread.
 
+
+
 actor LlamaRunner {
+
 
     private var model: OpaquePointer? = nil
     private var context: OpaquePointer? = nil
@@ -33,19 +37,25 @@ actor LlamaRunner {
 
     init() {
         // Initialize the backend once for the lifetime of this actor
+        llama_log_set({ level, text, user_data in
+            guard let text = text, let str = String(cString: text, encoding: .utf8) else { return }
+            let cleanStr = str.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !cleanStr.isEmpty {
+                DispatchQueue.main.async {
+                    LogManager.shared.log("LLAMA: \(cleanStr)")
+                }
+            }
+        }, nil)
         llama_backend_init()
     }
 
     func load(path: String, availableMemoryGB: Double, modelSizeGB: Double, contextLimit: Int) throws {
-        // Unload any existing model first (does NOT touch the backend)
         unloadModelOnly()
 
         var modelParams = llama_model_default_params()
-
-        // Apple Silicon uses Unified Memory; CPU/GPU share the same RAM.
-        // Offloading to CPU does not save RAM, it only degrades performance.
-        // Always fully offload to Metal.
-        modelParams.n_gpu_layers = 99
+        modelParams.n_gpu_layers = 99 // Put everything on GPU
+        modelParams.use_mmap = true
+        modelParams.use_mlock = false
 
         guard let mdl = llama_model_load_from_file(path, modelParams) else {
             throw NSError(domain: "LlamaRunner", code: 1,
@@ -53,9 +63,8 @@ actor LlamaRunner {
         }
         self.model = mdl
 
-        // Use the user's configured context limit, capped by the model's trained context
         let trainedCtx = llama_model_n_ctx_train(mdl)
-        let nCtx = max(512, min(Int32(trainedCtx), Int32(contextLimit)))
+        let nCtx = min(Int32(contextLimit), Int32(trainedCtx))
 
         var ctxParams = llama_context_default_params()
         ctxParams.n_ctx   = UInt32(nCtx)
@@ -183,7 +192,10 @@ actor LlamaRunner {
 
         let maxPromptTokens = max(1, nCtxTokens - min(maxTokens, nCtxTokens / 2))
         if promptTokens.count > maxPromptTokens {
-            LogManager.shared.log("LlamaRunner: Warning - Prompt tokens (\(promptTokens.count)) exceed safe threshold (\(maxPromptTokens)). Truncating.")
+            let pCount = promptTokens.count
+            Task { @MainActor in
+                LogManager.shared.log("LlamaRunner: Warning - Prompt tokens (\(pCount)) exceed safe threshold (\(maxPromptTokens)). Truncating.")
+            }
             let bos = promptTokens[0]
             promptTokens = [bos] + Array(promptTokens.suffix(maxPromptTokens - 1))
         }
@@ -348,7 +360,7 @@ actor LlamaRunner {
 
             // Guard against context overflow gracefully
             if nPos >= Int32(nCtxTokens) - 1 {
-                LogManager.shared.log("LlamaRunner: Hard context limit reached. Stopping generation.")
+                Task { @MainActor in LogManager.shared.log("LlamaRunner: Hard context limit reached. Stopping generation.") }
                 continuation.yield("\n\n[System: Context window limit reached. Generation stopped.]")
                 break
             }
@@ -407,18 +419,19 @@ class LLMManager: ObservableObject {
     }
     
     var safeContextLimit: Int {
-        let maxMemory = systemMemoryGB * 0.80
+        let maxMemory = systemMemoryGB * 0.40
         switch loadState {
         case .loaded(_, let sizeGB):
-            let availableForKV = maxMemory - sizeGB
+            let activeModelWeightRAM = sizeGB * 0.10
+            let availableForKV = maxMemory - activeModelWeightRAM
             if availableForKV <= 0 { return 2048 }
-            let gbPer1kTokens = sizeGB * 0.025
+            let gbPer1kTokens = max(0.04, sizeGB * 0.02)
             let safeLimit = (availableForKV / gbPer1kTokens) * 1000
             return max(2048, min(32768, Int(safeLimit)))
         default:
-            let availableForKV = maxMemory - 4.0
+            let availableForKV = maxMemory - 1.5
             if availableForKV <= 0 { return 4096 }
-            let gbPer1kTokens = 4.0 * 0.025
+            let gbPer1kTokens = 0.08
             let safeLimit = (availableForKV / gbPer1kTokens) * 1000
             return max(2048, min(32768, Int(safeLimit)))
         }
@@ -429,6 +442,7 @@ class LLMManager: ObservableObject {
     init() {
         self.systemMemoryGB = getPhysicalMemory()
         setupAppLifecycleObservers()
+        freeSwapStorage()
     }
 
     // MARK: - App Lifecycle - Clean unload on background/termination
@@ -459,7 +473,26 @@ class LLMManager: ObservableObject {
         }
     }
 
-    // MARK: - Memory Utilities
+    // MARK: - Memory
+    func freeSwapStorage() {
+        Task.detached(priority: .background) {
+            let fileManager = FileManager.default
+            let urls = fileManager.urls(for: .documentDirectory, in: .userDomainMask)
+            guard let docDir = urls.first else { return }
+            
+            // Delete old chunk files if they exist
+            if let existingFiles = try? fileManager.contentsOfDirectory(atPath: docDir.path) {
+                for file in existingFiles where file.hasPrefix("swap_chunk_") {
+                    try? fileManager.removeItem(atPath: docDir.appendingPathComponent(file).path)
+                }
+            }
+            
+            let filePath = docDir.appendingPathComponent("swap_reserve.bin").path
+            if fileManager.fileExists(atPath: filePath) {
+                try? fileManager.removeItem(atPath: filePath)
+            }
+        }
+    }
 
     func getPhysicalMemory() -> Double {
         #if os(iOS)

@@ -135,39 +135,14 @@ struct SettingsView: View {
                                         Slider(value: Binding(
                                             get: { Double(llmManager.contextTokenLimit) },
                                             set: { llmManager.contextTokenLimit = Int($0) }
-                                        ), in: 2048...32768, step: 512, onEditingChanged: { editing in
-                                            if !editing {
-                                                if llmManager.contextTokenLimit > llmManager.safeContextLimit {
-                                                    showContextWarningPopup = true
-                                                }
-                                            }
-                                        })
+                                        ), in: 512...4096, step: 256)
                                         .accentColor(Theme.accent)
-                                        
-                                        let totalRange = 32768.0 - 2048.0
-                                        let safeValue = Double(llmManager.safeContextLimit)
-                                        let percentage = max(0, min(1, (safeValue - 2048.0) / totalRange))
-                                        let thumbWidth: CGFloat = 28
-                                        let trackWidth = geo.size.width - thumbWidth
-                                        let xOffset = (trackWidth * percentage) + (thumbWidth / 2)
-                                        
-                                        Rectangle()
-                                            .fill(Color.orange)
-                                            .frame(width: 2, height: 12)
-                                            .offset(x: xOffset - 1, y: (geo.size.height - 12) / 2)
-                                            .allowsHitTesting(false)
                                     }
                                 }
                                 .frame(height: 28)
-                                
-                                if llmManager.contextTokenLimit > llmManager.safeContextLimit {
-                                    Text("⚠️ Warning: Based on your device memory and the loaded model size, setting the context limit above \(llmManager.safeContextLimit) tokens risks an Out-Of-Memory crash.")
-                                        .font(.system(size: 11))
-                                        .foregroundColor(.orange)
-                                        .fixedSize(horizontal: false, vertical: true)
-                                }
                             }
                             
+
                             Divider().background(Theme.border)
                             
                             VStack(alignment: .leading, spacing: 8) {
@@ -408,6 +383,39 @@ struct SettingsView: View {
                             }
                             .disabled(llmManager.activeModelURL == nil)
                             .opacity(llmManager.activeModelURL == nil ? 0.5 : 1.0)
+                        }
+                        .glassCard(cornerRadius: 16)
+                        
+                        // SECTION 6: Diagnostics
+                        VStack(alignment: .leading, spacing: 14) {
+                            HStack {
+                                Image(systemName: "ladybug")
+                                    .foregroundColor(.yellow)
+                                Text("DIAGNOSTICS & LOGS")
+                                    .font(.system(size: 14, weight: .bold))
+                                    .foregroundColor(Theme.textPrimary)
+                                    .kerning(1.2)
+                                Spacer()
+                            }
+                            
+                            Divider().background(Theme.border)
+                            
+                            NavigationLink {
+                                LogExportView()
+                            } label: {
+                                HStack {
+                                    Text("View & Export Logs")
+                                        .font(.system(size: 13, weight: .medium))
+                                        .foregroundColor(Theme.textPrimary)
+                                    Spacer()
+                                    Image(systemName: "chevron.right")
+                                        .font(.system(size: 12))
+                                        .foregroundColor(Theme.textSecondary)
+                                }
+                                .padding()
+                                .background(Theme.cardBackground)
+                                .cornerRadius(12)
+                            }
                         }
                         .glassCard(cornerRadius: 16)
                         
@@ -798,6 +806,45 @@ struct SettingsView: View {
             ragManager.ingestDocument(name: sourceURL.lastPathComponent, content: content)
         } catch {
             print("Failed ingesting RAG document: \(error)")
+        }
+    }
+}
+
+struct LogExportView: View {
+    @ObservedObject var logManager = LogManager.shared
+    @State private var logText: String = ""
+
+    var body: some View {
+        VStack {
+            TextEditor(text: $logText)
+                .font(.system(.caption, design: .monospaced))
+                .padding()
+                .background(Color.black)
+                .foregroundColor(.green)
+                .cornerRadius(10)
+                .disabled(true)
+            
+            Spacer()
+            
+            if #available(iOS 16.0, *) {
+                ShareLink(item: logText, preview: SharePreview("DarkAI Diagnostic Logs")) {
+                    Label("Export Logs", systemImage: "square.and.arrow.up")
+                        .font(.headline)
+                        .foregroundColor(.white)
+                        .padding()
+                        .frame(maxWidth: .infinity)
+                        .background(Theme.accent)
+                        .cornerRadius(15)
+                }
+                .padding()
+            }
+        }
+        .padding()
+        .background(Color.black.edgesIgnoringSafeArea(.all))
+        .navigationTitle("Diagnostic Logs")
+        .navigationBarTitleDisplayMode(.inline)
+        .onAppear {
+            logText = logManager.logs.joined(separator: "\n")
         }
     }
 }

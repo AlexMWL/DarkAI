@@ -48,7 +48,6 @@ class PersonalityManager: ObservableObject {
         return modelPersonalities[modelName] ?? "You are DarkAI, a highly capable assistant. Provide concise, helpful answers."
     }
     
-    /// Analyzes a user message and slowly builds a mirrored personality profile for the specific model.
     func analyzeUserMessage(_ message: String, modelName: String) {
         guard !modelName.isEmpty else { return }
         
@@ -56,7 +55,7 @@ class PersonalityManager: ObservableObject {
         let lower = message.lowercased()
         let words = lower.components(separatedBy: .punctuationCharacters).joined().components(separatedBy: .whitespaces)
         
-        let slangList = ["lol", "lmao", "bruh", "tbh", "fr", "frfr", "ngl", "idk", "rn", "gotcha", "yep", "yeah", "dude", "hey", "yo"]
+        let slangList = ["lol", "lmao", "bruh", "tbh", "fr", "frfr", "ngl", "idk", "rn", "gotcha", "yep", "yeah", "dude", "hey", "yo", "bet", "cap", "vibes"]
         var usedSlang = Set<String>()
         for word in words {
             if slangList.contains(word) {
@@ -67,7 +66,7 @@ class PersonalityManager: ObservableObject {
         // If the user's message is entirely lowercase and decently long, they are a casual typer.
         let isAllLowercase = (message == lower) && message.trimmingCharacters(in: .whitespacesAndNewlines).count > 8
         let hasEmojis = message.unicodeScalars.contains { $0.properties.isEmojiPresentation }
-        let isVerbose = message.count > 300
+        let isVerbose = message.count > 200
         
         var newTraits: [String] = []
         
@@ -89,17 +88,37 @@ class PersonalityManager: ObservableObject {
             }
         }
         
+        // Aggressively extract facts, plans, and preferences
+        let sentences = message.components(separatedBy: CharacterSet(charactersIn: ".!?\n"))
+        let aggressiveTriggers = ["i like ", "i am ", "i plan to ", "i need to ", "i want to ", "my favorite ", "i have ", "my goal is ", "i love ", "i hate ", "im ", "i'm "]
+        
+        for sentence in sentences {
+            let cleanSentence = sentence.trimmingCharacters(in: .whitespacesAndNewlines)
+            let lowerSentence = cleanSentence.lowercased()
+            
+            for trigger in aggressiveTriggers {
+                if lowerSentence.hasPrefix(trigger) && cleanSentence.count > trigger.count + 2 {
+                    let fact = "The user stated: '\(cleanSentence)'."
+                    if !currentProfile.contains(fact) {
+                        newTraits.append("Remember: \(fact)")
+                    }
+                    break
+                }
+            }
+        }
+        
         if !newTraits.isEmpty {
             if currentProfile.isEmpty {
-                currentProfile = "You are an adaptive AI. Mirror the user's speech patterns by following these uniquely developed traits:\n- " + newTraits.joined(separator: "\n- ")
+                currentProfile = "You are an adaptive AI. Mirror the user's speech patterns and remember these facts:\n- " + newTraits.joined(separator: "\n- ")
             } else {
                 currentProfile += "\n- " + newTraits.joined(separator: "\n- ")
             }
             
             // Limit the persona block so it doesn't consume the entire context window over months of chatting
+            // Increased from 15 to 50 for more aggressive retention
             let lines = currentProfile.components(separatedBy: "\n")
-            if lines.count > 15 {
-                currentProfile = ([lines[0]] + lines.suffix(14)).joined(separator: "\n")
+            if lines.count > 50 {
+                currentProfile = ([lines[0]] + lines.suffix(49)).joined(separator: "\n")
             }
             
             modelPersonalities[modelName] = currentProfile

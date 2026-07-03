@@ -291,7 +291,7 @@ struct ContentView: View {
                 .foregroundColor(Theme.accent)
                 .neonGlow(color: Theme.accent, radius: 10)
             
-            Text("LOCAL RUNNER v5.7.3")
+            Text("LOCAL RUNNER v5.7.5")
                 .font(.system(size: 15, weight: .bold))
                 .foregroundColor(.white)
                 .kerning(1.5)
@@ -403,6 +403,13 @@ struct ContentView: View {
                         RoundedRectangle(cornerRadius: 14)
                             .fill(LinearGradient(colors: [Theme.accent, Theme.accentRose], startPoint: .topLeading, endPoint: .bottomTrailing))
                     )
+                    .contextMenu {
+                        Button {
+                            UIPasteboard.general.string = message.text
+                        } label: {
+                            Label("Copy", systemImage: "doc.on.doc")
+                        }
+                    }
             } else {
                 Image(systemName: "terminal.fill")
                     .foregroundColor(Theme.accentCyan)
@@ -425,6 +432,13 @@ struct ContentView: View {
                         RoundedRectangle(cornerRadius: 14)
                             .stroke(Theme.border, lineWidth: 1)
                     )
+                    .contextMenu {
+                        Button {
+                            UIPasteboard.general.string = isThinking ? message.text : filteredText
+                        } label: {
+                            Label("Copy", systemImage: "doc.on.doc")
+                        }
+                    }
                 Spacer()
             }
         }
