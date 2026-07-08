@@ -260,7 +260,23 @@ actor LlamaRunner {
 
         var accumulatedOutput = ""
 
-        while generatedCount < maxTokens {
+        // MARK: Thinking-Block Suppression
+        // Gemma and similar models emit internal reasoning inside thinking tags
+        // (<think>, <channel thought>, etc.) before the actual response.
+        // These tokens are silently consumed — they do NOT count against maxTokens
+        // and are NOT streamed to the UI. This gives the model its full token
+        // budget for the actual response instead of burning it on reasoning.
+        var hasEnteredThinkingBlock = false
+        var hasExitedThinkingBlock  = false
+        var thinkingTagBuffer = ""  // Rolling 50-char window for tag detection
+        let thinkingOpenMarkers  = ["<think>", "<thinking>", "<channel thought", "<thought>", "<reflection>", "<reasoning>"]
+        let thinkingCloseMarkers = ["</think>", "</thinking>", "</channel thought>", "</thought>", "</reflection>", "</reasoning>"]
+
+        // The loop runs while:
+        //  • generatedCount < maxTokens (normal response budget), OR
+        //  • the model is still inside a thinking block that started before any real content
+        //    (so thinking doesn't consume the response budget)
+        while generatedCount < maxTokens || (hasEnteredThinkingBlock && !hasExitedThinkingBlock && generatedCount == 0) {
             await Task.yield()
             guard !isCancelled else { break }
 
@@ -281,18 +297,17 @@ actor LlamaRunner {
                 }
             }
 
-            // Temperature scaling - If the model is outputting dots, bump it up!
-            let activeTemp = (accumulatedOutput.count < 10) ? max(temperature, 1.2) : temperature
-            if activeTemp > 0 && activeTemp != 1.0 {
-                let invTemp = 1.0 / Float(activeTemp)
+            // Temperature scaling
+            if temperature > 0 && temperature != 1.0 {
+                let invTemp = 1.0 / Float(temperature)
                 for i in 0..<nVocab { logits[i] *= invTemp }
             }
 
             let maxLogit = logits.max() ?? 0
-            
+
             // Optimization: Filter out incredibly improbable logits before expf and sorting (O(N log N) -> O(1))
             let logitThreshold = maxLogit - 12.0
-            
+
             var validLogits: [(Int, Float)] = []
             validLogits.reserveCapacity(1000)
             for i in 0..<nVocab {
@@ -338,24 +353,38 @@ actor LlamaRunner {
             // Detokenize
             var tokenBuf = [CChar](repeating: 0, count: 256)
             let nChars = llama_token_to_piece(vocab, bestId, &tokenBuf, 256, 0, false)
+            var yieldedRealToken = false
             if nChars > 0 {
                 let piece = String(bytes: tokenBuf.prefix(Int(nChars)).map { UInt8(bitPattern: $0) }, encoding: .utf8) ?? ""
                 if !piece.isEmpty {
-                    // --- ADD THIS BLOCK HERE ---
-                    if piece.contains(".") && accumulatedOutput.count < 5 {
-                         // If we are just starting and the model tries to output a dot, ignore it!
-                         continue 
-                    }
-                    // ---------------------------
                     accumulatedOutput += piece
 
-                    // Stop String check — prevents models talking to themselves
-                    let lower = accumulatedOutput.lowercased()
-                    if lower.hasSuffix("[inst]") || lower.hasSuffix("user:") || lower.hasSuffix("<|im_end|>") || lower.hasSuffix("<start_of_turn>user") || lower.hasSuffix("<|user|>") {
-                        break
+                    // Update the rolling tag-detection buffer (O(1) — avoids O(N) full-string lowercasing)
+                    thinkingTagBuffer += piece
+                    if thinkingTagBuffer.count > 50 { thinkingTagBuffer = String(thinkingTagBuffer.suffix(50)) }
+                    let bufLower = thinkingTagBuffer.lowercased()
+
+                    // Detect thinking block entry (latch — checked only until first open tag)
+                    if !hasEnteredThinkingBlock {
+                        hasEnteredThinkingBlock = thinkingOpenMarkers.contains { bufLower.contains($0) }
+                    }
+                    // Detect thinking block exit (latch — checked only until first close tag)
+                    if hasEnteredThinkingBlock && !hasExitedThinkingBlock {
+                        hasExitedThinkingBlock = thinkingCloseMarkers.contains { bufLower.contains($0) }
                     }
 
-                    continuation.yield(piece)
+                    let inThinkingBlock = hasEnteredThinkingBlock && !hasExitedThinkingBlock
+
+                    if !inThinkingBlock {
+                        // Real content — check stop strings and stream to UI
+                        let lower = accumulatedOutput.lowercased()
+                        if lower.hasSuffix("[inst]") || lower.hasSuffix("user:") || lower.hasSuffix("<|im_end|>") || lower.hasSuffix("<start_of_turn>user") || lower.hasSuffix("<|user|>") {
+                            break
+                        }
+                        continuation.yield(piece)
+                        yieldedRealToken = true
+                    }
+                    // Thinking-block tokens: silently consumed — no UI yield, no budget decrement.
                 }
             }
 
@@ -363,15 +392,15 @@ actor LlamaRunner {
             recentTokens.append(bestId)
             if recentTokens.count > 64 { recentTokens.removeFirst() }
 
-            // Advance
+            // Advance KV cache
             singleBatch.token[0] = bestId
-            singleBatch.pos[0] = nPos
+            singleBatch.pos[0]   = nPos
             singleBatch.n_seq_id[0] = 1
             if let seqIdPtr = singleBatch.seq_id[0] {
                 seqIdPtr.pointee = 0
             }
             singleBatch.logits[0] = 1
-            singleBatch.n_tokens = 1
+            singleBatch.n_tokens  = 1
 
             // Guard against context overflow gracefully
             if nPos >= Int32(nCtxTokens) - 1 {
@@ -383,7 +412,8 @@ actor LlamaRunner {
             if llama_decode(ctx, singleBatch) != 0 { break }
 
             nPos += 1
-            generatedCount += 1
+            // Only increment the response budget counter for real (non-thinking) tokens
+            if yieldedRealToken { generatedCount += 1 }
         }
 
         continuation.finish()
@@ -392,7 +422,7 @@ actor LlamaRunner {
     deinit {
         if let ctx = context { llama_free(ctx) }
         if let mdl = model   { llama_model_free(mdl) }
-        llama_backend_free()
+        // Note: llama_backend_free() is only called in unload() to avoid a double-free.
     }
 }
 
@@ -457,7 +487,6 @@ class LLMManager: ObservableObject {
     init() {
         self.systemMemoryGB = getPhysicalMemory()
         setupAppLifecycleObservers()
-        freeSwapStorage()
     }
 
     // MARK: - App Lifecycle - Clean unload on background/termination
@@ -489,26 +518,6 @@ class LLMManager: ObservableObject {
     }
 
     // MARK: - Memory
-    func freeSwapStorage() {
-        Task.detached(priority: .background) {
-            let fileManager = FileManager.default
-            let urls = fileManager.urls(for: .documentDirectory, in: .userDomainMask)
-            guard let docDir = urls.first else { return }
-            
-            // Delete old chunk files if they exist
-            if let existingFiles = try? fileManager.contentsOfDirectory(atPath: docDir.path) {
-                for file in existingFiles where file.hasPrefix("swap_chunk_") {
-                    try? fileManager.removeItem(atPath: docDir.appendingPathComponent(file).path)
-                }
-            }
-            
-            let filePath = docDir.appendingPathComponent("swap_reserve.bin").path
-            if fileManager.fileExists(atPath: filePath) {
-                try? fileManager.removeItem(atPath: filePath)
-            }
-        }
-    }
-
     func getPhysicalMemory() -> Double {
         return Double(ProcessInfo.processInfo.physicalMemory) / (1024.0 * 1024.0 * 1024.0)
     }
@@ -582,12 +591,18 @@ class LLMManager: ObservableObject {
 
     func unloadModel() {
         Task {
-            await runner.requestCancel()
-            await runner.unloadModelOnly()
+            await unloadModelAsync()
         }
-        activeModelURL = nil
-        loadState = .unloaded
-        modelSupportsVision = false
+    }
+    
+    func unloadModelAsync() async {
+        await runner.requestCancel()
+        await runner.unloadModelOnly()
+        await MainActor.run {
+            self.activeModelURL = nil
+            self.loadState = .unloaded
+            self.modelSupportsVision = false
+        }
     }
 
     func cancelGeneration() {
@@ -701,33 +716,15 @@ class LLMManager: ObservableObject {
 
                 accumulated += piece
                 
-                // Infinite Loop Prevention (The "..." Loop)
-                let trimmed = accumulated.trimmingCharacters(in: CharacterSet(charactersIn: ". \\n"))
-                if trimmed.isEmpty && elapsed > 5.0 && accumulated.contains(".") {
-                    // We are trapped in a dot loop. Break and restart.
+                // Infinite Loop Prevention — detect dot/space loops
+                let trimmed = accumulated.trimmingCharacters(in: CharacterSet(charactersIn: ". \n"))
+                if trimmed.isEmpty && elapsed > 5.0 && accumulated.count > 10 {
                     await self.runner.requestCancel()
-                    
                     await MainActor.run {
-                        onToken("\\n[Loop detected. Breaking...]\\n")
+                        onToken("\n[Loop detected. Stopping generation.]")
                         self.isGenerating = false
                     }
-                    
-                    // Restart with a temperature boost to break the cycle
-                    Task {
-                        await MainActor.run {
-                            self.generateResponse(
-                                prompt: prompt,
-                                history: history,
-                                systemPrompt: systemPrompt,
-                                memoriesContext: memoriesContext,
-                                ragContext: ragContext,
-                                temperatureBoost: temperatureBoost + 0.2,
-                                onToken: onToken,
-                                onComplete: onComplete
-                            )
-                        }
-                    }
-                    return // Exit the current generation thread
+                    return
                 }
 
                 await MainActor.run {
@@ -746,16 +743,18 @@ class LLMManager: ObservableObject {
     func generateBackgroundAnalysis(prompt: String) async -> String? {
         guard case .loaded = loadState else { return nil }
         
-        let msg = (role: "user", content: prompt)
+        // System message ensures the analysis result is plain text, not markdown-polluted
+        let systemMsg = (role: "system", content: "Respond in plain text only. No asterisks, no bullet points, no markdown headers, no thinking tags. Write each observation as a plain sentence on its own line.")
+        let userMsg = (role: "user", content: prompt)
         
         var accumulated = ""
         
         let stream = AsyncStream<String> { continuation in
             Task {
                 await runner.generateStream(
-                    messages: [msg],
-                    maxTokens: 512, // Keep analysis reasonably bounded
-                    temperature: 0.3, // Low temp for analytical tasks
+                    messages: [systemMsg, userMsg],
+                    maxTokens: 512,
+                    temperature: 0.3,
                     continuation: continuation
                 )
             }
@@ -765,7 +764,7 @@ class LLMManager: ObservableObject {
             accumulated += piece
         }
         
-        return accumulated
+        return accumulated.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
 }

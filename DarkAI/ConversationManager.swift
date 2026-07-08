@@ -6,6 +6,10 @@ struct ChatMessage: Identifiable, Codable, Equatable {
     var isUser: Bool
     var text: String
     var timestamp: Date = Date()
+    /// JPEG data for AI-generated images. nil for text-only messages.
+    var imageData: Data? = nil
+
+    var isImageMessage: Bool { imageData != nil }
 }
 
 struct Conversation: Identifiable, Codable, Equatable {
@@ -107,6 +111,27 @@ class ConversationManager: ObservableObject {
            !conversations[index].messages.isEmpty {
             let lastIndex = conversations[index].messages.count - 1
             conversations[index].messages[lastIndex].text = text
+        }
+    }
+
+    /// Appends a completed AI-generated image message to the active conversation.
+    func addImageMessageToActive(prompt: String, imageData: Data) {
+        guard let activeId = activeConversationId else { return }
+        if let index = conversations.firstIndex(where: { $0.id == activeId }) {
+            let msg = ChatMessage(isUser: false, text: prompt, imageData: imageData)
+            conversations[index].messages.append(msg)
+            saveConversations()
+            objectWillChange.send()
+        }
+    }
+
+    /// Updates the imageData of the last message (used while generation completes).
+    func updateLastMessageImage(imageData: Data) {
+        guard let activeId = activeConversationId else { return }
+        if let index = conversations.firstIndex(where: { $0.id == activeId }),
+           !conversations[index].messages.isEmpty {
+            let lastIndex = conversations[index].messages.count - 1
+            conversations[index].messages[lastIndex].imageData = imageData
         }
     }
 }

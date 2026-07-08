@@ -57,16 +57,15 @@ class PersonalityManager: ObservableObject {
     
     func getPersonality(for modelName: String) -> String {
         let profile = modelPersonalities[modelName] ?? ""
-        if profile.isEmpty {
-            return "You are DarkAI, a highly capable assistant. Provide concise, helpful answers."
-        }
+        guard !profile.isEmpty else { return "" }
         
-        return """
-        critical instruction: drop all ai formalities. forget perfect grammar. u must explicitly mimic the user's exact typos, lowercase letters, missing punctuation, and slang. respond exactly as the user texts fr.
-
-        [user style matrix]:
-        \(profile)
-        """
+        // Require at least 2 distinct trait lines before personality has enough signal to apply
+        let entryCount = profile.components(separatedBy: "\n")
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            .count
+        guard entryCount >= 2 else { return "" }
+        
+        return "[User Style Matrix — Adapt your communication style naturally to match the user's patterns]:\n\(profile)"
     }
     
     func analyzeUserMessage(_ message: String, modelName: String, llmManager: LLMManager?) {
@@ -112,9 +111,9 @@ class PersonalityManager: ObservableObject {
         
         if !newTraits.isEmpty {
             if currentProfile.isEmpty {
-                currentProfile = newTraits.joined(separator: "\\n- ")
+                currentProfile = newTraits.joined(separator: "\n")
             } else {
-                currentProfile += "\\n- " + newTraits.joined(separator: "\\n- ")
+                currentProfile += "\n" + newTraits.joined(separator: "\n")
             }
             modelPersonalities[modelName] = currentProfile
             
@@ -127,9 +126,11 @@ class PersonalityManager: ObservableObject {
         // --- 2. Batching & Background Style Analysis ---
         messageBatch.append(message)
         
-        if messageBatch.count >= 3, let llm = llmManager {
+        if messageBatch.count >= 3 {
             let batchedText = messageBatch.joined(separator: "\n\n")
-            messageBatch.removeAll() // Clear batch
+            messageBatch.removeAll() // Always clear batch to prevent unbounded growth
+            
+            guard let llm = llmManager else { return }
             
             Task {
                 let analysisPrompt = """
@@ -139,19 +140,35 @@ class PersonalityManager: ObservableObject {
                 3. Run-on sentences
                 4. Distinct slang or vocabulary
                 
-                Respond ONLY with a bulleted list of strict instructions on how to mimic this style exactly. Do not include any filler text.
+                Summarize the communication style as a short list of plain-text observations. Do not use bullet points, asterisks, or markdown formatting.
                 
                 User Messages:
                 \(batchedText)
                 """
                 
-                if let analysis = await llm.generateBackgroundAnalysis(prompt: analysisPrompt) {
+                if let rawAnalysis = await llm.generateBackgroundAnalysis(prompt: analysisPrompt) {
+                    // Strip any markdown formatting before embedding in the personality profile
+                    var analysis = rawAnalysis
+                    analysis = analysis.replacingOccurrences(of: "**", with: "")
+                    analysis = analysis.replacingOccurrences(of: "__", with: "")
+                    let cleanedLines = analysis.components(separatedBy: "\n").map { line -> String in
+                        var l = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if l.hasPrefix("### ") { l = String(l.dropFirst(4)) }
+                        else if l.hasPrefix("## ") { l = String(l.dropFirst(3)) }
+                        else if l.hasPrefix("# ") { l = String(l.dropFirst(2)) }
+                        if l.hasPrefix("- ") { l = String(l.dropFirst(2)) }
+                        else if l.hasPrefix("• ") { l = String(l.dropFirst(2)) }
+                        else if l.hasPrefix("* ") { l = String(l.dropFirst(2)) }
+                        return l
+                    }.filter { !$0.isEmpty }
+                    analysis = cleanedLines.joined(separator: "\n")
+                    
                     await MainActor.run {
                         var updatedProfile = self.modelPersonalities[modelName] ?? ""
-                        if !updatedProfile.contains(analysis) {
-                            updatedProfile += "\n\n[STYLE ANALYSIS]\n" + analysis.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !analysis.isEmpty && !updatedProfile.contains(analysis) {
+                            updatedProfile += "\n\n[STYLE ANALYSIS]\n" + analysis
                             
-                            // Limit size
+                            // Limit size to prevent unbounded growth
                             let lines = updatedProfile.components(separatedBy: "\n")
                             if lines.count > 100 {
                                 updatedProfile = ([lines[0]] + lines.suffix(99)).joined(separator: "\n")

@@ -7,21 +7,28 @@ struct SettingsView: View {
     @ObservedObject var memoryManager: MemoryManager
     @ObservedObject var ragManager: RAGManager
     @ObservedObject var personalityManager: PersonalityManager
-    
+    @ObservedObject var diffusionManager: DiffusionManager
+
     @Binding var customInstructions: String
     @Binding var enableRAG: Bool
     @Binding var enableMemories: Bool
-    
+
     @State private var importedModels: [URL] = []
     @State private var showModelImporter = false
     @State private var isImporting = false
     @State private var importProgress = ""
     @State private var showResetPersonalityAlert = false
-    
+
+    // Diffusion model import
+    @State private var importedDiffusionModels: [URL] = []
+    @State private var showDiffusionImporter = false
+    @State private var isDiffusionImporting = false
+    @State private var diffusionImportProgress = ""
+
     // Context Warning
     @State private var showContextWarningPopup = false
     @State private var showInvalidFileTypeAlert = false
-    
+
     // Failsafe Modal States
     @State private var showFailsafePopup = false
     @State private var selectedModelToLoad: URL? = nil
@@ -100,7 +107,167 @@ struct SettingsView: View {
                             }
                         }
                         .glassCard(cornerRadius: 16)
-                        
+
+                        // SECTION 1b: Diffusion Model Manager
+                        VStack(alignment: .leading, spacing: 14) {
+                            HStack {
+                                Image(systemName: "photo.badge.plus")
+                                    .foregroundColor(Color.purple)
+                                    .font(.headline)
+                                Text("DIFFUSION MODEL (.GGUF)")
+                                    .font(.system(size: 14, weight: .bold))
+                                    .foregroundColor(Theme.textPrimary)
+                                    .kerning(1.2)
+                                Spacer()
+                                Button(action: { showDiffusionImporter = true }) {
+                                    HStack(spacing: 6) {
+                                        Image(systemName: "plus")
+                                        Text("Import")
+                                    }
+                                    .font(.system(size: 12, weight: .bold))
+                                    .foregroundColor(.white)
+                                    .padding(.horizontal, 12)
+                                    .padding(.vertical, 6)
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 8)
+                                            .fill(LinearGradient(
+                                                colors: [Color.purple, Color.purple.opacity(0.6)],
+                                                startPoint: .leading, endPoint: .trailing))
+                                    )
+                                }
+                            }
+
+                            // Diffusion model list
+                            if importedDiffusionModels.isEmpty {
+                                Text("No diffusion model imported. Tap 'Import' to add a diffusion .gguf model.")
+                                    .font(.system(size: 13))
+                                    .foregroundColor(Theme.textSecondary)
+                                    .padding()
+                                    .frame(maxWidth: .infinity, alignment: .center)
+                                    .glassCard(cornerRadius: 12)
+                            } else {
+                                VStack(spacing: 12) {
+                                    ForEach(importedDiffusionModels, id: \.self) { url in
+                                        diffusionModelRow(for: url)
+                                    }
+                                }
+                            }
+
+                            if isDiffusionImporting {
+                                HStack {
+                                    ProgressView()
+                                        .progressViewStyle(CircularProgressViewStyle(tint: Color.purple))
+                                    Text(diffusionImportProgress)
+                                        .font(.system(size: 13, weight: .medium))
+                                        .foregroundColor(Theme.textPrimary)
+                                        .padding(.leading, 8)
+                                    Spacer()
+                                }
+                                .padding()
+                                .background(Theme.background)
+                                .cornerRadius(12)
+                                .overlay(RoundedRectangle(cornerRadius: 12)
+                                    .stroke(Color.purple.opacity(0.3), lineWidth: 1))
+                            }
+
+                            // Current diffusion load state
+                            switch diffusionManager.diffusionLoadState {
+                            case .loading(_, let status):
+                                HStack(spacing: 8) {
+                                    ProgressView()
+                                        .progressViewStyle(CircularProgressViewStyle(tint: Color.purple))
+                                        .scaleEffect(0.8)
+                                    Text(status)
+                                        .font(.system(size: 12, design: .monospaced))
+                                        .foregroundColor(Theme.textSecondary)
+                                }
+                            case .failed(let err):
+                                Text("Error: \(err)")
+                                    .font(.system(size: 12))
+                                    .foregroundColor(.red.opacity(0.8))
+                            default:
+                                EmptyView()
+                            }
+
+                            Divider().background(Theme.border)
+
+                            // Generation settings sub-section
+                            Text("GENERATION PARAMETERS")
+                                .font(.system(size: 11, weight: .bold))
+                                .foregroundColor(Theme.textSecondary)
+                                .kerning(1.0)
+
+                            // Steps
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack {
+                                    Text("Inference Steps:")
+                                        .font(.system(size: 13))
+                                        .foregroundColor(Theme.textSecondary)
+                                    Spacer()
+                                    Text("\(diffusionManager.steps)")
+                                        .font(.system(size: 13, weight: .bold, design: .monospaced))
+                                        .foregroundColor(Color.purple)
+                                }
+                                Slider(value: Binding(
+                                    get: { Double(diffusionManager.steps) },
+                                    set: { diffusionManager.steps = Int($0) }
+                                ), in: 4...50, step: 1)
+                                .accentColor(Color.purple)
+                            }
+
+                            Divider().background(Theme.border)
+
+                            // CFG Scale
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack {
+                                    Text("CFG Scale (Prompt Strength):")
+                                        .font(.system(size: 13))
+                                        .foregroundColor(Theme.textSecondary)
+                                    Spacer()
+                                    Text(String(format: "%.1f", diffusionManager.cfgScale))
+                                        .font(.system(size: 13, weight: .bold, design: .monospaced))
+                                        .foregroundColor(Color.purple)
+                                }
+                                Slider(value: $diffusionManager.cfgScale, in: 1.0...12.0, step: 0.5)
+                                    .accentColor(Color.purple)
+                            }
+
+                            Divider().background(Theme.border)
+
+                            // Output resolution
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Output Resolution:")
+                                    .font(.system(size: 13))
+                                    .foregroundColor(Theme.textSecondary)
+                                HStack(spacing: 8) {
+                                    ForEach([256, 512, 768, 1024], id: \.self) { size in
+                                        Button(action: { diffusionManager.outputSize = size }) {
+                                            Text("\(size)")
+                                                .font(.system(size: 12, weight: .bold, design: .monospaced))
+                                                .foregroundColor(diffusionManager.outputSize == size ? .white : Theme.textSecondary)
+                                                .padding(.horizontal, 12)
+                                                .padding(.vertical, 6)
+                                                .background(
+                                                    RoundedRectangle(cornerRadius: 8)
+                                                        .fill(diffusionManager.outputSize == size
+                                                            ? Color.purple
+                                                            : Theme.border.opacity(0.4))
+                                                )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        .glassCard(cornerRadius: 16)
+                        .fileImporter(
+                            isPresented: $showDiffusionImporter,
+                            allowedContentTypes: [UTType.data],
+                            allowsMultipleSelection: false
+                        ) { result in
+                            handleDiffusionImport(result)
+                        }
+                        .onAppear { loadDiffusionModels() }
+
                         // SECTION 2: Custom Prompt Instructions
                         VStack(alignment: .leading, spacing: 12) {
                             HStack {
@@ -162,7 +329,7 @@ struct SettingsView: View {
                                                     showContextWarningPopup = true
                                                 }
                                             }
-                                        ), in: 512...4096, step: 256)
+                                        ), in: 512...8192, step: 256)
                                         .accentColor(Theme.accent)
                                     }
                                 }
@@ -662,7 +829,20 @@ struct SettingsView: View {
             
             Spacer()
             
-            if isLoaded {
+            HStack(spacing: 8) {
+                if !isLoaded {
+                    Button(action: { deleteModel(at: url, isDiffusion: false) }) {
+                        Image(systemName: "trash")
+                            .font(.system(size: 12))
+                            .foregroundColor(Theme.textSecondary)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(Theme.border)
+                            .cornerRadius(8)
+                    }
+                }
+            
+                if isLoaded {
                 // Unload button when model is currently active
                 Button(action: {
                     llmManager.unloadModel()
@@ -695,6 +875,7 @@ struct SettingsView: View {
                         .background(Theme.border)
                         .cornerRadius(8)
                 }
+            }
             }
         }
         .padding(10)
@@ -776,6 +957,21 @@ struct SettingsView: View {
         }
     }
     
+    private func deleteModel(at url: URL, isDiffusion: Bool) {
+        do {
+            if FileManager.default.fileExists(atPath: url.path) {
+                try FileManager.default.removeItem(at: url)
+            }
+            if isDiffusion {
+                loadDiffusionModels()
+            } else {
+                refreshModelList()
+            }
+        } catch {
+            print("Failed to delete model: \(error.localizedDescription)")
+        }
+    }
+    
     private func copyModelToAppDocuments(from sourceURL: URL) {
         guard sourceURL.startAccessingSecurityScopedResource() else { return }
         
@@ -836,6 +1032,124 @@ struct SettingsView: View {
         }
     }
     
+
+    // MARK: - Diffusion Model Helpers
+
+    private func diffusionModelRow(for url: URL) -> some View {
+        let sizeGB = diffusionManager.getFileSizeGB(at: url)
+        let isSelected = diffusionManager.lastDiffusionModelPath == url.path
+
+        return HStack(spacing: 12) {
+            Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                .font(.system(size: 14))
+                .foregroundColor(isSelected ? .purple : Theme.textSecondary)
+                .frame(width: 24)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(url.lastPathComponent)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(Theme.textPrimary)
+                    .lineLimit(1)
+                Text(String(format: "%.2f GB", sizeGB))
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundColor(Theme.textSecondary)
+            }
+
+            Spacer()
+
+            HStack(spacing: 8) {
+                if !isSelected {
+                    Button(action: { deleteModel(at: url, isDiffusion: true) }) {
+                        Image(systemName: "trash")
+                            .font(.system(size: 12))
+                            .foregroundColor(Theme.textSecondary)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(Theme.cardBackground)
+                            .overlay(RoundedRectangle(cornerRadius: 6).stroke(Theme.border, lineWidth: 1))
+                    }
+                }
+            
+                if isSelected {
+                    Text("SELECTED")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundColor(.purple)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .overlay(RoundedRectangle(cornerRadius: 6)
+                            .stroke(Color.purple.opacity(0.5), lineWidth: 1))
+                } else {
+                    Button(action: { diffusionManager.lastDiffusionModelPath = url.path }) {
+                        HStack(spacing: 4) {
+                            Text("SELECT")
+                        }
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .background(
+                            RoundedRectangle(cornerRadius: 6)
+                                .fill(LinearGradient(
+                                    colors: [Color.purple, Color.purple.opacity(0.7)],
+                                    startPoint: .leading, endPoint: .trailing))
+                        )
+                    }
+                }
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
+        .background(Theme.cardBackground)
+        .cornerRadius(10)
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Theme.border, lineWidth: 1))
+    }
+
+    private func handleDiffusionImport(_ result: Result<[URL], Error>) {
+        switch result {
+        case .success(let urls):
+            guard let sourceURL = urls.first else { return }
+            guard sourceURL.pathExtension.lowercased() == "gguf" else { return }
+            isDiffusionImporting = true
+            diffusionImportProgress = "Copying \(sourceURL.lastPathComponent)…"
+            Task {
+                let isSecured = sourceURL.startAccessingSecurityScopedResource()
+                defer { if isSecured { sourceURL.stopAccessingSecurityScopedResource() } }
+                guard let docsURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
+                    await MainActor.run { isDiffusionImporting = false }
+                    return
+                }
+                let modelsDir = docsURL.appendingPathComponent("DiffusionModels")
+                try? FileManager.default.createDirectory(at: modelsDir, withIntermediateDirectories: true)
+                let destURL = modelsDir.appendingPathComponent(sourceURL.lastPathComponent)
+                do {
+                    if FileManager.default.fileExists(atPath: destURL.path) {
+                        try FileManager.default.removeItem(at: destURL)
+                    }
+                    try FileManager.default.copyItem(at: sourceURL, to: destURL)
+                    await MainActor.run { isDiffusionImporting = false; loadDiffusionModels() }
+                } catch {
+                    await MainActor.run {
+                        isDiffusionImporting = false
+                        diffusionImportProgress = "Import failed: \(error.localizedDescription)"
+                    }
+                }
+            }
+        case .failure(let error):
+            print("Diffusion import error: \(error)")
+        }
+    }
+
+    private func loadDiffusionModels() {
+        guard let docsURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else { return }
+        let modelsDir = docsURL.appendingPathComponent("DiffusionModels")
+        guard let contents = try? FileManager.default.contentsOfDirectory(
+            at: modelsDir, includingPropertiesForKeys: [.fileSizeKey], options: .skipsHiddenFiles
+        ) else { return }
+        importedDiffusionModels = contents
+            .filter { $0.pathExtension.lowercased() == "gguf" }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+    }
+
 }
 
 struct LogExportView: View {

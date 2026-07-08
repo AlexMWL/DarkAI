@@ -90,10 +90,6 @@ class MemoryManager: ObservableObject {
         matchPrefix(lower, message, prefix: "i'm studying ", format: { "User is studying \($0)." })
         matchPrefix(lower, message, prefix: "my job is ", format: { "User's job is \($0)." })
         
-        // — Health & Traits —
-        matchPrefix(lower, message, prefix: "i am allergic to ", format: { "User is allergic to \($0)." })
-        matchPrefix(lower, message, prefix: "i'm allergic to ", format: { "User is allergic to \($0)." })
-
         // — Likes / Dislikes —
         matchPrefix(lower, message, prefix: "i love ", format: { "User loves \($0)." })
         matchPrefix(lower, message, prefix: "i like ", format: { "User likes \($0)." })
@@ -124,8 +120,6 @@ class MemoryManager: ObservableObject {
         matchPrefix(lower, message, prefix: "i should ", format: { "User should \($0)." })
         
         // — Interests & Hobbies —
-        matchPrefix(lower, message, prefix: "i'm interested in ", format: { "User is interested in \($0)." })
-        matchPrefix(lower, message, prefix: "i am interested in ", format: { "User is interested in \($0)." })
         matchPrefix(lower, message, prefix: "i'm fascinated by ", format: { "User is fascinated by \($0)." })
         matchPrefix(lower, message, prefix: "i am fascinated by ", format: { "User is fascinated by \($0)." })
         matchPrefix(lower, message, prefix: "my hobby is ", format: { "User's hobby is \($0)." })

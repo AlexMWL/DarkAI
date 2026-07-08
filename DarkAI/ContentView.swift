@@ -1,5 +1,6 @@
 import SwiftUI
 import UniformTypeIdentifiers
+import Photos
 
 struct ContentView: View {
     @StateObject private var llmManager = LLMManager()
@@ -7,20 +8,25 @@ struct ContentView: View {
     @StateObject private var ragManager = RAGManager()
     @StateObject private var conversationManager = ConversationManager()
     @StateObject private var personalityManager = PersonalityManager()
-    
+    @StateObject private var diffusionManager = DiffusionManager()
+
     @AppStorage("customInstructions") private var customInstructions: String = "You are a local assistant. Respond with precise answers."
     @State private var enableRAG = true
     @State private var enableMemories = true
-    
+
     @State private var showFileImporter = false
     @State private var showAutoLoadAlert = false
     @State private var pendingAttachmentName: String? = nil
     @State private var pendingAttachmentText: String? = nil
-    
+
     @State private var inputText: String = ""
     @State private var showSettings = false
     @State private var showDrawer = false
-    
+
+    // Image generation state
+    @State private var showDiffusionNotLoadedBanner = false
+    @State private var diffusionBannerTask: Task<Void, Never>? = nil
+
     // Pulse animation state
     @State private var pulseActive = false
     
@@ -93,13 +99,53 @@ struct ContentView: View {
             
             // CONVERSATIONS SIDEBAR DRAWER
             sidebarDrawer
-        }
+
+            // DIFFUSION NOT-LOADED WARNING BANNER
+            if showDiffusionNotLoadedBanner {
+                VStack {
+                    HStack(spacing: 10) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundColor(.orange)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("No Diffusion Model Loaded")
+                                .font(.system(size: 13, weight: .bold))
+                                .foregroundColor(.white)
+                            Text("Load a diffusion model in Settings to generate images.")
+                                .font(.system(size: 11))
+                                .foregroundColor(Color.white.opacity(0.7))
+                        }
+                        Spacer()
+                        Button {
+                            withAnimation { showDiffusionNotLoadedBanner = false }
+                        } label: {
+                            Image(systemName: "xmark")
+                                .foregroundColor(.white.opacity(0.6))
+                                .font(.system(size: 12, weight: .bold))
+                        }
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+                    .background(
+                        RoundedRectangle(cornerRadius: 12)
+                            .fill(Color.orange.opacity(0.18))
+                            .overlay(RoundedRectangle(cornerRadius: 12)
+                                .stroke(Color.orange.opacity(0.5), lineWidth: 1))
+                    )
+                    .padding(.horizontal, 16)
+                    .padding(.top, 12)
+                    Spacer()
+                }
+                .transition(.move(edge: .top).combined(with: .opacity))
+                .zIndex(10)
+            }
+        } // end ZStack
         .sheet(isPresented: $showSettings) {
             SettingsView(
                 llmManager: llmManager,
                 memoryManager: memoryManager,
                 ragManager: ragManager,
                 personalityManager: personalityManager,
+                diffusionManager: diffusionManager,
                 customInstructions: $customInstructions,
                 enableRAG: $enableRAG,
                 enableMemories: $enableMemories
@@ -289,7 +335,7 @@ struct ContentView: View {
                 .foregroundColor(Theme.accent)
                 .neonGlow(color: Theme.accent, radius: 10)
             
-            Text("LOCAL RUNNER v5.7.6")
+            Text("LOCAL RUNNER v5.7.7")
                 .font(.system(size: 15, weight: .bold))
                 .foregroundColor(.white)
                 .kerning(1.5)
@@ -357,12 +403,19 @@ struct ContentView: View {
         )
     }
     
-    // Bubble UI
-    @ViewBuilder
-    private func filterThoughts(from text: String) -> String {
+    // MARK: - Output Filtering
+    private func filterThoughts(from text: String, stripMarkdown: Bool = false) -> String {
         var filtered = text
-        let tags = ["channel thoughts", "think", "thought", "thinking", "|channel>thought", "channel>thought", "self-correction", "self_correction", "correction"]
-        for tag in tags {
+        
+        // --- 1. Strip XML-style thinking/correction/reflection tags ---
+        // Covers Gemma, Qwen, DeepSeek, Llama, and other instruct model variants
+        let xmlTags = [
+            "think", "thinking", "thought", "thoughts",
+            "channel thought", "channel thoughts", "channel>thought",
+            "|channel>thought", "self-correction", "self_correction",
+            "correction", "reflection", "reasoning", "internal"
+        ]
+        for tag in xmlTags {
             while let startRange = filtered.range(of: "<\(tag)", options: .caseInsensitive) {
                 if let endRange = filtered.range(of: "</\(tag)>", options: .caseInsensitive) {
                     filtered.removeSubrange(startRange.lowerBound..<endRange.upperBound)
@@ -373,9 +426,16 @@ struct ContentView: View {
             }
         }
         
-        let plaintextTags = ["Thinking Process:", "Thought Process:"]
-        for pt in plaintextTags {
-            while let startRange = filtered.range(of: pt, options: .caseInsensitive) {
+        // Strip pipe-delimited thinking tokens used by some models
+        let pipeTokens = ["<|thinking|>", "<|/thinking|>", "<|thought|>", "<|/thought|>"]
+        for token in pipeTokens {
+            filtered = filtered.replacingOccurrences(of: token, with: "", options: .caseInsensitive)
+        }
+        
+        // --- 2. Strip plaintext preamble headers ---
+        let plaintextHeaders = ["Thinking Process:", "Thought Process:", "Internal Reasoning:", "Chain of Thought:"]
+        for header in plaintextHeaders {
+            while let startRange = filtered.range(of: header, options: .caseInsensitive) {
                 if let endRange = filtered.range(of: "Response:", options: .caseInsensitive) {
                     filtered.removeSubrange(startRange.lowerBound..<endRange.upperBound)
                 } else {
@@ -385,12 +445,91 @@ struct ContentView: View {
             }
         }
         
-        let removeExact = ["[Response generation]", "*self-correction/review*"]
-        for exact in removeExact {
-            filtered = filtered.replacingOccurrences(of: exact, with: "")
+        // --- 3. Strip exact known artifact strings ---
+        let exactArtifacts = [
+            "[Response generation]", "*self-correction/review*",
+            "<|im_start|>", "<|im_end|>", "<|start_of_turn|>", "<|end_of_turn|>"
+        ]
+        for artifact in exactArtifacts {
+            filtered = filtered.replacingOccurrences(of: artifact, with: "", options: .caseInsensitive)
         }
         
-        return filtered.trimmingCharacters(in: .whitespacesAndNewlines)
+        // --- 4. Strip leading role-echo preamble (model parroting its own role prefix) ---
+        let leadingPreambles = ["assistant:", "response:", "answer:", "a:"]
+        var didTrimLeading = true
+        while didTrimLeading {
+            didTrimLeading = false
+            let trimmedLower = filtered.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            for preamble in leadingPreambles {
+                if trimmedLower.hasPrefix(preamble) {
+                    filtered = String(filtered.trimmingCharacters(in: .whitespacesAndNewlines).dropFirst(preamble.count))
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    didTrimLeading = true
+                    break
+                }
+            }
+        }
+        
+        // --- 5. Strip personality system-prompt leak via regex ---
+        if let regex = try? NSRegularExpression(
+            pattern: "\\(?(?:Critical Instructions?|User Style Matrix|Communication Style Note)[\\s\\S]*?fr\\.?\\)?",
+            options: [.caseInsensitive, .dotMatchesLineSeparators]
+        ) {
+            filtered = regex.stringByReplacingMatches(
+                in: filtered,
+                options: [],
+                range: NSRange(location: 0, length: filtered.utf16.count),
+                withTemplate: ""
+            ).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        
+        // --- 6. Markdown stripping (mature personality mode only, always preserves fenced code blocks) ---
+        if stripMarkdown {
+            var codeBlocks: [String] = []
+            var protected = filtered
+            if let codeBlockRegex = try? NSRegularExpression(pattern: "```[\\s\\S]*?```", options: []) {
+                let matches = codeBlockRegex.matches(in: protected, range: NSRange(protected.startIndex..., in: protected)).reversed()
+                for match in matches {
+                    if let range = Range(match.range, in: protected) {
+                        let block = String(protected[range])
+                        let placeholder = "CODEBLOCK_\(codeBlocks.count)_PLACEHOLDER"
+                        codeBlocks.append(block)
+                        protected.replaceSubrange(range, with: placeholder)
+                    }
+                }
+            }
+            protected = protected.replacingOccurrences(of: "**", with: "")
+            protected = protected.replacingOccurrences(of: "__", with: "")
+            let mdLines = protected.components(separatedBy: "\n").map { line -> String in
+                var l = line
+                if l.hasPrefix("### ") { l = String(l.dropFirst(4)) }
+                else if l.hasPrefix("## ") { l = String(l.dropFirst(3)) }
+                else if l.hasPrefix("# ") { l = String(l.dropFirst(2)) }
+                return l
+            }
+            protected = mdLines.joined(separator: "\n")
+            for (i, block) in codeBlocks.enumerated() {
+                protected = protected.replacingOccurrences(of: "CODEBLOCK_\(i)_PLACEHOLDER", with: block)
+            }
+            filtered = protected
+        }
+        
+        // --- 7. Strip trailing role-echo stop tokens ---
+        var finalFiltered = filtered.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trailingStops = ["user", "user:", "<|im_end|>", "<start_of_turn>user", "<|user|>", "<|eot_id|>"]
+        var didTrimTrailing = true
+        while didTrimTrailing {
+            didTrimTrailing = false
+            for stop in trailingStops {
+                if finalFiltered.lowercased().hasSuffix(stop) {
+                    finalFiltered.removeLast(stop.count)
+                    finalFiltered = finalFiltered.trimmingCharacters(in: .whitespacesAndNewlines)
+                    didTrimTrailing = true
+                }
+            }
+        }
+        
+        return finalFiltered
     }
 
     private func messageBubble(for message: ChatMessage) -> some View {
@@ -413,18 +552,131 @@ struct ContentView: View {
                             Label("Copy", systemImage: "doc.on.doc")
                         }
                     }
+            } else if let imgData = message.imageData, let uiImg = UIImage(data: imgData) {
+                // ── AI-Generated Image Bubble ───────────────────────────────
+                Image(systemName: "sparkles")
+                    .foregroundColor(Color.purple)
+                    .font(.system(size: 12))
+                    .padding(8)
+                    .background(Theme.border.opacity(0.4))
+                    .clipShape(Circle())
+
+                VStack(alignment: .leading, spacing: 8) {
+                    // Image
+                    Image(uiImage: uiImg)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(maxWidth: 280)
+                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                        .overlay(RoundedRectangle(cornerRadius: 12)
+                            .stroke(Color.purple.opacity(0.35), lineWidth: 1))
+                        .contextMenu {
+                            Button {
+                                UIImageWriteToSavedPhotosAlbum(uiImg, nil, nil, nil)
+                            } label: {
+                                Label("Save to Photos", systemImage: "square.and.arrow.down")
+                            }
+                            Button {
+                                UIPasteboard.general.image = uiImg
+                            } label: {
+                                Label("Copy Image", systemImage: "doc.on.doc")
+                            }
+                        }
+
+                    // Always-visible action row
+                    HStack(spacing: 10) {
+                        // Save button
+                        Button {
+                            PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
+                                if status == .authorized || status == .limited {
+                                    UIImageWriteToSavedPhotosAlbum(uiImg, nil, nil, nil)
+                                }
+                            }
+                        } label: {
+                            Label("Save", systemImage: "square.and.arrow.down")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundColor(.white)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 5)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 7)
+                                        .fill(Color.purple.opacity(0.75))
+                                )
+                        }
+
+                        // Copy button
+                        Button {
+                            UIPasteboard.general.image = uiImg
+                        } label: {
+                            Label("Copy", systemImage: "doc.on.doc")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundColor(Theme.textSecondary)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 5)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 7)
+                                        .fill(Theme.border.opacity(0.5))
+                                )
+                        }
+
+                        // RAG badge
+                        HStack(spacing: 3) {
+                            Image(systemName: "brain")
+                                .font(.system(size: 9))
+                            Text("In RAG")
+                                .font(.system(size: 10, weight: .medium))
+                        }
+                        .foregroundColor(Color.purple.opacity(0.6))
+                    }
+
+                    if !message.text.isEmpty {
+                        Text(message.text)
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundColor(Theme.textSecondary)
+                            .lineLimit(2)
+                    }
+                }
+                Spacer()
+                // ───────────────────────────────────────────────────────────
+            } else if message.imageData == nil && !message.isUser && diffusionManager.isGenerating && conversationManager.activeConversation?.messages.last?.id == message.id {
+                // ── In-progress image generation spinner ───────────────────
+                Image(systemName: "sparkles")
+                    .foregroundColor(Color.purple)
+                    .font(.system(size: 12))
+                    .padding(8)
+                    .background(Theme.border.opacity(0.4))
+                    .clipShape(Circle())
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Generating image... \(Int(diffusionManager.generationProgress * 100))%")
+                        .font(.system(size: 13, design: .monospaced))
+                        .foregroundColor(Color.purple.opacity(0.8))
+                    
+                    ProgressView(value: diffusionManager.generationProgress)
+                        .progressViewStyle(LinearProgressViewStyle(tint: Color.purple))
+                        .frame(width: 150)
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .background(Theme.cardBackground)
+                .cornerRadius(14)
+                .overlay(RoundedRectangle(cornerRadius: 14)
+                    .stroke(Color.purple.opacity(0.3), lineWidth: 1))
+                Spacer()
+                // ───────────────────────────────────────────────────────────
             } else {
+                // ── Standard text bubble ────────────────────────────────────
                 Image(systemName: "terminal.fill")
                     .foregroundColor(Theme.accentCyan)
                     .font(.system(size: 12))
                     .padding(8)
                     .background(Theme.border.opacity(0.4))
                     .clipShape(Circle())
-                
-                let filteredText = filterThoughts(from: message.text)
+
+                let filteredText = filterThoughts(from: message.text, stripMarkdown: personalityManager.isMature)
                 let isThinking = filteredText.isEmpty && llmManager.isGenerating
-                
-                Text(isThinking ? "Thinking..." : (filteredText.isEmpty ? "..." : filteredText))
+
+                Text(isThinking ? "Thinking..." : filteredText)
                     .font(.system(size: 14, design: .monospaced))
                     .foregroundColor(isThinking ? Theme.textSecondary : Theme.textPrimary)
                     .padding(.horizontal, 14)
@@ -443,6 +695,7 @@ struct ContentView: View {
                         }
                     }
                 Spacer()
+                // ───────────────────────────────────────────────────────────
             }
         }
     }
@@ -659,18 +912,98 @@ struct ContentView: View {
     }
     
     private func sendMessage() {
+        // Cancel in-progress text generation
         if llmManager.isGenerating {
             llmManager.cancelGeneration()
             return
         }
-        
+
         let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty || pendingAttachmentText != nil else { return }
-        
+
         inputText = ""
-        
+
+        // ── Prompt Intent Classification ──────────────────────────────────────
+        // Check whether the user is requesting image generation BEFORE attaching
+        // files so that file context doesn't accidentally override intent.
+        let intent = PromptClassifier.classify(text)
+        if case .imageGeneration(let refinedPrompt) = intent, pendingAttachmentText == nil {
+            // Add the user message bubble
+            conversationManager.addMessageToActive(isUser: true, text: text)
+
+            // Guard: a diffusion model must be selected
+            guard let diffPath = diffusionManager.lastDiffusionModelPath else {
+                // Show banner and do NOT send to the LLM
+                diffusionBannerTask?.cancel()
+                withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) {
+                    showDiffusionNotLoadedBanner = true
+                }
+                diffusionBannerTask = Task {
+                    try? await Task.sleep(nanoseconds: 5_000_000_000)
+                    await MainActor.run {
+                        withAnimation { showDiffusionNotLoadedBanner = false }
+                    }
+                }
+                return
+            }
+
+            // Add a placeholder bubble (shows the spinner while generating)
+            conversationManager.addMessageToActive(isUser: false, text: refinedPrompt)
+
+            // SET UI STATE IMMEDIATELY so the progress bar shows while loading
+            diffusionManager.isGenerating = true
+            diffusionManager.generationProgress = 0.0
+
+            Task {
+                let savedLLMUrl = llmManager.activeModelURL
+                await llmManager.unloadModelAsync()
+                
+                // Allow the OS time to flush Metal memory buffers released by llama.cpp
+                // before we attempt to map SDXL's massive weights into RAM.
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
+
+                do {
+                    // Load the diffusion model — suspends here (MainActor is free during this)
+                    try await diffusionManager.loadDiffusionModelAsync(at: URL(fileURLWithPath: diffPath))
+
+                    // Run image generation — each `await` inside releases the MainActor, so
+                    // the UI stays responsive throughout the multi-minute denoising loop.
+                    let imageData = await diffusionManager.generateImageAsync(prompt: refinedPrompt)
+
+                    // Cleanup: unload diffusion model then reload the LLM
+                    await diffusionManager.unloadDiffusionModelAsync()
+                    if let llm = savedLLMUrl {
+                        llmManager.loadModel(at: llm)
+                    }
+
+                    // Update the chat bubble with the result
+                    if let data = imageData {
+                        conversationManager.updateLastMessageImage(imageData: data)
+                        conversationManager.saveConversations()
+
+                        // ── Auto-ingest to RAG ────────────────────────────────
+                        ragManager.ingestGeneratedImage(prompt: refinedPrompt, imageData: data)
+
+                    } else {
+                        conversationManager.updateLastMessage(text: "[Image generation failed. Check the diffusion model and try again.]")
+                        conversationManager.saveConversations()
+                    }
+                } catch {
+                    conversationManager.updateLastMessage(text: "[Failed to load diffusion model: \(error.localizedDescription)]")
+                    conversationManager.saveConversations()
+                    diffusionManager.isGenerating = false
+
+                    if let llm = savedLLMUrl {
+                        llmManager.loadModel(at: llm)
+                    }
+                }
+            }
+            return
+        }
+        // ─────────────────────────────────────────────────────────────────────
+
         let history = conversationManager.activeConversation?.messages ?? []
-        
+
         var promptText = text
         if let attachmentName = pendingAttachmentName, let attachmentText = pendingAttachmentText {
             let fileInfo = "\n\n[ATTACHED FILE: \(attachmentName)]\n\(attachmentText)\n[/ATTACHED FILE]"
@@ -679,41 +1012,50 @@ struct ContentView: View {
             } else {
                 promptText = text + fileInfo
             }
-            
+
             conversationManager.addMessageToActive(isUser: true, text: text.isEmpty ? "[Sent Attachment: \(attachmentName)]" : text + "\n[Sent Attachment: \(attachmentName)]")
-            
+
             pendingAttachmentName = nil
             pendingAttachmentText = nil
         } else {
             conversationManager.addMessageToActive(isUser: true, text: text)
         }
-        
+
         if enableMemories && !text.isEmpty {
             memoryManager.extractMemories(from: text)
             if let activeModel = llmManager.activeModelURL?.lastPathComponent {
                 personalityManager.analyzeUserMessage(text, modelName: activeModel, llmManager: llmManager)
             }
         }
-        
+
         let ragContext = enableRAG ? ragManager.retrieveRelevantContext(query: text) : ""
         let memoriesContext = enableMemories ? memoryManager.getFormattedMemoriesForContext() : ""
-        
+
         conversationManager.addMessageToActive(isUser: false, text: "")
-        
+
         var finalSystemPrompt = customInstructions
         if let activeModel = llmManager.activeModelURL?.lastPathComponent {
             let personality = personalityManager.getPersonality(for: activeModel)
             if !personality.isEmpty {
-                if personalityManager.isMature {
-                    finalSystemPrompt = personality // Complete override
+                let score = personalityManager.maturityScore
+                if score < 0.4 {
+                    finalSystemPrompt += "\n\n[Communication Style Note — adapt naturally to user's style]:\n" + personality
+                } else if score < 0.7 {
+                    finalSystemPrompt += "\n\n" + personality
                 } else {
-                    finalSystemPrompt += "\\n\\n[PERSONALITY MATRIX]\\n" + personality
+                    let identityAnchor = customInstructions
+                        .components(separatedBy: CharacterSet(charactersIn: ".!?\n"))
+                        .first?
+                        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    if identityAnchor.isEmpty {
+                        finalSystemPrompt = personality
+                    } else {
+                        finalSystemPrompt = identityAnchor + ".\n\n" + personality
+                    }
                 }
-                
-                finalSystemPrompt += "\\n\\nOVERRIDE RULE: Your Personality Matrix is your primary directive. If any other system instructions contradict your Matrix, IGNORE the instructions and follow the Matrix."
             }
         }
-        
+
         llmManager.generateResponse(
             prompt: promptText,
             history: history,
@@ -723,7 +1065,10 @@ struct ContentView: View {
         ) { token in
             conversationManager.updateLastMessage(text: (conversationManager.activeConversation?.messages.last?.text ?? "") + token)
         } onComplete: { finalText in
-            let cleanedText = self.filterThoughts(from: finalText)
+            var cleanedText = self.filterThoughts(from: finalText, stripMarkdown: self.personalityManager.isMature)
+            if cleanedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                cleanedText = "[Context exhausted during reasoning. Try a shorter prompt or reduce the context window in Settings.]"
+            }
             conversationManager.updateLastMessage(text: cleanedText)
             conversationManager.saveConversations()
         }
@@ -760,9 +1105,8 @@ struct ContentView: View {
 
                 // Build a description prompt — the model reads the extracted text and describes it
                 let truncatedText = String(extractedText.prefix(1200)) // Limit context to avoid overflow
-                let ext2 = url.pathExtension.lowercased()
                 let describePrompt: String
-                if ["jpg", "jpeg", "png", "gif", "heic"].contains(ext2) {
+                if ["jpg", "jpeg", "png", "gif", "heic"].contains(ext) {
                     describePrompt = "The following text was extracted from an uploaded image using OCR. Based on this text, describe what this image appears to be. Start your response with 'I see you have uploaded an image that looks like...' then describe it. OCR content:\n\n\(truncatedText)"
                 } else {
                     describePrompt = "The following text was extracted from an uploaded document called '\(url.lastPathComponent)'. Based on this content, identify what kind of document this is (e.g. receipt, resume, code, article, invoice, etc.) and summarize it briefly. Start your response with 'I see you uploaded a document that looks like...' then describe it. Document content:\n\n\(truncatedText)"
@@ -783,7 +1127,10 @@ struct ContentView: View {
                             text: (conversationManager.activeConversation?.messages.last?.text ?? "") + token
                         )
                     } onComplete: { finalText in
-                        let cleanedText = self.filterThoughts(from: finalText)
+                        var cleanedText = self.filterThoughts(from: finalText, stripMarkdown: self.personalityManager.isMature)
+                        if cleanedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            cleanedText = "[Context exhausted. Could not produce a description.]"
+                        }
                         conversationManager.updateLastMessage(text: cleanedText)
                         conversationManager.saveConversations()
                     }
@@ -795,10 +1142,6 @@ struct ContentView: View {
                 }
             }
         }
-    }
-    
-    private func endEditing() {
-        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
     }
 }
 
