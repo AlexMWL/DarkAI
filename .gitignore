@@ -3,3 +3,4 @@ llama-b9837-xcframework.zip
 build_log.txt
 DarkAI.xcodeproj/project.xcworkspace/xcuserdata/alexmwl.xcuserdatad/UserInterfaceState.xcuserstate
 *.xcuserstate
+/stable-diffusion.cpp
