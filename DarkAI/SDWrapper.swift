@@ -30,6 +30,10 @@ class SDWrapper {
         // Each extra thread requires additional working memory for intermediate ggml tensors.
         ctxParams.n_threads = 2
         
+        // Enable Flash Attention to aggressively reduce VRAM usage during the denoising loop
+        ctxParams.flash_attn = true
+        ctxParams.diffusion_flash_attn = true
+        
         sd_ctx = new_sd_ctx(&ctxParams)
         
         if sd_ctx == nil {
@@ -41,7 +45,9 @@ class SDWrapper {
     
     func unload() {
         if let ctx = sd_ctx {
-            free_sd_ctx(ctx)
+            autoreleasepool {
+                free_sd_ctx(ctx)
+            }
             sd_ctx = nil
         }
         isLoaded = false

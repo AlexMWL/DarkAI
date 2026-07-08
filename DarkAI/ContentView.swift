@@ -912,6 +912,12 @@ struct ContentView: View {
     }
     
     private func sendMessage() {
+        // Prevent sending new messages while an image is currently generating
+        // to avoid launching multiple 5GB models into memory at the same time (OOM crash).
+        if diffusionManager.isGenerating {
+            return
+        }
+
         // Cancel in-progress text generation
         if llmManager.isGenerating {
             llmManager.cancelGeneration()
@@ -957,10 +963,9 @@ struct ContentView: View {
             Task {
                 let savedLLMUrl = llmManager.activeModelURL
                 await llmManager.unloadModelAsync()
-                
                 // Allow the OS time to flush Metal memory buffers released by llama.cpp
                 // before we attempt to map SDXL's massive weights into RAM.
-                try? await Task.sleep(nanoseconds: 1_500_000_000)
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
 
                 do {
                     // Load the diffusion model — suspends here (MainActor is free during this)
@@ -972,6 +977,10 @@ struct ContentView: View {
 
                     // Cleanup: unload diffusion model then reload the LLM
                     await diffusionManager.unloadDiffusionModelAsync()
+                    
+                    // Allow the OS time to flush Metal memory buffers released by stable-diffusion.cpp
+                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                    
                     if let llm = savedLLMUrl {
                         llmManager.loadModel(at: llm)
                     }
@@ -992,6 +1001,9 @@ struct ContentView: View {
                     conversationManager.updateLastMessage(text: "[Failed to load diffusion model: \(error.localizedDescription)]")
                     conversationManager.saveConversations()
                     diffusionManager.isGenerating = false
+
+                    await diffusionManager.unloadDiffusionModelAsync()
+                    try? await Task.sleep(nanoseconds: 2_000_000_000)
 
                     if let llm = savedLLMUrl {
                         llmManager.loadModel(at: llm)

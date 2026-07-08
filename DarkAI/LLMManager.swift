@@ -46,11 +46,13 @@ actor LlamaRunner {
                 }
             }
         }, nil)
-        llama_backend_init()
     }
 
     func load(path: String, availableMemoryGB: Double, modelSizeGB: Double, contextLimit: Int) throws {
         unloadModelOnly()
+        
+        // Re-initialize the backend since it is destroyed in unloadModelOnly to free memory
+        llama_backend_init()
 
         var modelParams = llama_model_default_params()
         // Prevent Metal buffer zeros ("...") on Gemma's massive vocab by restricting GPU layers
@@ -90,8 +92,13 @@ actor LlamaRunner {
     /// Unloads only the model+context, leaving the backend alive for the next load.
     func unloadModelOnly() {
         isCancelled = true  // Stop any ongoing generation
-        if let ctx = context { llama_free(ctx) }
-        if let mdl = model   { llama_model_free(mdl) }
+        autoreleasepool {
+            if let ctx = context { llama_free(ctx) }
+            if let mdl = model   { llama_model_free(mdl) }
+            // Completely tear down the Metal context to ensure physical memory is released to the OS
+            // before stable-diffusion.cpp tries to allocate it.
+            llama_backend_free()
+        }
         context = nil
         model   = nil
     }
@@ -99,11 +106,13 @@ actor LlamaRunner {
     /// Full teardown — call only when the actor itself is being destroyed.
     func unload() {
         isCancelled = true
-        if let ctx = context { llama_free(ctx) }
-        if let mdl = model   { llama_model_free(mdl) }
+        autoreleasepool {
+            if let ctx = context { llama_free(ctx) }
+            if let mdl = model   { llama_model_free(mdl) }
+            llama_backend_free()
+        }
         context = nil
         model   = nil
-        llama_backend_free()
     }
 
     func requestCancel() {
@@ -422,7 +431,8 @@ actor LlamaRunner {
     deinit {
         if let ctx = context { llama_free(ctx) }
         if let mdl = model   { llama_model_free(mdl) }
-        // Note: llama_backend_free() is only called in unload() to avoid a double-free.
+        model = nil
+        context = nil
     }
 }
 
