@@ -47,8 +47,9 @@ class SDWrapper: @unchecked Sendable {
         // Reducing to 1 strictly limits the intermediate compute buffers.
         ctxParams.n_threads = 1
         
-        // Enable Flash Attention to aggressively reduce VRAM usage during the denoising loop
-        ctxParams.flash_attn = true
+        // Enable Flash Attention for the diffusion UNet, but disable it for the text encoder
+        // because Flash Attention on Apple Silicon can sometimes misalign memory for the CLIP models.
+        ctxParams.flash_attn = false
         ctxParams.diffusion_flash_attn = true
         
         sd_ctx = new_sd_ctx(&ctxParams)

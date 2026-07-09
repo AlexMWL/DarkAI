@@ -37,6 +37,8 @@ actor LlamaRunner {
 
     init() {
         // Initialize the backend once for the lifetime of this actor
+        llama_backend_init()
+        
         llama_log_set({ level, text, user_data in
             guard let text = text, let str = String(cString: text, encoding: .utf8) else { return }
             let cleanStr = str.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -50,9 +52,6 @@ actor LlamaRunner {
 
     func load(path: String, availableMemoryGB: Double, modelSizeGB: Double, contextLimit: Int) throws {
         unloadModelOnly()
-        
-        // Re-initialize the backend since it is destroyed in unloadModelOnly to free memory
-        llama_backend_init()
 
         var modelParams = llama_model_default_params()
         // Prevent Metal buffer zeros ("...") on Gemma's massive vocab by restricting GPU layers
@@ -95,9 +94,7 @@ actor LlamaRunner {
         autoreleasepool {
             if let ctx = context { llama_free(ctx) }
             if let mdl = model   { llama_model_free(mdl) }
-            // Completely tear down the Metal context to ensure physical memory is released to the OS
-            // before stable-diffusion.cpp tries to allocate it.
-            llama_backend_free()
+            // Do NOT call llama_backend_free() here because the metal context is shared globally with stable-diffusion.cpp.
         }
         context = nil
         model   = nil
