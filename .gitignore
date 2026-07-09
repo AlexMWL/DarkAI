@@ -5,3 +5,9 @@ DarkAI.xcodeproj/project.xcworkspace/xcuserdata/alexmwl.xcuserdatad/UserInterfac
 *.xcuserstate
 /stable-diffusion.cpp
 /DarkAI.xcodeproj/project.xcworkspace
+/sd_build
+/DarkAI.xcodeproj
+*.xcuserstate
+DarkAI.xcodeproj/project.xcworkspace/xcuserdata/alexmwl.xcuserdatad/UserInterfaceState.xcuserstate
+DarkAI.xcodeproj/project.xcworkspace/xcuserdata/alexmwl.xcuserdatad/UserInterfaceState.xcuserstate
+/StableDiffusion.xcframework

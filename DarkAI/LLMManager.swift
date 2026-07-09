@@ -447,6 +447,10 @@ class LLMManager: ObservableObject {
     @Published var generationSpeed: Double = 0.0
     @Published var modelSupportsVision: Bool = false
 
+    var isModelLoaded: Bool {
+        if case .loaded = loadState { return true }
+        return false
+    }
     @Published var maxTokens: Int = UserDefaults.standard.object(forKey: "maxTokens") as? Int ?? 512 {
         didSet { UserDefaults.standard.set(maxTokens, forKey: "maxTokens") }
     }

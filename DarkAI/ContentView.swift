@@ -966,7 +966,7 @@ struct ContentView: View {
                 // Allow the OS time to flush Metal memory buffers released by llama.cpp
                 // before we attempt to map SDXL's massive weights into RAM.
                 do {
-                    try await Task.sleep(nanoseconds: 2_000_000_000)
+                    try await Task.sleep(nanoseconds: 100_000_000)
                 } catch {
                     print("Generation task was cancelled during initial sleep.")
                     diffusionManager.isGenerating = false
@@ -1047,59 +1047,77 @@ struct ContentView: View {
             conversationManager.addMessageToActive(isUser: true, text: text)
         }
 
-        if enableMemories && !text.isEmpty {
-            memoryManager.extractMemories(from: text)
-            if let activeModel = llmManager.activeModelURL?.lastPathComponent {
-                personalityManager.analyzeUserMessage(text, modelName: activeModel, llmManager: llmManager)
+        let capturedPromptText = promptText
+        
+        Task {
+            // Evict Stable Diffusion from RAM before running the LLM
+            await diffusionManager.unloadDiffusionModelAsync()
+            do {
+                try await Task.sleep(nanoseconds: 100_000_000)
+            } catch {
+                print("Generation task was cancelled during text sleep.")
             }
-        }
-
-        let ragContext = enableRAG ? ragManager.retrieveRelevantContext(query: text) : ""
-        let memoriesContext = enableMemories ? memoryManager.getFormattedMemoriesForContext() : ""
-
-        conversationManager.addMessageToActive(isUser: false, text: "")
-
-        var finalSystemPrompt = customInstructions
-        if let activeModel = llmManager.activeModelURL?.lastPathComponent {
-            let personality = personalityManager.getPersonality(for: activeModel)
-            if !personality.isEmpty {
-                let score = personalityManager.maturityScore
-                if score < 0.4 {
-                    finalSystemPrompt += "\n\n[Communication Style Note — adapt naturally to user's style]:\n" + personality
-                } else if score < 0.7 {
-                    finalSystemPrompt += "\n\n" + personality
-                } else {
-                    let identityAnchor = customInstructions
-                        .components(separatedBy: CharacterSet(charactersIn: ".!?\n"))
-                        .first?
-                        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                    if identityAnchor.isEmpty {
-                        finalSystemPrompt = personality
-                    } else {
-                        finalSystemPrompt = identityAnchor + ".\n\n" + personality
+            
+            await MainActor.run {
+                if !llmManager.isModelLoaded, let llm = llmManager.activeModelURL {
+                    llmManager.loadModel(at: llm)
+                }
+                
+                if enableMemories && !text.isEmpty {
+                    memoryManager.extractMemories(from: text)
+                    if let activeModel = llmManager.activeModelURL?.lastPathComponent {
+                        personalityManager.analyzeUserMessage(text, modelName: activeModel, llmManager: llmManager)
                     }
+                }
+        
+                let ragContext = enableRAG ? ragManager.retrieveRelevantContext(query: text) : ""
+                let memoriesContext = enableMemories ? memoryManager.getFormattedMemoriesForContext() : ""
+        
+                conversationManager.addMessageToActive(isUser: false, text: "")
+        
+                var finalSystemPrompt = customInstructions
+                if let activeModel = llmManager.activeModelURL?.lastPathComponent {
+                    let personality = personalityManager.getPersonality(for: activeModel)
+                    if !personality.isEmpty {
+                        let score = personalityManager.maturityScore
+                        if score < 0.4 {
+                            finalSystemPrompt += "\n\n[Communication Style Note — adapt naturally to user's style]:\n" + personality
+                        } else if score < 0.7 {
+                            finalSystemPrompt += "\n\n" + personality
+                        } else {
+                            let identityAnchor = customInstructions
+                                .components(separatedBy: CharacterSet(charactersIn: ".!?\n"))
+                                .first?
+                                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                            if identityAnchor.isEmpty {
+                                finalSystemPrompt = personality
+                            } else {
+                                finalSystemPrompt = identityAnchor + ".\n\n" + personality
+                            }
+                        }
+                    }
+                }
+        
+                llmManager.generateResponse(
+                    prompt: capturedPromptText,
+                    history: history,
+                    systemPrompt: finalSystemPrompt,
+                    memoriesContext: memoriesContext,
+                    ragContext: ragContext
+                ) { token in
+                    conversationManager.updateLastMessage(text: (conversationManager.activeConversation?.messages.last?.text ?? "") + token)
+                } onComplete: { finalText in
+                    var cleanedText = self.filterThoughts(from: finalText, stripMarkdown: self.personalityManager.isMature)
+                    if cleanedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        cleanedText = "[Context exhausted during reasoning. Try a shorter prompt or reduce the context window in Settings.]"
+                    }
+                    conversationManager.updateLastMessage(text: cleanedText)
+                    conversationManager.saveConversations()
                 }
             }
         }
-
-        llmManager.generateResponse(
-            prompt: promptText,
-            history: history,
-            systemPrompt: finalSystemPrompt,
-            memoriesContext: memoriesContext,
-            ragContext: ragContext
-        ) { token in
-            conversationManager.updateLastMessage(text: (conversationManager.activeConversation?.messages.last?.text ?? "") + token)
-        } onComplete: { finalText in
-            var cleanedText = self.filterThoughts(from: finalText, stripMarkdown: self.personalityManager.isMature)
-            if cleanedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                cleanedText = "[Context exhausted during reasoning. Try a shorter prompt or reduce the context window in Settings.]"
-            }
-            conversationManager.updateLastMessage(text: cleanedText)
-            conversationManager.saveConversations()
-        }
     }
-    
+
     // MARK: - File Import Handler
 
     private func handleFileImport(_ result: Result<[URL], Error>) {

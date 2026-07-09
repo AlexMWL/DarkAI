@@ -4,7 +4,7 @@ import UIKit
 import CoreGraphics
 
 /// A pure Swift wrapper around the C++ stable-diffusion.cpp library
-class SDWrapper {
+class SDWrapper: @unchecked Sendable {
     private var sd_ctx: OpaquePointer?
     private var isLoaded: Bool = false
 
