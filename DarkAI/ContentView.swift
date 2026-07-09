@@ -965,7 +965,13 @@ struct ContentView: View {
                 await llmManager.unloadModelAsync()
                 // Allow the OS time to flush Metal memory buffers released by llama.cpp
                 // before we attempt to map SDXL's massive weights into RAM.
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                do {
+                    try await Task.sleep(nanoseconds: 2_000_000_000)
+                } catch {
+                    print("Generation task was cancelled during initial sleep.")
+                    diffusionManager.isGenerating = false
+                    return
+                }
 
                 do {
                     // Load the diffusion model — suspends here (MainActor is free during this)
@@ -979,7 +985,11 @@ struct ContentView: View {
                     await diffusionManager.unloadDiffusionModelAsync()
                     
                     // Allow the OS time to flush Metal memory buffers released by stable-diffusion.cpp
-                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                    do {
+                        try await Task.sleep(nanoseconds: 2_000_000_000)
+                    } catch {
+                        print("Generation task was cancelled during final sleep.")
+                    }
                     
                     if let llm = savedLLMUrl {
                         llmManager.loadModel(at: llm)
@@ -1003,7 +1013,11 @@ struct ContentView: View {
                     diffusionManager.isGenerating = false
 
                     await diffusionManager.unloadDiffusionModelAsync()
-                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                    do {
+                        try await Task.sleep(nanoseconds: 2_000_000_000)
+                    } catch {
+                        print("Generation task was cancelled during error sleep.")
+                    }
 
                     if let llm = savedLLMUrl {
                         llmManager.loadModel(at: llm)

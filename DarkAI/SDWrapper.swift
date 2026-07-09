@@ -20,6 +20,22 @@ class SDWrapper {
         sd_ctx_params_init(&ctxParams)
         // Assign a stable copy; sd_ctx owns nothing, so we can free after new_sd_ctx returns
         ctxParams.model_path = UnsafePointer(pathCStr)
+        
+        let physicalMemory = ProcessInfo.processInfo.physicalMemory
+        let totalGiB = Double(physicalMemory) / 1024 / 1024 / 1024
+        
+        // iOS limits Metal memory to ~60% of total physical RAM (before increased-memory-limit).
+        // We use 55% as a safe upper limit for all Metal allocations.
+        let metalLimitGiB = totalGiB * 0.55
+        // We must subtract ~0.6 GiB to leave room for the required intermediate compute buffers,
+        // leaving the remainder purely for the model weights.
+        var weightVRAM = metalLimitGiB - 0.6
+        if weightVRAM < 1.0 { weightVRAM = 1.0 } // Minimum fallback to prevent weird edge cases
+        
+        let vramString = String(format: "%.1f", weightVRAM)
+        let maxVRAM = strdup(vramString)
+        defer { free(maxVRAM) }
+        ctxParams.max_vram = UnsafePointer(maxVRAM)
         // SD_TYPE_COUNT = use the model's native quantized types; do NOT re-quantize on load
         ctxParams.wtype = SD_TYPE_COUNT
         // mmap = true: weights are paged in from flash on demand rather than fully read into RAM.
@@ -28,7 +44,8 @@ class SDWrapper {
         ctxParams.enable_mmap = true
         // Use 2 threads on iOS devices to keep peak RAM within limits during the denoising loop.
         // Each extra thread requires additional working memory for intermediate ggml tensors.
-        ctxParams.n_threads = 2
+        // Reducing to 1 strictly limits the intermediate compute buffers.
+        ctxParams.n_threads = 1
         
         // Enable Flash Attention to aggressively reduce VRAM usage during the denoising loop
         ctxParams.flash_attn = true
@@ -42,8 +59,13 @@ class SDWrapper {
         
         isLoaded = true
     }
+    private var isCurrentlyGenerating: Bool = false
     
     func unload() {
+        guard !isCurrentlyGenerating else {
+            // Cannot unload the model while it's actively generating on a background thread!
+            return
+        }
         if let ctx = sd_ctx {
             autoreleasepool {
                 free_sd_ctx(ctx)
@@ -64,8 +86,11 @@ class SDWrapper {
         progressHandler: ((Double) -> Void)? = nil
     ) throws -> Data {
         guard isLoaded, let ctx = sd_ctx else {
-            throw NSError(domain: "SDWrapper", code: 2, userInfo: [NSLocalizedDescriptionKey: "Model not loaded"])
+            throw NSError(domain: "SDWrapper", code: 2, userInfo: [NSLocalizedDescriptionKey: "Diffusion model is not loaded."])
         }
+        
+        isCurrentlyGenerating = true
+        defer { isCurrentlyGenerating = false }
         
         class ProgressContext {
             var handler: ((Double) -> Void)?

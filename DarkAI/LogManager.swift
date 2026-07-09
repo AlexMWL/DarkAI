@@ -54,6 +54,8 @@ class LogManager: ObservableObject {
         }
     }
     
+
+    
     private func appendToFile(_ line: String) {
         let data = (line + "\n").data(using: .utf8) ?? Data()
         if FileManager.default.fileExists(atPath: logFileURL.path) {

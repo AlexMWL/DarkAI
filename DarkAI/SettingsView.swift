@@ -1169,18 +1169,32 @@ struct LogExportView: View {
             
             Spacer()
             
-            if #available(iOS 16.0, *) {
-                ShareLink(item: logManager.getLogFileURL()) {
-                    Label("Export Logs to .txt", systemImage: "square.and.arrow.up")
+            HStack {
+                Button(action: {
+                    logManager.clearLogs()
+                }) {
+                    Label("Clear Logs", systemImage: "trash")
                         .font(.headline)
                         .foregroundColor(.white)
                         .padding()
                         .frame(maxWidth: .infinity)
-                        .background(Theme.accent)
+                        .background(Color.red)
                         .cornerRadius(15)
                 }
-                .padding()
+                
+                if #available(iOS 16.0, *) {
+                    ShareLink(item: logManager.getLogFileURL()) {
+                        Label("Export Logs", systemImage: "square.and.arrow.up")
+                            .font(.headline)
+                            .foregroundColor(.white)
+                            .padding()
+                            .frame(maxWidth: .infinity)
+                            .background(Theme.accent)
+                            .cornerRadius(15)
+                    }
+                }
             }
+            .padding()
         }
         .padding()
         .background(Color.black.edgesIgnoringSafeArea(.all))

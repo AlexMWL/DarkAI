@@ -4,3 +4,4 @@ build_log.txt
 DarkAI.xcodeproj/project.xcworkspace/xcuserdata/alexmwl.xcuserdatad/UserInterfaceState.xcuserstate
 *.xcuserstate
 /stable-diffusion.cpp
+/DarkAI.xcodeproj/project.xcworkspace

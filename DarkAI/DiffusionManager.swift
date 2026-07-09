@@ -73,7 +73,7 @@ actor DiffusionRunner {
                 do {
                     let data = try wrapper.generateImage(
                         prompt: p,
-                        negativePrompt: "",
+                        negativePrompt: "ugly, blurry, lowres, bad anatomy, bad hands, cropped, worst quality",
                         steps: s,
                         cfgScale: cfg,
                         width: w,
@@ -110,7 +110,7 @@ class DiffusionManager: ObservableObject {
     @Published var steps: Int = UserDefaults.standard.object(forKey: "diffusionSteps") as? Int ?? 20 {
         didSet { UserDefaults.standard.set(steps, forKey: "diffusionSteps") }
     }
-    @Published var cfgScale: Double = UserDefaults.standard.object(forKey: "diffusionCFG") as? Double ?? 4.0 {
+    @Published var cfgScale: Double = UserDefaults.standard.object(forKey: "diffusionCFG") as? Double ?? 7.0 {
         didSet { UserDefaults.standard.set(cfgScale, forKey: "diffusionCFG") }
     }
     @Published var outputSize: Int = UserDefaults.standard.object(forKey: "diffusionSize") as? Int ?? 512 {
