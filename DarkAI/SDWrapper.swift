@@ -7,6 +7,7 @@ import CoreGraphics
 class SDWrapper: @unchecked Sendable {
     private var sd_ctx: OpaquePointer?
     private var isLoaded: Bool = false
+    private var maxVRAMPointer: UnsafeMutablePointer<CChar>? = nil
 
     /// Loads the diffusion model. 
     /// Note: `modelPath` should point to a standard SD1.5 or SDXL GGUF model.
@@ -34,7 +35,7 @@ class SDWrapper: @unchecked Sendable {
         
         let vramString = String(format: "%.1f", weightVRAM)
         let maxVRAM = strdup(vramString)
-        defer { free(maxVRAM) }
+        self.maxVRAMPointer = maxVRAM
         ctxParams.max_vram = UnsafePointer(maxVRAM)
         // SD_TYPE_COUNT = use the model's native quantized types; do NOT re-quantize on load
         ctxParams.wtype = SD_TYPE_COUNT
@@ -45,7 +46,7 @@ class SDWrapper: @unchecked Sendable {
         // Use 2 threads on iOS devices to keep peak RAM within limits during the denoising loop.
         // Each extra thread requires additional working memory for intermediate ggml tensors.
         // Reducing to 1 strictly limits the intermediate compute buffers.
-        ctxParams.n_threads = 1
+        ctxParams.n_threads = 2
         
         // Enable Flash Attention for the diffusion UNet, but disable it for the text encoder
         // because Flash Attention on Apple Silicon can sometimes misalign memory for the CLIP models.
@@ -72,6 +73,10 @@ class SDWrapper: @unchecked Sendable {
                 free_sd_ctx(ctx)
             }
             sd_ctx = nil
+        }
+        if let ptr = maxVRAMPointer {
+            free(ptr)
+            maxVRAMPointer = nil
         }
         isLoaded = false
     }

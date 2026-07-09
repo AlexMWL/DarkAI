@@ -966,7 +966,7 @@ struct ContentView: View {
                 // Allow the OS time to flush Metal memory buffers released by llama.cpp
                 // before we attempt to map SDXL's massive weights into RAM.
                 do {
-                    try await Task.sleep(nanoseconds: 100_000_000)
+                    try await Task.sleep(nanoseconds: 1_000_000_000)
                 } catch {
                     print("Generation task was cancelled during initial sleep.")
                     diffusionManager.isGenerating = false
@@ -986,7 +986,7 @@ struct ContentView: View {
                     
                     // Allow the OS time to flush Metal memory buffers released by stable-diffusion.cpp
                     do {
-                        try await Task.sleep(nanoseconds: 2_000_000_000)
+                        try await Task.sleep(nanoseconds: 1_000_000_000)
                     } catch {
                         print("Generation task was cancelled during final sleep.")
                     }
@@ -1014,7 +1014,7 @@ struct ContentView: View {
 
                     await diffusionManager.unloadDiffusionModelAsync()
                     do {
-                        try await Task.sleep(nanoseconds: 2_000_000_000)
+                        try await Task.sleep(nanoseconds: 1_000_000_000)
                     } catch {
                         print("Generation task was cancelled during error sleep.")
                     }
@@ -1053,7 +1053,7 @@ struct ContentView: View {
             // Evict Stable Diffusion from RAM before running the LLM
             await diffusionManager.unloadDiffusionModelAsync()
             do {
-                try await Task.sleep(nanoseconds: 100_000_000)
+                try await Task.sleep(nanoseconds: 1_000_000_000)
             } catch {
                 print("Generation task was cancelled during text sleep.")
             }
