@@ -1078,6 +1078,18 @@ struct ContentView: View {
 
             Task {
                 let savedLLMUrl = llmManager.activeModelURL
+
+                // Ask the currently loaded chat model to expand the request into a
+                // richer SD prompt — must happen BEFORE the unload below, since it needs
+                // the model resident. Falls back to the rule-based `refinedPrompt` if no
+                // model is loaded, the actor is busy, or the model's output isn't usable.
+                var finalPrompt = refinedPrompt
+                if llmManager.isModelLoaded,
+                   let llmPrompt = await llmManager.generateImagePrompt(from: refinedPrompt) {
+                    finalPrompt = llmPrompt
+                    conversationManager.updateLastMessage(text: finalPrompt)
+                }
+
                 await llmManager.unloadModelAsync()
                 // Allow the OS time to flush Metal memory buffers released by llama.cpp
                 // before we attempt to map SDXL's massive weights into RAM.
@@ -1095,18 +1107,18 @@ struct ContentView: View {
 
                     // Run image generation — each `await` inside releases the MainActor, so
                     // the UI stays responsive throughout the multi-minute denoising loop.
-                    let imageData = await diffusionManager.generateImageAsync(prompt: refinedPrompt)
+                    let imageData = await diffusionManager.generateImageAsync(prompt: finalPrompt)
 
                     // Cleanup: unload diffusion model then reload the LLM
                     await diffusionManager.unloadDiffusionModelAsync()
-                    
+
                     // Allow the OS time to flush Metal memory buffers released by stable-diffusion.cpp
                     do {
                         try await Task.sleep(nanoseconds: 1_000_000_000)
                     } catch {
                         print("Generation task was cancelled during final sleep.")
                     }
-                    
+
                     if let llm = savedLLMUrl {
                         llmManager.loadModel(at: llm)
                     }
@@ -1117,7 +1129,7 @@ struct ContentView: View {
                         conversationManager.saveConversations()
 
                         // ── Auto-ingest to RAG ────────────────────────────────
-                        ragManager.ingestGeneratedImage(prompt: refinedPrompt, imageData: data)
+                        ragManager.ingestGeneratedImage(prompt: finalPrompt, imageData: data)
 
                     } else {
                         conversationManager.updateLastMessage(text: "[Image generation failed. Check the diffusion model and try again.]")

@@ -1213,4 +1213,45 @@ class LLMManager: ObservableObject {
         return accumulated.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    /// Uses the currently loaded chat model to expand a short/casual image request into
+    /// a richer, more descriptive Stable Diffusion prompt (concrete subject, setting,
+    /// lighting, style/quality tags) — PromptClassifier's keyword-stripping alone only
+    /// removes the triggering verb ("draw me a dragon" → "a dragon"), it doesn't add any
+    /// visual detail SD benefits from. Must be called *before* the LLM is unloaded for
+    /// the diffusion handoff, since it needs the model resident to run.
+    /// Returns nil (caller should fall back to the raw request) if no model is loaded, a
+    /// real chat turn is already in flight, or the model's output doesn't look usable.
+    func generateImagePrompt(from userRequest: String) async -> String? {
+        guard case .loaded = loadState else { return nil }
+        // Same reasoning as generateBackgroundAnalysis — LlamaRunner is a single
+        // serialized actor, never enter if a real chat generation owns it right now.
+        guard !isGenerating else { return nil }
+
+        let systemMsg = (role: "system", content: "You are a Stable Diffusion prompt writer. Rewrite the user's image request as a single vivid, comma-separated prompt describing concrete subject, setting, composition, lighting, and style/quality tags. Output ONLY the prompt itself on one line — no explanation, no quotation marks, no markdown, no leading label like 'Prompt:'.")
+        let userMsg = (role: "user", content: userRequest)
+
+        var accumulated = ""
+        let stream = AsyncStream<String> { continuation in
+            Task {
+                await runner.generateStream(
+                    messages: [systemMsg, userMsg],
+                    // Short and cheap by design — this delays the start of image generation,
+                    // so it should read as "a beat of extra thinking," not a second wait.
+                    maxTokens: 120,
+                    temperature: 0.6,
+                    continuation: continuation
+                )
+            }
+        }
+        for await piece in stream { accumulated += piece }
+
+        let cleaned = accumulated
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+        // Sanity-guard the output — a degenerate/empty/runaway result is worse than just
+        // falling back to the caller's own rule-based prompt.
+        guard cleaned.count > 3, cleaned.count < 500 else { return nil }
+        return cleaned
+    }
+
 }
