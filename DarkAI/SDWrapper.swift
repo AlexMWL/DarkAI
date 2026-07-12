@@ -98,10 +98,14 @@ nonisolated class SDWrapper: @unchecked Sendable {
         // Reducing to 1 strictly limits the intermediate compute buffers.
         ctxParams.n_threads = 2
         
-        // Enable Flash Attention for the diffusion UNet, but disable it for the text encoder
-        // because Flash Attention on Apple Silicon can sometimes misalign memory for the CLIP models.
+        // Disabled for both the text encoder AND the diffusion UNet. Flash Attention on this
+        // Apple Silicon Metal backend can silently misalign/corrupt memory rather than throwing
+        // — the library reports a fully successful, error-free generate_image completion (no
+        // NaN/overflow warnings, no truncated tensors) while the actual output is structureless
+        // colorful noise. This was already known and worked around for CLIP; the UNet path
+        // (diffusion_flash_attn) was left enabled and hit the same class of bug.
         ctxParams.flash_attn = false
-        ctxParams.diffusion_flash_attn = true
+        ctxParams.diffusion_flash_attn = false
         
         sd_ctx = new_sd_ctx(&ctxParams)
         
