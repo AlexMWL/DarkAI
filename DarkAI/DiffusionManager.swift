@@ -41,7 +41,7 @@ actor DiffusionRunner {
     private let sdWrapper = SDWrapper()
     var loadedPath: String?
 
-    func loadModel(at url: URL, availableMemoryGB: Double) async throws {
+    func loadModel(at url: URL, availableMemoryGB: Double, modelSizeGB: Double) async throws {
         let path = url.path
         let wrapper = sdWrapper  // Capture actor-isolated property before leaving actor context
         // Run the heavy blocking C++ load on a background thread.
@@ -49,7 +49,7 @@ actor DiffusionRunner {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             DispatchQueue.global(qos: .userInitiated).async {
                 do {
-                    try wrapper.loadModel(modelPath: path, availableMemoryGB: availableMemoryGB)
+                    try wrapper.loadModel(modelPath: path, availableMemoryGB: availableMemoryGB, modelSizeGB: modelSizeGB)
                     continuation.resume()
                 } catch {
                     continuation.resume(throwing: error)
@@ -239,7 +239,7 @@ class DiffusionManager: ObservableObject {
 
         do {
             let availMem = getAvailableMemoryGB()
-            try await runner.loadModel(at: url, availableMemoryGB: availMem)
+            try await runner.loadModel(at: url, availableMemoryGB: availMem, modelSizeGB: sizeGB)
 
             await MainActor.run {
                 self.diffusionLoadState = .loaded(modelName: url.lastPathComponent, sizeGB: sizeGB)

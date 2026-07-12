@@ -35,7 +35,9 @@ nonisolated class SDWrapper: @unchecked Sendable {
     ///   yet, RAG/conversation state, a large denoising history) is already using a chunk
     ///   of that RAM right now, and previously routinely asked stable-diffusion.cpp to size
     ///   its allocations against memory that wasn't actually free.
-    func loadModel(modelPath: String, availableMemoryGB: Double) throws {
+    /// - Parameter modelSizeGB: the diffusion model file's own size, used as a hard floor
+    ///   on the VRAM budget below (see the comment at `modelFloorGB`).
+    func loadModel(modelPath: String, availableMemoryGB: Double, modelSizeGB: Double) throws {
         unload()
 
         let pathCStr = strdup(modelPath)
@@ -57,14 +59,29 @@ nonisolated class SDWrapper: @unchecked Sendable {
         var staticWeightVRAM = metalLimitGiB - 0.6
         if staticWeightVRAM < 1.0 { staticWeightVRAM = 1.0 } // Minimum fallback to prevent weird edge cases
 
+        // The caller (DiffusionManager.checkMemorySafety) already confirmed there's enough
+        // real headroom for this model before this function is ever reached, using a full
+        // required-vs-available margin. So the model's own file size (plus a small margin)
+        // is a *safe floor* for the VRAM budget here — not an arbitrary constant.
+        //
+        // Without this floor, a low `availableMemoryGB` reading clamps the dynamic budget
+        // below what the model itself needs, and stable-diffusion.cpp does not fail cleanly
+        // on an undersized budget — it silently drops/truncates tensors instead of throwing,
+        // which is what a fully-generated-but-blank image actually looks like. A low reading
+        // is a real risk right after unloading a fully-GPU-offloaded LLM (e.g. Llama 3, which
+        // — unlike Gemma's GPU-layer-capped large-vocab path — gets every layer on GPU): its
+        // Metal buffers can take longer to actually release than the settle window gives them,
+        // so `os_proc_available_memory()` reads lower than the true post-flush figure.
+        let modelFloorGB = modelSizeGB + 0.5
+
         // Dynamic cap: never budget more than a fraction of what's actually free right now,
         // regardless of what the static total-RAM formula above thinks is theoretically
         // available. Only 70% of current headroom — loading isn't instantaneous, and peak
         // usage during weight mmap page-in plus the denoising compute graph can exceed
         // steady-state, so headroom measured before the load starts needs real margin.
-        let dynamicWeightVRAM = max(1.0, availableMemoryGB * 0.7 - 0.6)
+        let dynamicWeightVRAM = max(modelFloorGB, availableMemoryGB * 0.7 - 0.6)
 
-        let weightVRAM = min(staticWeightVRAM, dynamicWeightVRAM)
+        let weightVRAM = max(modelFloorGB, min(staticWeightVRAM, dynamicWeightVRAM))
 
         let vramString = String(format: "%.1f", weightVRAM)
         let maxVRAM = strdup(vramString)
