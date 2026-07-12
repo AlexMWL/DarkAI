@@ -3,36 +3,69 @@ import Combine
 import UIKit
 import CoreGraphics
 
-/// A pure Swift wrapper around the C++ stable-diffusion.cpp library
-class SDWrapper: @unchecked Sendable {
+/// A pure Swift wrapper around the C++ stable-diffusion.cpp library.
+/// Explicitly `nonisolated` — it's always driven from the `DiffusionRunner` background
+/// actor (off the main actor, which is this module's default isolation) so its heavy,
+/// blocking C++ calls never run on the main thread; `@unchecked Sendable` reflects that
+/// its internal state is only ever touched serially from that single background actor.
+nonisolated class SDWrapper: @unchecked Sendable {
     private var sd_ctx: OpaquePointer?
     private var isLoaded: Bool = false
     private var maxVRAMPointer: UnsafeMutablePointer<CChar>? = nil
+    
+    init() {
+        sd_set_log_callback({ level, text, user_data in
+            guard let text = text, let str = String(cString: text, encoding: .utf8) else { return }
+            let cleanStr = str.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !cleanStr.isEmpty {
+                DispatchQueue.main.async {
+                    LogManager.shared.log("SD: \(cleanStr)")
+                }
+            }
+        }, nil)
+    }
 
-    /// Loads the diffusion model. 
+    /// Loads the diffusion model.
     /// Note: `modelPath` should point to a standard SD1.5 or SDXL GGUF model.
-    func loadModel(modelPath: String) throws {
+    /// - Parameter availableMemoryGB: the process's real current headroom
+    ///   (`os_proc_available_memory()`) measured by the caller right before this call —
+    ///   not total device RAM. See the matching comment on
+    ///   `LlamaRunner.safeContextTokens` for why: a static total-RAM-based budget has no
+    ///   idea whether something else (an LLM that hasn't fully released its Metal buffers
+    ///   yet, RAG/conversation state, a large denoising history) is already using a chunk
+    ///   of that RAM right now, and previously routinely asked stable-diffusion.cpp to size
+    ///   its allocations against memory that wasn't actually free.
+    func loadModel(modelPath: String, availableMemoryGB: Double) throws {
         unload()
-        
+
         let pathCStr = strdup(modelPath)
         defer { free(pathCStr) }
-        
+
         var ctxParams = sd_ctx_params_t()
         sd_ctx_params_init(&ctxParams)
         // Assign a stable copy; sd_ctx owns nothing, so we can free after new_sd_ctx returns
         ctxParams.model_path = UnsafePointer(pathCStr)
-        
+
         let physicalMemory = ProcessInfo.processInfo.physicalMemory
         let totalGiB = Double(physicalMemory) / 1024 / 1024 / 1024
-        
+
         // iOS limits Metal memory to ~60% of total physical RAM (before increased-memory-limit).
         // We use 55% as a safe upper limit for all Metal allocations.
         let metalLimitGiB = totalGiB * 0.55
         // We must subtract ~0.6 GiB to leave room for the required intermediate compute buffers,
         // leaving the remainder purely for the model weights.
-        var weightVRAM = metalLimitGiB - 0.6
-        if weightVRAM < 1.0 { weightVRAM = 1.0 } // Minimum fallback to prevent weird edge cases
-        
+        var staticWeightVRAM = metalLimitGiB - 0.6
+        if staticWeightVRAM < 1.0 { staticWeightVRAM = 1.0 } // Minimum fallback to prevent weird edge cases
+
+        // Dynamic cap: never budget more than a fraction of what's actually free right now,
+        // regardless of what the static total-RAM formula above thinks is theoretically
+        // available. Only 70% of current headroom — loading isn't instantaneous, and peak
+        // usage during weight mmap page-in plus the denoising compute graph can exceed
+        // steady-state, so headroom measured before the load starts needs real margin.
+        let dynamicWeightVRAM = max(1.0, availableMemoryGB * 0.7 - 0.6)
+
+        let weightVRAM = min(staticWeightVRAM, dynamicWeightVRAM)
+
         let vramString = String(format: "%.1f", weightVRAM)
         let maxVRAM = strdup(vramString)
         self.maxVRAMPointer = maxVRAM
@@ -93,6 +126,11 @@ class SDWrapper: @unchecked Sendable {
     ) throws -> Data {
         guard isLoaded, let ctx = sd_ctx else {
             throw NSError(domain: "SDWrapper", code: 2, userInfo: [NSLocalizedDescriptionKey: "Diffusion model is not loaded."])
+        }
+        
+        let trimmedPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedPrompt.isEmpty else {
+            throw NSError(domain: "SDWrapper", code: 7, userInfo: [NSLocalizedDescriptionKey: "Empty prompt sent to text encoder."])
         }
         
         isCurrentlyGenerating = true

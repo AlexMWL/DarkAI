@@ -6,6 +6,12 @@ class MemoryManager: ObservableObject {
 
     private let storageKey = "DarkAI_Memories"
 
+    private static let eventDateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "MMMM d, yyyy"
+        return f
+    }()
+
     init() {
         loadMemories()
     }
@@ -20,11 +26,19 @@ class MemoryManager: ObservableObject {
         UserDefaults.standard.set(memories, forKey: storageKey)
     }
 
+    // Every stored memory is re-injected into every future prompt's system block, so
+    // unbounded growth silently eats more and more of the context budget over a long-running
+    // install — crowding out actual conversation history and degrading response quality.
+    private let maxMemories = 60
+
     func addMemory(_ memory: String) {
         let trimmed = memory.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, trimmed.count > 5 else { return }
         if !memories.contains(where: { $0.caseInsensitiveCompare(trimmed) == .orderedSame }) {
             memories.append(trimmed)
+            if memories.count > maxMemories {
+                memories.removeFirst(memories.count - maxMemories)
+            }
             saveMemories()
         }
     }
@@ -131,6 +145,33 @@ class MemoryManager: ObservableObject {
         matchPrefix(lower, message, prefix: "i grew up in ", format: { "User grew up in \($0)." })
         matchPrefix(lower, message, prefix: "i studied at ", format: { "User studied at \($0)." })
         matchPrefix(lower, message, prefix: "i graduated from ", format: { "User graduated from \($0)." })
+
+        // — Events & Occurrences — (time-anchored recountings of specific things that
+        // happened, as opposed to stable preferences/plans above. Tagged with the date
+        // the user mentioned it so the model can reason about how recent it is.)
+        let today = Self.eventDateFormatter.string(from: Date())
+        matchPrefix(lower, message, prefix: "yesterday i ", format: { "On \(today), user reported that yesterday they \($0)." })
+        matchPrefix(lower, message, prefix: "today i ", format: { "On \(today), user reported that today they \($0)." })
+        matchPrefix(lower, message, prefix: "this morning i ", format: { "On \(today), user reported that this morning they \($0)." })
+        matchPrefix(lower, message, prefix: "this afternoon i ", format: { "On \(today), user reported that this afternoon they \($0)." })
+        matchPrefix(lower, message, prefix: "last night i ", format: { "On \(today), user reported that last night they \($0)." })
+        matchPrefix(lower, message, prefix: "last week i ", format: { "On \(today), user reported that last week they \($0)." })
+        matchPrefix(lower, message, prefix: "earlier today i ", format: { "On \(today), user reported that earlier today they \($0)." })
+        matchPrefix(lower, message, prefix: "i just ", format: { "On \(today), user reported they just \($0)." })
+        matchPrefix(lower, message, prefix: "i recently ", format: { "On \(today), user reported they recently \($0)." })
+        matchPrefix(lower, message, prefix: "we celebrated ", format: { "On \(today), user reported celebrating \($0)." })
+        matchPrefix(lower, message, prefix: "i had a ", format: { "On \(today), user reported having a \($0)." })
+        matchPrefix(lower, message, prefix: "i had an ", format: { "On \(today), user reported having an \($0)." })
+        matchPrefix(lower, message, prefix: "i got ", format: { "On \(today), user reported that they got \($0)." })
+        matchPrefix(lower, message, prefix: "i finished ", format: { "On \(today), user reported finishing \($0)." })
+        matchPrefix(lower, message, prefix: "i completed ", format: { "On \(today), user reported completing \($0)." })
+        matchPrefix(lower, message, prefix: "i started ", format: { "On \(today), user reported starting \($0)." })
+        matchPrefix(lower, message, prefix: "i broke ", format: { "On \(today), user reported breaking \($0)." })
+        matchPrefix(lower, message, prefix: "i lost ", format: { "On \(today), user reported losing \($0)." })
+        matchPrefix(lower, message, prefix: "i found ", format: { "On \(today), user reported finding \($0)." })
+        matchPrefix(lower, message, prefix: "i missed ", format: { "On \(today), user reported missing \($0)." })
+        matchPrefix(lower, message, prefix: "i passed ", format: { "On \(today), user reported passing \($0)." })
+        matchPrefix(lower, message, prefix: "i failed ", format: { "On \(today), user reported failing \($0)." })
 
         // — Favorite X is Y pattern —
         if let range = lower.range(of: "my favorite ") {

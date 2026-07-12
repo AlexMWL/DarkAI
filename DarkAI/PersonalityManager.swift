@@ -58,14 +58,27 @@ class PersonalityManager: ObservableObject {
     func getPersonality(for modelName: String) -> String {
         let profile = modelPersonalities[modelName] ?? ""
         guard !profile.isEmpty else { return "" }
-        
+
         // Require at least 2 distinct trait lines before personality has enough signal to apply
         let entryCount = profile.components(separatedBy: "\n")
             .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
             .count
         guard entryCount >= 2 else { return "" }
-        
-        return "[User Style Matrix — Adapt your communication style naturally to match the user's patterns]:\n\(profile)"
+
+        // CRITICAL: lines starting "The AI has previously said..." are the model's OWN
+        // established opinions/preferences — separate from the "Long-Term Conversational
+        // Memories" block elsewhere in the prompt, which is about the USER. Without this
+        // explicit split the model tends to answer "what's your favorite X" by echoing back
+        // something it saw stored about the user instead of forming/recalling its own answer.
+        return """
+        [AI Personality Matrix — two distinct kinds of entries below, do not mix them up:
+        • Lines starting "The AI has previously said..." are YOUR OWN opinions and preferences. \
+        If asked again, give the SAME answer for consistency. Never state something from the \
+        user's memories as if it were your own preference — those are two separate people.
+        • All other lines describe the user's communication style/facts — adapt your tone to \
+        match them, but they belong to the user, not you.]
+        \(profile)
+        """
     }
     
     func analyzeUserMessage(_ message: String, modelName: String, llmManager: LLMManager?) {
@@ -185,5 +198,89 @@ class PersonalityManager: ObservableObject {
                 }
             }
         }
+    }
+
+    // MARK: - AI Self-Identity Extraction
+    // Captures the model's OWN stated likes/dislikes/favorites from its responses — e.g.
+    // "I love jazz" or "my favorite car is a Tesla" — so it can stay consistent when asked
+    // again later, instead of forming a fresh (or worse, borrowing the user's) answer every
+    // time. Purely local string matching, no LLM call, safe to run after every response.
+    func analyzeAssistantMessage(_ message: String, modelName: String) {
+        guard !modelName.isEmpty else { return }
+        let text = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+
+        var currentProfile = modelPersonalities[modelName] ?? ""
+        var newTraits: [String] = []
+
+        func addFact(_ fact: String) {
+            guard !fact.isEmpty, fact.count < 140, !currentProfile.contains(fact) else { return }
+            newTraits.append(fact)
+        }
+
+        let likeTriggers: [(String, (String) -> String)] = [
+            ("i love ", { "The AI has previously said it loves \($0)." }),
+            ("i really like ", { "The AI has previously said it likes \($0)." }),
+            ("i like ", { "The AI has previously said it likes \($0)." }),
+            ("i enjoy ", { "The AI has previously said it enjoys \($0)." }),
+            ("i prefer ", { "The AI has previously said it prefers \($0)." }),
+            ("i'm a fan of ", { "The AI has previously said it's a fan of \($0)." }),
+            ("i am a fan of ", { "The AI has previously said it's a fan of \($0)." }),
+        ]
+        let dislikeTriggers: [(String, (String) -> String)] = [
+            ("i hate ", { "The AI has previously said it dislikes \($0)." }),
+            ("i dislike ", { "The AI has previously said it dislikes \($0)." }),
+            ("i don't like ", { "The AI has previously said it dislikes \($0)." }),
+            ("i do not like ", { "The AI has previously said it dislikes \($0)." }),
+        ]
+
+        let sentences = text.components(separatedBy: CharacterSet(charactersIn: ".!?\n"))
+        for sentence in sentences {
+            let cleanSentence = sentence.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !cleanSentence.isEmpty else { continue }
+            let lowerSentence = cleanSentence.lowercased()
+
+            for (prefix, format) in likeTriggers + dislikeTriggers {
+                guard lowerSentence.hasPrefix(prefix), cleanSentence.count > prefix.count + 2 else { continue }
+                let value = String(cleanSentence.dropFirst(prefix.count))
+                    .trimmingCharacters(in: CharacterSet(charactersIn: " .!?,;"))
+                guard !value.isEmpty, value.count < 100 else { continue }
+                addFact(format(value))
+                break
+            }
+
+            // "My favorite X is Y" / "My favourite X is Y"
+            for favoritePrefix in ["my favorite ", "my favourite "] {
+                guard lowerSentence.hasPrefix(favoritePrefix) else { continue }
+                let rest = cleanSentence.dropFirst(favoritePrefix.count)
+                guard let isRange = rest.lowercased().range(of: " is ") else { break }
+                let subject = rest[..<isRange.lowerBound].trimmingCharacters(in: .whitespacesAndNewlines)
+                let value = rest[isRange.upperBound...].trimmingCharacters(in: CharacterSet(charactersIn: " .!?,;"))
+                if !subject.isEmpty, !value.isEmpty, value.count < 100 {
+                    addFact("The AI has previously said its favorite \(subject) is \(value).")
+                }
+                break
+            }
+        }
+
+        guard !newTraits.isEmpty else { return }
+
+        if currentProfile.isEmpty {
+            currentProfile = newTraits.joined(separator: "\n")
+        } else {
+            currentProfile += "\n" + newTraits.joined(separator: "\n")
+        }
+
+        // Cap growth the same way the background style-analysis pass does.
+        let lines = currentProfile.components(separatedBy: "\n")
+        if lines.count > 100 {
+            currentProfile = ([lines[0]] + lines.suffix(99)).joined(separator: "\n")
+        }
+        modelPersonalities[modelName] = currentProfile
+
+        maturityScore = min(1.0, maturityScore + (Double(newTraits.count) * 0.05))
+        isMature = maturityScore >= 0.7
+
+        savePersonalities()
     }
 }

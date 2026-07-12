@@ -82,7 +82,7 @@ class DocumentProcessor {
                 var result = ""
                 
                 // Process Classification
-                if let classObservations = classifyRequest.results as? [VNClassificationObservation] {
+                if let classObservations = classifyRequest.results {
                     // Get top 5 high-confidence labels
                     let topLabels = classObservations
                         .filter { $0.confidence > 0.6 }
@@ -95,7 +95,7 @@ class DocumentProcessor {
                 }
                 
                 // Process Text
-                if let textObservations = textRequest.results as? [VNRecognizedTextObservation] {
+                if let textObservations = textRequest.results {
                     let extracted = textObservations.compactMap { $0.topCandidates(1).first?.string }.joined(separator: "\n")
                     if !extracted.isEmpty {
                         result += "Extracted Text (OCR):\n" + extracted

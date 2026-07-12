@@ -51,7 +51,7 @@ struct SettingsView: View {
                                 Image(systemName: "cpu")
                                     .foregroundColor(Theme.accentCyan)
                                     .font(.headline)
-                                Text("LOCAL LLM MODELS (.GGUF)")
+                                Text("LOCAL LLM MODELS")
                                     .font(.system(size: 14, weight: .bold))
                                     .foregroundColor(Theme.textPrimary)
                                     .kerning(1.2)
@@ -59,7 +59,7 @@ struct SettingsView: View {
                                 Button(action: { showModelImporter = true }) {
                                     HStack(spacing: 6) {
                                         Image(systemName: "plus")
-                                        Text("Import")
+                                        Text("Import .gguf")
                                     }
                                     .font(.system(size: 12, weight: .bold))
                                     .foregroundColor(.white)
@@ -114,7 +114,7 @@ struct SettingsView: View {
                                 Image(systemName: "photo.badge.plus")
                                     .foregroundColor(Color.purple)
                                     .font(.headline)
-                                Text("DIFFUSION MODEL (.GGUF)")
+                                Text("DIFFUSION MODEL")
                                     .font(.system(size: 14, weight: .bold))
                                     .foregroundColor(Theme.textPrimary)
                                     .kerning(1.2)
@@ -122,7 +122,7 @@ struct SettingsView: View {
                                 Button(action: { showDiffusionImporter = true }) {
                                     HStack(spacing: 6) {
                                         Image(systemName: "plus")
-                                        Text("Import")
+                                        Text("Import .gguf")
                                     }
                                     .font(.system(size: 12, weight: .bold))
                                     .foregroundColor(.white)
@@ -192,7 +192,7 @@ struct SettingsView: View {
                             Divider().background(Theme.border)
 
                             // Generation settings sub-section
-                            Text("GENERATION PARAMETERS")
+                            Text("IMAGE GEN SETTINGS")
                                 .font(.system(size: 11, weight: .bold))
                                 .foregroundColor(Theme.textSecondary)
                                 .kerning(1.0)
@@ -240,7 +240,7 @@ struct SettingsView: View {
                                     .font(.system(size: 13))
                                     .foregroundColor(Theme.textSecondary)
                                 HStack(spacing: 8) {
-                                    ForEach([256, 512, 768, 1024], id: \.self) { size in
+                                    ForEach([256, 512, 768], id: \.self) { size in
                                         Button(action: { diffusionManager.outputSize = size }) {
                                             Text("\(size)")
                                                 .font(.system(size: 12, weight: .bold, design: .monospaced))
@@ -299,7 +299,7 @@ struct SettingsView: View {
                             HStack {
                                 Image(systemName: "slider.horizontal.below.rectangle")
                                     .foregroundColor(Theme.accentCyan)
-                                Text("MODEL PARAMETERS")
+                                Text("LLM SETTINGS")
                                     .font(.system(size: 14, weight: .bold))
                                     .foregroundColor(Theme.textPrimary)
                                     .kerning(1.2)
@@ -329,7 +329,7 @@ struct SettingsView: View {
                                                     showContextWarningPopup = true
                                                 }
                                             }
-                                        ), in: 512...8192, step: 256)
+                                        ), in: 512...32768, step: 256)
                                         .accentColor(Theme.accent)
                                     }
                                 }
@@ -396,7 +396,7 @@ struct SettingsView: View {
                             HStack {
                                 Image(systemName: "doc.text.magnifyingglass")
                                     .foregroundColor(Theme.accentCyan)
-                                Text("RAG CONFIGURATION")
+                                Text("RAG CONFIG")
                                     .font(.system(size: 14, weight: .bold))
                                     .foregroundColor(Theme.textPrimary)
                                     .kerning(1.2)
@@ -457,7 +457,7 @@ struct SettingsView: View {
                                 }
                                 
                                 if memoryManager.memories.isEmpty {
-                                    Text("No memories extracted yet. Tell the chatbot things like 'I prefer Python' or 'My name is John' to build long-term memory.")
+                                    Text("No memories extracted yet. Tell DarkAI things like 'I prefer Python' or 'My name is John' to build long-term memory.")
                                         .font(.system(size: 13))
                                         .foregroundColor(Theme.textMuted)
                                         .padding(.vertical, 8)
@@ -565,7 +565,7 @@ struct SettingsView: View {
                             HStack {
                                 Image(systemName: "ladybug")
                                     .foregroundColor(.yellow)
-                                Text("DIAGNOSTICS & LOGS")
+                                Text("DIAGNOSTICS LOGS")
                                     .font(.system(size: 14, weight: .bold))
                                     .foregroundColor(Theme.textPrimary)
                                     .kerning(1.2)
@@ -599,12 +599,6 @@ struct SettingsView: View {
                                 .font(.system(size: 11, weight: .bold))
                                 .foregroundColor(Theme.accentCyan)
                                 .kerning(1.5)
-                            
-                            Text("This application has been compiled with increased memory limit entitlement, enabling addressable RAM access beyond standard App Store caps.")
-                                .font(.system(size: 11))
-                                .foregroundColor(Theme.textSecondary)
-                                .multilineTextAlignment(.center)
-                                .lineSpacing(3)
                         }
                         .padding()
                         .frame(maxWidth: .infinity)
@@ -1203,6 +1197,115 @@ struct LogExportView: View {
     }
 }
 
+/// Shared "Export" pill used by both Mindscape entry types.
+private struct MindscapeExportLabel: View {
+    var body: some View {
+        HStack {
+            Image(systemName: "square.and.arrow.up")
+            Text("Export")
+        }
+        .font(.system(size: 12, weight: .bold))
+        .foregroundColor(.white)
+        .padding(.vertical, 6)
+        .padding(.horizontal, 12)
+        .background(Theme.accent)
+        .cornerRadius(8)
+    }
+}
+
+/// Content for a Mindscape entry backed by an actual generated image.
+private struct MindscapeImageContent: View {
+    let doc: RAGDocument
+    let uiImage: UIImage
+    let imageURL: URL
+
+    var body: some View {
+        Image(uiImage: uiImage)
+            .resizable()
+            .scaledToFit()
+            .frame(maxWidth: .infinity)
+            .frame(height: 220)
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+
+        Text(doc.content)
+            .font(.system(.caption, design: .monospaced))
+            .foregroundColor(Theme.textSecondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+        if #available(iOS 16.0, *) {
+            let preview = SharePreview(doc.name, image: Image(uiImage: uiImage))
+            ShareLink(item: imageURL, preview: preview) {
+                MindscapeExportLabel()
+            }
+        }
+    }
+}
+
+/// Content for a plain-text Mindscape entry.
+private struct MindscapeTextContent: View {
+    let doc: RAGDocument
+
+    private var joinedText: String { doc.chunks.joined(separator: "\n\n---\n\n") }
+
+    var body: some View {
+        ScrollView(.vertical) {
+            Text(joinedText)
+                .font(.system(.caption, design: .monospaced))
+                .foregroundColor(.white)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .frame(height: 150)
+        .padding(8)
+        .background(Color(white: 0.1))
+        .cornerRadius(8)
+
+        if #available(iOS 16.0, *) {
+            ShareLink(item: joinedText) {
+                MindscapeExportLabel()
+            }
+        }
+    }
+}
+
+/// A single Mindscape entry row — an image entry if the document has a backing
+/// generated image, otherwise the plain-text chunk view.
+private struct MindscapeDocumentRow: View {
+    let doc: RAGDocument
+    @ObservedObject var ragManager: RAGManager
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text(doc.name)
+                    .font(.headline)
+                    .foregroundColor(Theme.accentCyan)
+                Spacer()
+                Button(action: {
+                    if let idx = ragManager.documents.firstIndex(where: { $0.id == doc.id }) {
+                        ragManager.deleteDocument(at: IndexSet(integer: idx))
+                    }
+                }) {
+                    Image(systemName: "trash")
+                        .foregroundColor(.red)
+                }
+            }
+
+            if doc.imageFileName != nil,
+               let imgData = ragManager.imageData(for: doc),
+               let uiImage = UIImage(data: imgData),
+               let imageURL = ragManager.imageURL(for: doc) {
+                MindscapeImageContent(doc: doc, uiImage: uiImage, imageURL: imageURL)
+            } else {
+                MindscapeTextContent(doc: doc)
+            }
+        }
+        .padding()
+        .background(Color.black)
+        .cornerRadius(12)
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Theme.border, lineWidth: 1))
+    }
+}
+
 struct MindscapeView: View {
     @ObservedObject var ragManager: RAGManager
     @State private var showDocImporter = false
@@ -1217,53 +1320,7 @@ struct MindscapeView: View {
                             .padding()
                     } else {
                         ForEach(ragManager.documents) { doc in
-                            VStack(alignment: .leading, spacing: 6) {
-                                HStack {
-                                    Text(doc.name)
-                                        .font(.headline)
-                                        .foregroundColor(Theme.accentCyan)
-                                    Spacer()
-                                    Button(action: {
-                                        if let idx = ragManager.documents.firstIndex(where: { $0.id == doc.id }) {
-                                            ragManager.deleteDocument(at: IndexSet(integer: idx))
-                                        }
-                                    }) {
-                                        Image(systemName: "trash")
-                                            .foregroundColor(.red)
-                                    }
-                                }
-                                
-                                // Join all chunks into a scrollable text area for the user to view/export
-                                ScrollView(.vertical) {
-                                    Text(doc.chunks.joined(separator: "\n\n---\n\n"))
-                                        .font(.system(.caption, design: .monospaced))
-                                        .foregroundColor(.white)
-                                        .frame(maxWidth: .infinity, alignment: .leading)
-                                }
-                                .frame(height: 150)
-                                .padding(8)
-                                .background(Color(white: 0.1))
-                                .cornerRadius(8)
-                                
-                                if #available(iOS 16.0, *) {
-                                    ShareLink(item: doc.chunks.joined(separator: "\n\n---\n\n")) {
-                                        HStack {
-                                            Image(systemName: "square.and.arrow.up")
-                                            Text("Export")
-                                        }
-                                        .font(.system(size: 12, weight: .bold))
-                                        .foregroundColor(.white)
-                                        .padding(.vertical, 6)
-                                        .padding(.horizontal, 12)
-                                        .background(Theme.accent)
-                                        .cornerRadius(8)
-                                    }
-                                }
-                            }
-                            .padding()
-                            .background(Color.black)
-                            .cornerRadius(12)
-                            .overlay(RoundedRectangle(cornerRadius: 12).stroke(Theme.border, lineWidth: 1))
+                            MindscapeDocumentRow(doc: doc, ragManager: ragManager)
                         }
                     }
                 }

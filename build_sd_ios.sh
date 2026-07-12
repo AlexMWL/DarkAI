@@ -5,6 +5,11 @@ REPO_URL="https://github.com/leejet/stable-diffusion.cpp.git"
 REPO_DIR="stable-diffusion.cpp"
 BUILD_DIR="sd_build"
 OUTPUT_XCFRAMEWORK="StableDiffusion.xcframework"
+# Must match DarkAI.xcodeproj's IPHONEOS_DEPLOYMENT_TARGET. Without this, CMake tags
+# every object file with the full iOS SDK version instead of the app's actual minimum
+# deployment target, producing a "was built for newer iOS version" linker warning for
+# every single object file merged into libsd_merged.a.
+IOS_DEPLOYMENT_TARGET="26.6"
 
 if [ ! -d "$REPO_DIR" ]; then
     echo "Cloning stable-diffusion.cpp..."
@@ -17,6 +22,7 @@ rm -rf "$BUILD_DIR/ios"
 cmake -S "$REPO_DIR" -B "$BUILD_DIR/ios" \
     -DCMAKE_SYSTEM_NAME=iOS \
     -DCMAKE_OSX_ARCHITECTURES=arm64 \
+    -DCMAKE_OSX_DEPLOYMENT_TARGET="$IOS_DEPLOYMENT_TARGET" \
     -DSD_METAL=ON \
     -DSD_BUILD_EXAMPLES=OFF \
     -DSD_BUILD_SHARED_LIBS=OFF
@@ -29,6 +35,7 @@ cmake -S "$REPO_DIR" -B "$BUILD_DIR/sim" \
     -DCMAKE_SYSTEM_NAME=iOS \
     -DCMAKE_OSX_SYSROOT=iphonesimulator \
     -DCMAKE_OSX_ARCHITECTURES=arm64 \
+    -DCMAKE_OSX_DEPLOYMENT_TARGET="$IOS_DEPLOYMENT_TARGET" \
     -DSD_METAL=ON \
     -DSD_BUILD_EXAMPLES=OFF \
     -DSD_BUILD_SHARED_LIBS=OFF

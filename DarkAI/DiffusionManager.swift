@@ -1,6 +1,7 @@
 import Foundation
 import Combine
 import UIKit
+import Darwin
 // LlamaSwift is imported for future llama_generate_image() integration.
 // The current lumina2 architecture is NOT registered in llama.cpp b9837,
 // so we use a pure-Swift GGUF validator instead of llama_model_load_from_file.
@@ -40,7 +41,7 @@ actor DiffusionRunner {
     private let sdWrapper = SDWrapper()
     var loadedPath: String?
 
-    func loadModel(at url: URL) async throws {
+    func loadModel(at url: URL, availableMemoryGB: Double) async throws {
         let path = url.path
         let wrapper = sdWrapper  // Capture actor-isolated property before leaving actor context
         // Run the heavy blocking C++ load on a background thread.
@@ -48,7 +49,7 @@ actor DiffusionRunner {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             DispatchQueue.global(qos: .userInitiated).async {
                 do {
-                    try wrapper.loadModel(modelPath: path)
+                    try wrapper.loadModel(modelPath: path, availableMemoryGB: availableMemoryGB)
                     continuation.resume()
                 } catch {
                     continuation.resume(throwing: error)
@@ -116,11 +117,42 @@ class DiffusionManager: ObservableObject {
     @Published var outputSize: Int = UserDefaults.standard.object(forKey: "diffusionSize") as? Int ?? 512 {
         didSet { UserDefaults.standard.set(outputSize, forKey: "diffusionSize") }
     }
-    @Published var lastDiffusionModelPath: String? = UserDefaults.standard.string(forKey: "lastDiffusionModelPath") {
+    // Reconstructed from the current DiffusionModels directory + a stored filename rather
+    // than a stored absolute path — see the matching comment on LLMManager.lastUsedModelPath
+    // for why a remembered absolute path silently stops resolving across app reinstalls.
+    @Published var lastDiffusionModelPath: String? = DiffusionManager.resolveLastDiffusionModelPath() {
         didSet {
-            if let p = lastDiffusionModelPath { UserDefaults.standard.set(p, forKey: "lastDiffusionModelPath") }
-            else { UserDefaults.standard.removeObject(forKey: "lastDiffusionModelPath") }
+            if let p = lastDiffusionModelPath {
+                UserDefaults.standard.set(URL(fileURLWithPath: p).lastPathComponent, forKey: "lastDiffusionModelFileName")
+            } else {
+                UserDefaults.standard.removeObject(forKey: "lastDiffusionModelFileName")
+            }
         }
+    }
+
+    private static func resolveLastDiffusionModelPath() -> String? {
+        guard let docsUrl = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
+            return nil
+        }
+        let modelsDir = docsUrl.appendingPathComponent("DiffusionModels")
+
+        if let fileName = UserDefaults.standard.string(forKey: "lastDiffusionModelFileName") {
+            let url = modelsDir.appendingPathComponent(fileName)
+            return FileManager.default.fileExists(atPath: url.path) ? url.path : nil
+        }
+
+        // One-time migration from the old absolute-path storage format.
+        if let oldPath = UserDefaults.standard.string(forKey: "lastDiffusionModelPath") {
+            let fileName = URL(fileURLWithPath: oldPath).lastPathComponent
+            let url = modelsDir.appendingPathComponent(fileName)
+            if FileManager.default.fileExists(atPath: url.path) {
+                UserDefaults.standard.set(fileName, forKey: "lastDiffusionModelFileName")
+                UserDefaults.standard.removeObject(forKey: "lastDiffusionModelPath")
+                return url.path
+            }
+        }
+
+        return nil
     }
 
     private let runner = DiffusionRunner()
@@ -150,17 +182,65 @@ class DiffusionManager: ObservableObject {
         }
     }
     
+    /// Real, current headroom before this process hits its dirty-memory limit — see the
+    /// matching comment on `LLMManager.getAvailableMemoryGB()`. Diffusion model loading
+    /// must budget against this, not total device RAM, for the same reason the LLM path
+    /// does: a snapshot of total RAM can't tell "plenty free right now" apart from
+    /// whatever else (a not-yet-fully-released LLM, RAG/conversation state) is currently
+    /// using memory.
+    func getAvailableMemoryGB() -> Double {
+        return Double(os_proc_available_memory()) / (1024.0 * 1024.0 * 1024.0)
+    }
+
+    /// Pre-flight check mirroring `LLMManager.checkMemorySafety` — diffusion models are
+    /// frequently the single largest allocation in the app (SDXL weights plus CLIP/VAE plus
+    /// the denoising compute graph), so attempting a load with genuinely insufficient
+    /// headroom risked a hard jetsam kill instead of a recoverable, user-visible failure.
+    func checkMemorySafety(modelSizeGB: Double) -> MemorySafetyStatus {
+        let availableNowGB = getAvailableMemoryGB()
+        // SDXL's CLIP text encoders, VAE, and the UNet's compute/activation buffers add
+        // meaningfully on top of the raw weight file size — budget generously since this
+        // pre-check is the only thing standing between "load" and a jetsam kill.
+        let required = modelSizeGB * 1.3 + 1.0
+        if required > availableNowGB * 0.85 {
+            return .dangerous(requiredGB: required, availableGB: availableNowGB)
+        }
+        let total = ProcessInfo.processInfo.physicalMemory
+        let totalGiB = Double(total) / (1024.0 * 1024.0 * 1024.0)
+        if required > totalGiB * 0.90 {
+            return .dangerous(requiredGB: required, availableGB: totalGiB)
+        } else if required > totalGiB * 0.70 {
+            return .warning(requiredGB: required, availableGB: totalGiB)
+        }
+        return .safe
+    }
+
     func loadDiffusionModelAsync(at url: URL) async throws {
         await MainActor.run {
             diffusionLoadState = .loading(progress: 0.1, status: "Validating GGUF...")
             activeDiffusionURL = url
             lastDiffusionModelPath = url.path
         }
-        
+
+        let sizeGB = getFileSizeGB(at: url)
+        let safety = checkMemorySafety(modelSizeGB: sizeGB)
+        if case .dangerous(let requiredGB, let availableGB) = safety {
+            let req = String(format: "%.1f", requiredGB)
+            let avail = String(format: "%.1f", availableGB)
+            let error = NSError(domain: "DiffusionManager", code: 10, userInfo: [
+                NSLocalizedDescriptionKey: "Memory Failsafe: Diffusion model requires ~\(req) GB but only \(avail) GB is safely available right now."
+            ])
+            await MainActor.run {
+                self.diffusionLoadState = .failed(error: error.localizedDescription)
+                self.activeDiffusionURL = nil
+            }
+            throw error
+        }
+
         do {
-            try await runner.loadModel(at: url)
-            
-            let sizeGB = getFileSizeGB(at: url)
+            let availMem = getAvailableMemoryGB()
+            try await runner.loadModel(at: url, availableMemoryGB: availMem)
+
             await MainActor.run {
                 self.diffusionLoadState = .loaded(modelName: url.lastPathComponent, sizeGB: sizeGB)
             }

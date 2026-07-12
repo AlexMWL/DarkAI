@@ -63,7 +63,7 @@ struct ContentView: View {
                         .onTapGesture {
                             endEditing()
                         }
-                        .onChange(of: activeConv.messages) { _ in
+                        .onChange(of: activeConv.messages) {
                             if let last = activeConv.messages.last {
                                 withAnimation {
                                     proxy.scrollTo(last.id, anchor: .bottom)
@@ -179,7 +179,15 @@ struct ContentView: View {
                 message: Text("Would you like to auto-load the last used model?"),
                 primaryButton: .default(Text("Load")) {
                     if let path = llmManager.lastUsedModelPath {
-                        llmManager.loadModel(at: URL(fileURLWithPath: path))
+                        // Give the app's own launch sequence (SwiftUI setup, asset
+                        // decoding, etc.) a moment to settle before competing with it for
+                        // memory — loading immediately on first launch was a common cause
+                        // of an avoidable out-of-memory failure that wouldn't reproduce
+                        // moments later loading the identical model from Settings.
+                        Task {
+                            try? await Task.sleep(nanoseconds: 1_500_000_000)
+                            llmManager.loadModel(at: URL(fileURLWithPath: path))
+                        }
                     }
                 },
                 secondaryButton: .cancel(Text("No"))
@@ -388,9 +396,42 @@ struct ContentView: View {
                     .font(.system(size: 9, weight: .bold))
                     .foregroundColor(Theme.accent)
             }
-            Text("MAX: \(llmManager.maxTokens)T")
-                .font(.system(size: 9, weight: .bold, design: .monospaced))
-                .foregroundColor(Theme.textSecondary)
+
+            // Shown whenever the oldest conversation history (or, mid-generation, the
+            // oldest tokens in the live KV cache) had to be dropped to fit the context
+            // window — the conversation keeps going, this just makes it visible when it's
+            // happening rather than a silent, confusing drop in what the model can recall.
+            if llmManager.isContextTruncating {
+                HStack(spacing: 3) {
+                    Image(systemName: "arrow.trianglehead.2.clockwise")
+                    Text("TRUNCATING")
+                }
+                .font(.system(size: 9, weight: .bold))
+                .foregroundColor(.orange)
+            }
+
+            // Live context-window usage vs. the limit actually applied to the loaded
+            // model (which can be lower than the requested setting once clamped to
+            // available RAM). Turns orange near the limit as an early warning.
+            let ctxLimit = llmManager.loadedContextWindow > 0 ? llmManager.loadedContextWindow : llmManager.contextTokenLimit
+            if ctxLimit > 0 {
+                let ctxFraction = Double(llmManager.contextTokensUsed) / Double(ctxLimit)
+                Text("CTX: \(llmManager.contextTokensUsed)/\(ctxLimit)T")
+                    .font(.system(size: 9, weight: .bold, design: .monospaced))
+                    .foregroundColor(ctxFraction >= 0.9 ? .orange : Theme.textSecondary)
+            }
+
+            // Shows live generated-token progress against the cap while streaming, so the
+            // max-response-size setting is directly observable being enforced in the UI.
+            if llmManager.isGenerating {
+                Text("GEN: \(llmManager.currentResponseTokenCount)/\(llmManager.maxTokens)T")
+                    .font(.system(size: 9, weight: .bold, design: .monospaced))
+                    .foregroundColor(Theme.accentCyan)
+            } else {
+                Text("MAX: \(llmManager.maxTokens)T")
+                    .font(.system(size: 9, weight: .bold, design: .monospaced))
+                    .foregroundColor(Theme.textSecondary)
+            }
         }
         .padding(.vertical, 8)
         .padding(.horizontal, 16)
@@ -406,7 +447,44 @@ struct ContentView: View {
     // MARK: - Output Filtering
     private func filterThoughts(from text: String, stripMarkdown: Bool = false) -> String {
         var filtered = text
-        
+
+        // --- 0. Strip format-agnostic reasoning/channel blocks ---
+        // Some models (gpt-oss, certain Gemma fine-tunes) use a "channel" convention with
+        // no matching close tag at all — e.g. <|channel|>analysis<|message|> ... reasoning ...
+        // <|channel|>final<|message|> — where analysis only ends when a new non-reasoning
+        // channel begins. The fixed open/close tag pairs in step 1 below can't express that,
+        // so this keys off vocabulary inside any bracketed tag (<tag>, </tag>, <|tag|>) and
+        // exits on whichever comes first: a real close tag, or a transition to a
+        // final/message/response/answer channel.
+        let reasoningOpenPattern = "<\\|?\\s*(think|thought|thinking|reflect|reason|channel|analysis|internal|scratchpad|deliberat)"
+        let reasoningClosePattern = "</\\s*(think|thought|thinking|reflect|reflection|reason|reasoning|channel|analysis|internal|scratchpad|deliberation)\\s*>"
+        let transitionPattern = "<\\|?/?\\s*(final|message|response|answer)[a-z]*\\s*\\|?>"
+        if let openRegex = try? NSRegularExpression(pattern: reasoningOpenPattern, options: [.caseInsensitive]),
+           let closeRegex = try? NSRegularExpression(pattern: reasoningClosePattern, options: [.caseInsensitive]),
+           let transitionRegex = try? NSRegularExpression(pattern: transitionPattern, options: [.caseInsensitive]) {
+            while let openMatch = openRegex.firstMatch(in: filtered, range: NSRange(filtered.startIndex..., in: filtered)),
+                  let openRange = Range(openMatch.range, in: filtered) {
+                let searchRange = NSRange(openRange.upperBound..., in: filtered)
+                let closeEnd = closeRegex.firstMatch(in: filtered, range: searchRange).flatMap { Range($0.range, in: filtered)?.upperBound }
+                let transEnd = transitionRegex.firstMatch(in: filtered, range: searchRange).flatMap { Range($0.range, in: filtered)?.upperBound }
+
+                let end: String.Index?
+                switch (closeEnd, transEnd) {
+                case let (c?, t?): end = min(c, t)
+                case let (c?, nil): end = c
+                case let (nil, t?): end = t
+                default: end = nil
+                }
+
+                if let end {
+                    filtered.removeSubrange(openRange.lowerBound..<end)
+                } else {
+                    filtered.removeSubrange(openRange.lowerBound..<filtered.endIndex)
+                    break
+                }
+            }
+        }
+
         // --- 1. Strip XML-style thinking/correction/reflection tags ---
         // Covers Gemma, Qwen, DeepSeek, Llama, and other instruct model variants
         let xmlTags = [
@@ -447,11 +525,43 @@ struct ContentView: View {
         
         // --- 3. Strip exact known artifact strings ---
         let exactArtifacts = [
-            "[Response generation]", "*self-correction/review*",
             "<|im_start|>", "<|im_end|>", "<|start_of_turn|>", "<|end_of_turn|>"
         ]
         for artifact in exactArtifacts {
             filtered = filtered.replacingOccurrences(of: artifact, with: "", options: .caseInsensitive)
+        }
+
+        // --- 3b. Strip bare (untagged) scaffolding/preamble blocks ---
+        // Some fine-tunes open every reply with meta-commentary about how they plan to
+        // respond — style/tone "checks," headers like "My internal monologue:", decorative
+        // "***" separators, or literal placeholder text like "(Generating response...)" —
+        // with no tag structure at all, and wording that varies message to message. Match
+        // the recurring *shapes* instead of specific wording: a slash-command header, a
+        // decorative "***" line, any bold/italic header ending in a colon, or known
+        // self-referential/stage-direction phrases in other wrappers. These have no
+        // reliable close tag, so the next blank line is treated as the block's end —
+        // scoped to near the start of the message only, so a legitimate bolded header
+        // later in a well-formed answer is never touched.
+        let bareLabelPattern = "(?:^|\\n)\\s*(?:" +
+            "\\*{3,}|" +
+            "/[A-Za-z][A-Za-z ]{2,29}:|" +
+            "\\*{1,2}[A-Za-z][A-Za-z ,]{2,39}:\\*{0,2}|" +
+            "[\\*\"'\\[\\(]{1,2}\\s*(?:self[- _]?correction|self[- _]?review|internal monologue|internal reasoning|response generation|chain of thought|style check|tone check|voice check|persona check|vibe check|character check|generating response|generating\\.\\.\\.)" +
+            ")"
+        if let bareLabelRegex = try? NSRegularExpression(pattern: bareLabelPattern, options: [.caseInsensitive]) {
+            var guardIterations = 0
+            while guardIterations < 20,
+                  let openMatch = bareLabelRegex.firstMatch(in: filtered, range: NSRange(filtered.startIndex..., in: filtered)),
+                  let openRange = Range(openMatch.range, in: filtered),
+                  filtered.distance(from: filtered.startIndex, to: openRange.lowerBound) < 600 {
+                guardIterations += 1
+                if let blankRange = filtered.range(of: "\n\n", range: openRange.upperBound..<filtered.endIndex) {
+                    filtered.removeSubrange(openRange.lowerBound..<blankRange.upperBound)
+                } else {
+                    filtered.removeSubrange(openRange.lowerBound..<filtered.endIndex)
+                    break
+                }
+            }
         }
         
         // --- 4. Strip leading role-echo preamble (model parroting its own role prefix) ---
@@ -675,8 +785,14 @@ struct ContentView: View {
 
                 let filteredText = filterThoughts(from: message.text, stripMarkdown: personalityManager.isMature)
                 let isThinking = filteredText.isEmpty && llmManager.isGenerating
+                // Suppressed thinking/preamble tokens are never streamed as visible text, so
+                // without this the bubble would show a bare "Thinking..." with no indication
+                // whether it's actively working or has stalled — indistinguishable from a hang.
+                let thinkingLabel = llmManager.thinkingTokensUsed > 0
+                    ? "Thinking... (\(llmManager.thinkingTokensUsed)T)"
+                    : "Thinking..."
 
-                Text(isThinking ? "Thinking..." : filteredText)
+                Text(isThinking ? thinkingLabel : filteredText)
                     .font(.system(size: 14, design: .monospaced))
                     .foregroundColor(isThinking ? Theme.textSecondary : Theme.textPrimary)
                     .padding(.horizontal, 14)
@@ -1065,9 +1181,11 @@ struct ContentView: View {
                 
                 if enableMemories && !text.isEmpty {
                     memoryManager.extractMemories(from: text)
-                    if let activeModel = llmManager.activeModelURL?.lastPathComponent {
-                        personalityManager.analyzeUserMessage(text, modelName: activeModel, llmManager: llmManager)
-                    }
+                    // NOTE: personality analysis can trigger its own background LLM call
+                    // (every 3rd message). LlamaRunner is a single serialized actor, so
+                    // firing that here would race the chat response below for the model —
+                    // whichever reaches the actor first runs, silently delaying replies.
+                    // It's fired from onComplete instead, strictly after this turn finishes.
                 }
         
                 let ragContext = enableRAG ? ragManager.retrieveRelevantContext(query: text) : ""
@@ -1109,10 +1227,22 @@ struct ContentView: View {
                 } onComplete: { finalText in
                     var cleanedText = self.filterThoughts(from: finalText, stripMarkdown: self.personalityManager.isMature)
                     if cleanedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        cleanedText = "[Context exhausted during reasoning. Try a shorter prompt or reduce the context window in Settings.]"
+                        cleanedText = "[No response content was generated — the model may have only produced internal notes for this turn. Try regenerating or rephrasing your prompt.]"
                     }
                     conversationManager.updateLastMessage(text: cleanedText)
                     conversationManager.saveConversations()
+
+                    // Run personality analysis only after the real response is fully done,
+                    // so its occasional background LLM call never delays a chat reply.
+                    if enableMemories && !text.isEmpty, let activeModel = llmManager.activeModelURL?.lastPathComponent {
+                        personalityManager.analyzeUserMessage(text, modelName: activeModel, llmManager: llmManager)
+                    }
+                    // Capture the AI's own stated likes/dislikes/favorites from its reply
+                    // (e.g. "my favorite car is a Tesla") so it stays consistent if asked
+                    // again, rather than borrowing an answer from the user's own memories.
+                    if enableMemories, let activeModel = llmManager.activeModelURL?.lastPathComponent {
+                        personalityManager.analyzeAssistantMessage(cleanedText, modelName: activeModel)
+                    }
                 }
             }
         }
@@ -1177,6 +1307,10 @@ struct ContentView: View {
                         }
                         conversationManager.updateLastMessage(text: cleanedText)
                         conversationManager.saveConversations()
+
+                        if enableMemories, let activeModel = llmManager.activeModelURL?.lastPathComponent {
+                            personalityManager.analyzeAssistantMessage(cleanedText, modelName: activeModel)
+                        }
                     }
                 }
 
