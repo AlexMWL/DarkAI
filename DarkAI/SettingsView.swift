@@ -2,6 +2,10 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 struct SettingsView: View {
+    // stable-diffusion.cpp loads GGUF, safetensors, and legacy .ckpt checkpoints through the
+    // same model_path — unlike the LLM chat path (LlamaSwift/llama.cpp), which is GGUF-only.
+    static let acceptedDiffusionExtensions: Set<String> = ["gguf", "safetensors", "ckpt"]
+
     @Environment(\.dismiss) var dismiss
     @ObservedObject var llmManager: LLMManager
     @ObservedObject var memoryManager: MemoryManager
@@ -122,7 +126,7 @@ struct SettingsView: View {
                                 Button(action: { showDiffusionImporter = true }) {
                                     HStack(spacing: 6) {
                                         Image(systemName: "plus")
-                                        Text("Import .gguf")
+                                        Text("Import Model")
                                     }
                                     .font(.system(size: 12, weight: .bold))
                                     .foregroundColor(.white)
@@ -139,7 +143,7 @@ struct SettingsView: View {
 
                             // Diffusion model list
                             if importedDiffusionModels.isEmpty {
-                                Text("No diffusion model imported. Tap 'Import' to add a diffusion .gguf model.")
+                                Text("No diffusion model imported. Tap 'Import' to add a diffusion model (.gguf or .safetensors).")
                                     .font(.system(size: 13))
                                     .foregroundColor(Theme.textSecondary)
                                     .padding()
@@ -1102,7 +1106,11 @@ struct SettingsView: View {
         switch result {
         case .success(let urls):
             guard let sourceURL = urls.first else { return }
-            guard sourceURL.pathExtension.lowercased() == "gguf" else { return }
+            // stable-diffusion.cpp auto-detects the actual weight format (GGUF, safetensors,
+            // or legacy checkpoint) from file content, not extension — SDWrapper.loadModel
+            // passes whatever path it's given straight through. This is just a sanity filter
+            // on what the picker will offer to import in the first place.
+            guard Self.acceptedDiffusionExtensions.contains(sourceURL.pathExtension.lowercased()) else { return }
             isDiffusionImporting = true
             diffusionImportProgress = "Copying \(sourceURL.lastPathComponent)…"
             Task {
@@ -1140,7 +1148,7 @@ struct SettingsView: View {
             at: modelsDir, includingPropertiesForKeys: [.fileSizeKey], options: .skipsHiddenFiles
         ) else { return }
         importedDiffusionModels = contents
-            .filter { $0.pathExtension.lowercased() == "gguf" }
+            .filter { Self.acceptedDiffusionExtensions.contains($0.pathExtension.lowercased()) }
             .sorted { $0.lastPathComponent < $1.lastPathComponent }
     }
 
