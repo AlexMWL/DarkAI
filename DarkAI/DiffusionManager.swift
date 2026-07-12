@@ -196,13 +196,22 @@ class DiffusionManager: ObservableObject {
     /// frequently the single largest allocation in the app (SDXL weights plus CLIP/VAE plus
     /// the denoising compute graph), so attempting a load with genuinely insufficient
     /// headroom risked a hard jetsam kill instead of a recoverable, user-visible failure.
+    ///
+    /// This is deliberately *not* as paranoid as it first looks it should be: the actual
+    /// weight-residency budgeting already happens one layer down, in
+    /// `SDWrapper.loadModel`'s `max_vram` calculation, which caps itself to real available
+    /// memory. This check's job is only to reject genuinely hopeless attempts before ever
+    /// reaching the C++ load — not to re-derive that budget. An earlier version used a 1.3x
+    /// weight-size multiplier plus a flat 1.0 GB and an 0.85 available-memory margin, which
+    /// rejected legitimate loads with real headroom to spare (observed: "requires ~4.8 GB
+    /// but only 5.6 GB is safely available" — a load that in practice had plenty of room).
     func checkMemorySafety(modelSizeGB: Double) -> MemorySafetyStatus {
         let availableNowGB = getAvailableMemoryGB()
-        // SDXL's CLIP text encoders, VAE, and the UNet's compute/activation buffers add
-        // meaningfully on top of the raw weight file size — budget generously since this
-        // pre-check is the only thing standing between "load" and a jetsam kill.
-        let required = modelSizeGB * 1.3 + 1.0
-        if required > availableNowGB * 0.85 {
+        // Flat compute overhead for CLIP text encoders, VAE, and UNet activation buffers —
+        // not multiplicative with weight size, since `max_vram` downstream already caps
+        // weight residency rather than assuming the full file size stays resident at once.
+        let required = modelSizeGB + 0.8
+        if required > availableNowGB * 0.9 {
             return .dangerous(requiredGB: required, availableGB: availableNowGB)
         }
         let total = ProcessInfo.processInfo.physicalMemory
