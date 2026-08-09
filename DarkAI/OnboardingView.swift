@@ -224,7 +224,7 @@ struct OnboardingView: View {
                 } label: {
                     Text("Get")
                         .font(.system(size: 12, weight: .bold))
-                        .foregroundColor(.white)
+                        .foregroundColor(Theme.onAccent)
                         .padding(.horizontal, 16)
                         .padding(.vertical, 7)
                         .background(RoundedRectangle(cornerRadius: 8).fill(Theme.accent))
@@ -320,7 +320,7 @@ struct OnboardingView: View {
             } label: {
                 Text(primaryButtonTitle)
                     .font(.system(size: 16, weight: .bold))
-                    .foregroundColor(.white)
+                    .foregroundColor(canAdvance ? Theme.onAccent : Theme.textSecondary)
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 15)
                     .background(
@@ -468,7 +468,7 @@ extension OnboardingView {
                 VStack(spacing: 8) {
                     Text(title)
                         .font(.system(size: 24, weight: .black))
-                        .foregroundColor(.white)
+                        .foregroundColor(Theme.textPrimary)
                         .multilineTextAlignment(.center)
                     Text(subtitle)
                         .font(.system(size: 14))

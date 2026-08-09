@@ -129,10 +129,10 @@ struct ContentView: View {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("No Diffusion Model Loaded")
                                 .font(.system(size: 13, weight: .bold))
-                                .foregroundColor(.white)
+                                .foregroundColor(Theme.textPrimary)
                             Text("Load a diffusion model in Settings to generate images.")
                                 .font(.system(size: 11))
-                                .foregroundColor(Color.white.opacity(0.7))
+                                .foregroundColor(Theme.textSecondary)
                         }
                         Spacer()
                         Button {
@@ -366,7 +366,7 @@ struct ContentView: View {
 
                 Button("View") { crashToInspect = crash }
                     .font(.system(size: 12, weight: .bold))
-                    .foregroundColor(.white)
+                    .foregroundColor(Theme.onAccent)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 6)
                     .background(RoundedRectangle(cornerRadius: 8).fill(Color.orange.opacity(0.85)))
@@ -543,7 +543,7 @@ struct ContentView: View {
                 } label: {
                     Text("Open Settings")
                         .font(.system(size: 14, weight: .bold))
-                        .foregroundColor(.white)
+                        .foregroundColor(Theme.onAccent)
                         .padding(.horizontal, 26)
                         .padding(.vertical, 11)
                         .background(RoundedRectangle(cornerRadius: 12).fill(Theme.accent))
@@ -851,7 +851,7 @@ struct ContentView: View {
                 Spacer()
                 Text(message.text)
                     .font(.system(size: 14))
-                    .foregroundColor(.white)
+                    .foregroundColor(Theme.onAccent)
                     .padding(.horizontal, 14)
                     .padding(.vertical, 10)
                     .background(
@@ -910,7 +910,7 @@ struct ContentView: View {
                         } label: {
                             Label("Save", systemImage: "square.and.arrow.down")
                                 .font(.system(size: 11, weight: .semibold))
-                                .foregroundColor(.white)
+                                .foregroundColor(Theme.onAccent)
                                 .padding(.horizontal, 10)
                                 .padding(.vertical, 5)
                                 .background(
@@ -1067,7 +1067,7 @@ struct ContentView: View {
                             } label: {
                                 Label("Search", systemImage: "magnifyingglass")
                                     .font(.system(size: 12, weight: .semibold))
-                                    .foregroundColor(.white)
+                                    .foregroundColor(Theme.onAccent)
                                     .padding(.horizontal, 12)
                                     .padding(.vertical, 6)
                                     .background(RoundedRectangle(cornerRadius: 8).fill(Theme.accentCyan))
@@ -1103,7 +1103,7 @@ struct ContentView: View {
                         .foregroundColor(Theme.accentCyan)
                     Text(attName)
                         .font(.system(size: 12, weight: .bold))
-                        .foregroundColor(.white)
+                        .foregroundColor(Theme.textPrimary)
                         .lineLimit(1)
                     Spacer()
                     Button(action: {
@@ -1169,7 +1169,7 @@ struct ContentView: View {
             // Send / Stop button
             Button(action: sendMessage) {
                 Image(systemName: llmManager.isGenerating ? "stop.fill" : "arrow.up")
-                    .foregroundColor(.white)
+                    .foregroundColor(isModelActive ? Theme.onAccent : Theme.textSecondary)
                     .font(.system(size: 14, weight: .bold))
                     .padding(10)
                     .background(
@@ -1200,7 +1200,7 @@ struct ContentView: View {
                 HStack {
                     Text("CHATS")
                         .font(.system(size: 13, weight: .black))
-                        .foregroundColor(.white)
+                        .foregroundColor(Theme.textPrimary)
                         .kerning(2.0)
                     
                     Spacer()
@@ -1248,7 +1248,7 @@ struct ContentView: View {
                                             .foregroundColor(conversationManager.activeConversationId == conversation.id ? Theme.accent : Theme.textMuted)
                                         Text(conversation.title)
                                             .font(.system(size: 13, weight: .semibold))
-                                            .foregroundColor(conversationManager.activeConversationId == conversation.id ? .white : Theme.textSecondary)
+                                            .foregroundColor(conversationManager.activeConversationId == conversation.id ? Theme.textPrimary : Theme.textSecondary)
                                             .lineLimit(1)
                                     }
                                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -1278,15 +1278,6 @@ struct ContentView: View {
                 }
                 
                 Spacer()
-                
-                // Drawer Footer status
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("\(AppInfo.displayName) · runs entirely on device")
-                        .font(.system(size: 10))
-                        .foregroundColor(Theme.textMuted)
-                }
-                .padding(.horizontal)
-                .padding(.bottom, 24)
             }
             .frame(width: 270)
             .background(Theme.background)
@@ -1770,6 +1761,13 @@ struct ContentView: View {
                         extraRagContext: extraContext, responseSuffix: sourcesFooter,
                         createsNewBubble: false
                     )
+                }
+            } catch WebSearchError.needsLocation {
+                // Not a failure — the question just didn't say where. Ask plainly instead of
+                // reporting a failed search or guessing a city.
+                await MainActor.run {
+                    conversationManager.updateLastMessage(text: "Which city should I check the weather for?")
+                    conversationManager.saveConversations()
                 }
             } catch WebSearchError.blocked(let message) {
                 // A deliberate content-policy refusal — this one stays a hard stop, not

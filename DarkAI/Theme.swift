@@ -45,6 +45,18 @@ struct Theme {
     static let border         = Color("ThemeBorder")
     static let glowColor      = Color("ThemeGlow")
 
+    /// Text and icons drawn *on top of* a saturated accent fill (a red button, a purple pill).
+    /// Deliberately white in both appearances: those fills are dark enough for white to read
+    /// against in light mode too, so this must NOT follow the appearance the way `textPrimary`
+    /// does — flipping it to near-black in light mode would make every filled button illegible.
+    ///
+    /// It exists to tell the two cases apart at a glance. A bare `.white` gives no signal about
+    /// whether it's correct-on-a-red-button or a light-mode bug, and the app shipped both:
+    /// "CHATS" in the chat drawer and the failsafe dialog's title were white on near-white
+    /// surfaces and simply disappeared. Anywhere text sits on a *theme* surface
+    /// (`background`, `cardBackground`, `border`) it wants `textPrimary`, not this.
+    static let onAccent       = Color.white
+
     /// Opaque chrome fill for bars that sit above content (header, input row, status strip).
     /// These were `Color.black.opacity(0.9)`, which stayed black in light mode.
     static let chrome         = Color("ThemeBackground").opacity(0.94)

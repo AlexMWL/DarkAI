@@ -209,14 +209,211 @@ struct DuckDuckGoInstantAnswerProvider: WebSearchProvider {
         }
 
         // Fall back to the first related topic with real text — often a disambiguation-list
-        // entry, still more useful than nothing.
-        if let related = decoded.RelatedTopics?.first(where: { ($0.Text?.isEmpty == false) }),
-           let text = related.Text {
+        // entry, still more useful than nothing. Held to the same relevance bar as the
+        // Wikipedia provider: a disambiguation list can wander a long way from what was asked,
+        // and a tangential entry presented as a search result is worse than no result.
+        let subjectTerms = WebSearchClassifier.subjectTerms(in: query)
+        if let related = decoded.RelatedTopics?.first(where: { topic in
+            guard let text = topic.Text, !text.isEmpty else { return false }
+            return WebSearchClassifier.isPlausiblyRelevant(text, toSubjectTerms: subjectTerms)
+        }), let text = related.Text {
             let sources = related.FirstURL.map { [WebSearchSource(title: "DuckDuckGo", url: $0)] } ?? []
             return WebSearchResult(answer: text, sources: sources)
         }
 
         throw WebSearchProviderError.noResults
+    }
+}
+
+// MARK: - Google News RSS (current events, keyless)
+
+/// Free, keyless source for the one thing an encyclopedia structurally cannot answer: what
+/// happened recently. Reads Google News' public RSS feed — a standard syndication endpoint meant
+/// to be consumed by feed readers, not scraped HTML, so there's no bot-detection gate and no
+/// terms problem.
+///
+/// Two feeds, picked by whether the question named a topic: a topic search for "what's in the
+/// news for Santa Clara", and the general top-stories feed for a bare "tell me the latest news".
+/// Headlines and publishers only — this returns what was reported and by whom, and the model
+/// summarises from that rather than from article bodies it never sees.
+nonisolated struct GoogleNewsProvider: WebSearchProvider {
+
+    /// Collects `<item><title>` / `<link>` pairs. `XMLParser` is Foundation's own parser, so
+    /// CDATA sections (which every title in this feed uses) are handled correctly — regex over
+    /// XML would not be.
+    private final class FeedParser: NSObject, XMLParserDelegate {
+        var items: [(title: String, link: String)] = []
+        private var insideItem = false
+        private var currentElement = ""
+        private var title = ""
+        private var link = ""
+
+        func parser(_ parser: XMLParser, didStartElement elementName: String,
+                    namespaceURI: String?, qualifiedName: String?, attributes: [String: String]) {
+            currentElement = elementName
+            if elementName == "item" {
+                insideItem = true
+                title = ""
+                link = ""
+            }
+        }
+
+        func parser(_ parser: XMLParser, foundCharacters string: String) {
+            guard insideItem else { return }
+            if currentElement == "title" { title += string }
+            if currentElement == "link" { link += string }
+        }
+
+        func parser(_ parser: XMLParser, foundCDATA CDATABlock: Data) {
+            guard insideItem, currentElement == "title",
+                  let text = String(data: CDATABlock, encoding: .utf8) else { return }
+            title += text
+        }
+
+        func parser(_ parser: XMLParser, didEndElement elementName: String,
+                    namespaceURI: String?, qualifiedName: String?) {
+            if elementName == "item" {
+                insideItem = false
+                let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !cleanTitle.isEmpty {
+                    items.append((cleanTitle, link.trimmingCharacters(in: .whitespacesAndNewlines)))
+                }
+            }
+            currentElement = ""
+        }
+    }
+
+    func search(query: String) async throws -> WebSearchResult {
+        // `subjectPhrase` strips the conversational wrapper — feeding the raw
+        // "what's been in the news lately for Santa Clara?" to a search feed matches on the
+        // filler words as much as the topic.
+        let topic = WebSearchClassifier.subjectPhrase(in: query)
+
+        var components: URLComponents
+        if topic.isEmpty {
+            // No topic named — "tell me the latest news". Top stories is the right answer.
+            components = URLComponents(string: "https://news.google.com/rss")!
+            components.queryItems = []
+        } else {
+            components = URLComponents(string: "https://news.google.com/rss/search")!
+            components.queryItems = [URLQueryItem(name: "q", value: topic)]
+        }
+        components.queryItems?.append(contentsOf: [
+            URLQueryItem(name: "hl", value: "en-US"),
+            URLQueryItem(name: "gl", value: "US"),
+            URLQueryItem(name: "ceid", value: "US:en")
+        ])
+
+        let (data, _) = try await URLSession.shared.data(from: components.url!)
+
+        let parserDelegate = FeedParser()
+        let parser = XMLParser(data: data)
+        parser.delegate = parserDelegate
+        guard parser.parse() else { throw WebSearchProviderError.invalidResponse }
+
+        // The first "item" in this feed is the channel description, not a story.
+        var items = parserDelegate.items.filter { !$0.title.lowercased().hasSuffix("google news") }
+
+        // A topic search still returns loosely-related stories; keep the ones that actually
+        // mention what was asked about. Skipped for top-stories, where there's no topic to be
+        // relevant to.
+        if !topic.isEmpty {
+            let terms = WebSearchClassifier.subjectTerms(in: query)
+            let onTopic = items.filter { WebSearchClassifier.isPlausiblyRelevant($0.title, toSubjectTerms: terms) }
+            if !onTopic.isEmpty { items = onTopic }
+        }
+
+        let top = Array(items.prefix(5))
+        guard !top.isEmpty else { throw WebSearchProviderError.noResults }
+
+        let heading = topic.isEmpty ? "Current top news headlines:" : "Recent news headlines about \(topic):"
+        let answer = heading + "\n" + top.map { "• \($0.title)" }.joined(separator: "\n")
+        let sources = top.prefix(3).compactMap { item -> WebSearchSource? in
+            guard !item.link.isEmpty else { return nil }
+            return WebSearchSource(title: item.title, url: item.link)
+        }
+        return WebSearchResult(answer: answer, sources: sources)
+    }
+}
+
+// MARK: - Wikipedia (general fallback, keyless)
+
+/// Free, keyless, and — unlike the instant-answer API above — it actually returns something for
+/// most real questions. One request does both halves of the job (`generator=search` finds the
+/// best-matching articles, `prop=extracts` returns their opening paragraphs), so a general
+/// lookup costs a single round trip.
+///
+/// It is an encyclopedia, not a search index: it answers "what/who/where is X" well and cannot
+/// answer "what happened today" at all. That gap is real and is why the optional Brave key
+/// exists — see `WebSearchManager.generalSearch` for the order these are tried in.
+struct WikipediaProvider: WebSearchProvider {
+
+    private struct Response: Decodable {
+        struct Page: Decodable {
+            var pageid: Int?
+            /// Search rank. The `pages` object is keyed by page ID, so iterating it yields an
+            /// arbitrary order — this is what puts the best match first again.
+            var index: Int?
+            var title: String?
+            var extract: String?
+        }
+        struct Query: Decodable {
+            var pages: [String: Page]?
+        }
+        var query: Query?
+    }
+
+    func search(query: String) async throws -> WebSearchResult {
+        var components = URLComponents(string: "https://en.wikipedia.org/w/api.php")!
+        components.queryItems = [
+            URLQueryItem(name: "action", value: "query"),
+            URLQueryItem(name: "generator", value: "search"),
+            URLQueryItem(name: "gsrsearch", value: query),
+            URLQueryItem(name: "gsrlimit", value: "2"),
+            URLQueryItem(name: "prop", value: "extracts"),
+            URLQueryItem(name: "exintro", value: "1"),
+            URLQueryItem(name: "explaintext", value: "1"),
+            URLQueryItem(name: "redirects", value: "1"),
+            URLQueryItem(name: "format", value: "json")
+        ]
+        var request = URLRequest(url: components.url!)
+        // Wikimedia's API etiquette policy requires a descriptive User-Agent; requests with a
+        // generic one are liable to be throttled or refused.
+        request.setValue("\(AppInfo.displayName)/\(AppInfo.version) (on-device iOS app)",
+                         forHTTPHeaderField: "User-Agent")
+
+        let (data, _) = try await URLSession.shared.data(for: request)
+        let decoded = try JSONDecoder().decode(Response.self, from: data)
+
+        let pages = (decoded.query?.pages?.values).map { Array($0) } ?? []
+        let ranked = pages.sorted { ($0.index ?? .max) < ($1.index ?? .max) }
+
+        // Full-text search always returns *something* — it will happily answer "Can you search
+        // and tell me the latest news?" with the TV series "Can This Love Be Translated?",
+        // matching only on the conversational wrapper. Requiring the article to share a real
+        // subject word with the question turns that into an honest "nothing found" instead of
+        // handing the model a confident, unrelated article to answer from.
+        let subjectTerms = WebSearchClassifier.subjectTerms(in: query)
+        let usable = ranked.filter { page in
+            guard !(page.extract ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  let title = page.title else { return false }
+            return WebSearchClassifier.isPlausiblyRelevant(title, toSubjectTerms: subjectTerms)
+        }
+        guard !usable.isEmpty else { throw WebSearchProviderError.noResults }
+
+        let answer = usable.compactMap { page -> String? in
+            guard let title = page.title, let extract = page.extract else { return nil }
+            // Intros run long; the model only needs enough to answer from.
+            return "\(title): \(String(extract.prefix(700)))"
+        }.joined(separator: "\n\n")
+        guard !answer.isEmpty else { throw WebSearchProviderError.noResults }
+
+        let sources = usable.compactMap { page -> WebSearchSource? in
+            guard let title = page.title, let id = page.pageid else { return nil }
+            return WebSearchSource(title: "Wikipedia — \(title)",
+                                   url: "https://en.wikipedia.org/?curid=\(id)")
+        }
+        return WebSearchResult(answer: answer, sources: sources)
     }
 }
 

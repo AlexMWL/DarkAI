@@ -260,7 +260,7 @@ struct ReportContentView: View {
                         } label: {
                             Text("Submit Report")
                                 .font(.system(size: 15, weight: .bold))
-                                .foregroundColor(.white)
+                                .foregroundColor(Theme.onAccent)
                                 .frame(maxWidth: .infinity)
                                 .padding(.vertical, 14)
                                 .background(RoundedRectangle(cornerRadius: 12).fill(Theme.accent))
@@ -482,7 +482,7 @@ struct CrashReportView: View {
                         } label: {
                             Text("Send Report")
                                 .font(.system(size: 15, weight: .bold))
-                                .foregroundColor(.white)
+                                .foregroundColor(Theme.onAccent)
                                 .frame(maxWidth: .infinity)
                                 .padding(.vertical, 14)
                                 .background(RoundedRectangle(cornerRadius: 12).fill(Theme.accent))

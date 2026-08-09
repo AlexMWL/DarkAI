@@ -33,6 +33,9 @@ struct SettingsView: View {
     @State private var showDiffusionImporter = false
     @State private var isDiffusionImporting = false
     @State private var diffusionImportProgress = ""
+    /// Why the last import was refused. Separate from `diffusionImportProgress` because that
+    /// row is only shown while an import is in flight — see `handleDiffusionImport`.
+    @State private var diffusionImportError: String? = nil
 
     // Context Warning
     @State private var showContextWarningPopup = false
@@ -75,7 +78,7 @@ struct SettingsView: View {
                                         Text("Import .gguf")
                                     }
                                     .font(.system(size: 12, weight: .bold))
-                                    .foregroundColor(.white)
+                                    .foregroundColor(Theme.onAccent)
                                     .padding(.horizontal, 12)
                                     .padding(.vertical, 6)
                                     .background(
@@ -142,7 +145,7 @@ struct SettingsView: View {
                                         Text("Import Model")
                                     }
                                     .font(.system(size: 12, weight: .bold))
-                                    .foregroundColor(.white)
+                                    .foregroundColor(Theme.onAccent)
                                     .padding(.horizontal, 12)
                                     .padding(.vertical, 6)
                                     .background(
@@ -189,6 +192,41 @@ struct SettingsView: View {
                                 .cornerRadius(12)
                                 .overlay(RoundedRectangle(cornerRadius: 12)
                                     .stroke(Color.purple.opacity(0.3), lineWidth: 1))
+                            }
+
+                            // Import refusal. These messages explain *what kind* of file was
+                            // picked (a LoRA, a bare VAE, a checkpoint with no VAE baked in),
+                            // so they're given room to wrap rather than being truncated to a
+                            // line — the explanation is the whole value.
+                            if let importError = diffusionImportError {
+                                VStack(alignment: .leading, spacing: 10) {
+                                    HStack(alignment: .top, spacing: 8) {
+                                        Image(systemName: "exclamationmark.triangle.fill")
+                                            .foregroundColor(.orange)
+                                            .font(.system(size: 14))
+                                        Text("Can't use this file")
+                                            .font(.system(size: 13, weight: .bold))
+                                            .foregroundColor(Theme.textPrimary)
+                                        Spacer()
+                                        Button {
+                                            diffusionImportError = nil
+                                        } label: {
+                                            Image(systemName: "xmark")
+                                                .font(.system(size: 12, weight: .bold))
+                                                .foregroundColor(Theme.textSecondary)
+                                        }
+                                    }
+                                    Text(importError)
+                                        .font(.system(size: 12))
+                                        .foregroundColor(Theme.textSecondary)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                        .lineSpacing(3)
+                                }
+                                .padding()
+                                .background(Color.orange.opacity(0.12))
+                                .cornerRadius(12)
+                                .overlay(RoundedRectangle(cornerRadius: 12)
+                                    .stroke(Color.orange.opacity(0.45), lineWidth: 1))
                             }
 
                             // Current diffusion load state
@@ -542,7 +580,7 @@ struct SettingsView: View {
                                     .font(.system(size: 11, weight: .semibold))
                                     .foregroundColor(Theme.textSecondary)
 
-                                Text("Weather and quick facts already work for free with no setup. Add a Brave Search API key for full general web search.")
+                                Text("Weather, and factual questions Wikipedia can answer, already work for free with no setup. A Brave Search API key adds real web search — needed for recent news, live scores, prices, and anything else that changes day to day.")
                                     .font(.system(size: 12))
                                     .foregroundColor(Theme.textMuted)
 
@@ -563,7 +601,7 @@ struct SettingsView: View {
                                         .font(.system(size: 11))
                                     Text(webSearchManager.hasBraveKey
                                          ? "Key saved on this device (Keychain) — full web search is active."
-                                         : "No key set — search will use free weather and quick-facts lookups only.")
+                                         : "No key set — searches use the free weather and Wikipedia lookups, which can't answer questions about recent events.")
                                         .font(.system(size: 11))
                                         .foregroundColor(Theme.textMuted)
                                 }
@@ -587,12 +625,12 @@ struct SettingsView: View {
                                     .foregroundColor(Theme.accentRose)
                                 Text("Personality Matrix")
                                     .font(.system(size: 14, weight: .bold))
-                                    .foregroundColor(.white)
+                                    .foregroundColor(Theme.textPrimary)
                                 Spacer()
                                 if personalityManager.isMature {
                                     Text("[ADAPTED]")
                                         .font(.system(size: 11, weight: .bold, design: .monospaced))
-                                        .foregroundColor(.white)
+                                        .foregroundColor(Theme.onAccent)
                                         .padding(.horizontal, 8)
                                         .padding(.vertical, 4)
                                         .background(Theme.accentRose)
@@ -629,7 +667,7 @@ struct SettingsView: View {
                                     Text("Reset Current Model's Personality")
                                 }
                                 .font(.system(size: 13, weight: .bold))
-                                .foregroundColor(.white)
+                                .foregroundColor(Theme.textPrimary)
                                 .padding(.vertical, 10)
                                 .frame(maxWidth: .infinity)
                                 .background(Theme.accentRose.opacity(0.2))
@@ -790,12 +828,6 @@ struct SettingsView: View {
                                 .font(.system(size: 11))
                                 .foregroundColor(Theme.textMuted)
                                 .lineSpacing(3)
-
-                            Text("\(AppInfo.displayName) · \(AppInfo.versionString)")
-                                .font(.system(size: 10, design: .monospaced))
-                                .foregroundColor(Theme.textMuted)
-                                .frame(maxWidth: .infinity, alignment: .center)
-                                .padding(.top, 4)
                         }
                         .glassCard(cornerRadius: 16)
 
@@ -863,7 +895,7 @@ struct SettingsView: View {
                             
                             Text(isFailsafeWarningOnly ? "MEMORY ALLOCATION WARNING" : "MEMORY FAILSAFE TRIGGERED")
                                 .font(.system(size: 16, weight: .bold))
-                                .foregroundColor(.white)
+                                .foregroundColor(Theme.textPrimary)
                                 .kerning(1.2)
                             
                             Text(failsafeMessage)
@@ -878,7 +910,7 @@ struct SettingsView: View {
                                         .foregroundColor(Theme.textMuted)
                                     Spacer()
                                     Text(String(format: "%.1f GB", llmManager.systemMemoryGB))
-                                        .foregroundColor(.white)
+                                        .foregroundColor(Theme.textPrimary)
                                 }
                                 HStack {
                                     Text("Estimated Model Footprint:")
@@ -906,7 +938,7 @@ struct SettingsView: View {
                                 }) {
                                     Text(isFailsafeWarningOnly ? "Cancel" : "OK")
                                         .font(.system(size: 14, weight: .bold))
-                                        .foregroundColor(.white)
+                                        .foregroundColor(Theme.textPrimary)
                                         .frame(maxWidth: .infinity)
                                         .padding(.vertical, 12)
                                         .background(
@@ -928,7 +960,7 @@ struct SettingsView: View {
                                     }) {
                                         Text("Load Anyway")
                                             .font(.system(size: 14, weight: .bold))
-                                            .foregroundColor(.white)
+                                            .foregroundColor(.black)
                                             .frame(maxWidth: .infinity)
                                             .padding(.vertical, 12)
                                             .background(
@@ -1156,7 +1188,7 @@ struct SettingsView: View {
                     } label: {
                         Text("Get")
                             .font(.system(size: 11, weight: .bold))
-                            .foregroundColor(.white)
+                            .foregroundColor(Theme.onAccent)
                             .padding(.horizontal, 14)
                             .padding(.vertical, 6)
                             .background(RoundedRectangle(cornerRadius: 8).fill(Theme.accent))
@@ -1238,7 +1270,7 @@ struct SettingsView: View {
                 }) {
                     Text("Load")
                         .font(.system(size: 12, weight: .bold))
-                        .foregroundColor(.white)
+                        .foregroundColor(Theme.textPrimary)
                         .padding(.horizontal, 14)
                         .padding(.vertical, 6)
                         .background(Theme.border)
@@ -1469,7 +1501,7 @@ struct SettingsView: View {
                             Text("SELECT")
                         }
                         .font(.system(size: 11, weight: .bold))
-                        .foregroundColor(.white)
+                        .foregroundColor(Theme.onAccent)
                         .padding(.horizontal, 10)
                         .padding(.vertical, 5)
                         .background(
@@ -1499,7 +1531,8 @@ struct SettingsView: View {
             // on what the picker will offer to import in the first place.
             guard Self.acceptedDiffusionExtensions.contains(sourceURL.pathExtension.lowercased()) else { return }
             isDiffusionImporting = true
-            diffusionImportProgress = "Copying \(sourceURL.lastPathComponent)…"
+            diffusionImportError = nil
+            diffusionImportProgress = "Checking \(sourceURL.lastPathComponent)…"
             Task {
                 let isSecured = sourceURL.startAccessingSecurityScopedResource()
                 defer { if isSecured { sourceURL.stopAccessingSecurityScopedResource() } }
@@ -1519,12 +1552,19 @@ struct SettingsView: View {
                 } catch {
                     await MainActor.run {
                         isDiffusionImporting = false
-                        diffusionImportProgress = "Import failed: \(error.localizedDescription)"
+                        // Surfaced through its own state, not `diffusionImportProgress` — that
+                        // row only renders while `isDiffusionImporting` is true, so writing the
+                        // failure there and clearing the flag in the same breath meant a
+                        // rejected import showed the user nothing at all and looked like the
+                        // button simply hadn't worked.
+                        diffusionImportError = error.localizedDescription
+                        LogManager.shared.log("Diffusion import rejected: \(error.localizedDescription)")
                     }
                 }
             }
         case .failure(let error):
-            print("Diffusion import error: \(error)")
+            diffusionImportError = error.localizedDescription
+            LogManager.shared.log("Diffusion import failed: \(error.localizedDescription)")
         }
     }
 
@@ -1561,7 +1601,7 @@ struct LogExportView: View {
                 }) {
                     Label("Clear Logs", systemImage: "trash")
                         .font(.headline)
-                        .foregroundColor(.white)
+                        .foregroundColor(Theme.onAccent)
                         .padding()
                         .frame(maxWidth: .infinity)
                         .background(Color.red)
@@ -1571,7 +1611,7 @@ struct LogExportView: View {
                 ShareLink(item: logManager.getLogFileURL()) {
                     Label("Export Logs", systemImage: "square.and.arrow.up")
                         .font(.headline)
-                        .foregroundColor(.white)
+                        .foregroundColor(Theme.onAccent)
                         .padding()
                         .frame(maxWidth: .infinity)
                         .background(Theme.accent)
@@ -1595,7 +1635,7 @@ private struct MindscapeExportLabel: View {
             Text("Export")
         }
         .font(.system(size: 12, weight: .bold))
-        .foregroundColor(.white)
+        .foregroundColor(Theme.onAccent)
         .padding(.vertical, 6)
         .padding(.horizontal, 12)
         .background(Theme.accent)
@@ -1639,7 +1679,7 @@ private struct MindscapeTextContent: View {
         ScrollView(.vertical) {
             Text(joinedText)
                 .font(.system(.caption, design: .monospaced))
-                .foregroundColor(.white)
+                .foregroundColor(Theme.textPrimary)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
         .frame(height: 150)
@@ -1757,7 +1797,7 @@ struct MindscapeView: View {
                     Text("Import RAG Document")
                 }
                 .font(.headline)
-                .foregroundColor(.white)
+                .foregroundColor(Theme.onAccent)
                 .padding()
                 .frame(maxWidth: .infinity)
                 .background(Theme.accentCyan)

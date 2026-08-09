@@ -3,10 +3,15 @@ import Combine
 
 enum WebSearchError: LocalizedError {
     case blocked(String)
+    /// A weather question that never named a place. The app deliberately asks no location
+    /// permission (see `WebSearchClassifier` — the place comes from the text itself), so the
+    /// honest move is to ask which city rather than run a general search that cannot succeed.
+    case needsLocation
 
     var errorDescription: String? {
         switch self {
         case .blocked(let message): return message
+        case .needsLocation:        return "Which city should I check the weather for?"
         }
     }
 }
@@ -50,6 +55,8 @@ final class WebSearchManager: ObservableObject {
 
     private let openMeteo = OpenMeteoProvider()
     private let duckDuckGo = DuckDuckGoInstantAnswerProvider()
+    private let wikipedia = WikipediaProvider()
+    private let googleNews = GoogleNewsProvider()
 
     // MARK: Search
 
@@ -73,12 +80,13 @@ final class WebSearchManager: ObservableObject {
         defer { isSearching = false; searchStage = "" }
 
         let result: WebSearchResult
-        if case .weather(let place) = queryType, let place, !place.isEmpty {
+        if case .weather(let place) = queryType {
+            // No place in the message means there's nothing to look up — a general search for
+            // the bare word "weather" returns nothing useful from any provider. Ask instead.
+            guard let place, !place.isEmpty else { throw WebSearchError.needsLocation }
             searchStage = "Checking the weather…"
             result = try await openMeteo.search(query: place)
         } else {
-            // Either a general query, or a weather-shaped one with no location the classifier
-            // could pull out — falls through to general search rather than guessing a place.
             searchStage = "Searching the interwebs…"
             result = try await generalSearch(queryText)
         }
@@ -91,10 +99,40 @@ final class WebSearchManager: ObservableObject {
         return result
     }
 
+    /// Tries providers in order and returns the first real answer.
+    ///
+    /// Chained rather than single-shot because each keyless provider covers a different, narrow
+    /// slice and any one of them comes back empty most of the time: DuckDuckGo's instant-answer
+    /// API only responds for well-known named entities, and Wikipedia only for things it has an
+    /// article about. Running one provider alone was why general searches almost always failed —
+    /// the request succeeded, there was simply nothing in that particular source.
+    ///
+    /// Brave goes first when a key is set, since it's the only one that's a real web index. It
+    /// still falls through on failure so a rate-limited or mistyped key degrades to the free
+    /// sources instead of failing the whole search.
     private func generalSearch(_ query: String) async throws -> WebSearchResult {
+        var providers: [WebSearchProvider] = []
         if hasBraveKey {
-            return try await BraveSearchProvider(apiKey: braveAPIKey).search(query: query)
+            providers.append(BraveSearchProvider(apiKey: braveAPIKey))
         }
-        return try await duckDuckGo.search(query: query)
+        // Current-events questions go to the news feed before the encyclopedia sources, which
+        // can describe a subject accurately while saying nothing about what happened to it this
+        // week — the exact case where a confident, stale answer is worse than none.
+        if WebSearchClassifier.isNewsQuery(query) {
+            providers.append(googleNews)
+        }
+        providers.append(duckDuckGo)
+        providers.append(wikipedia)
+
+        var lastError: Error = WebSearchProviderError.noResults
+        for provider in providers {
+            do {
+                return try await provider.search(query: query)
+            } catch {
+                LogManager.shared.log("WebSearch: \(type(of: provider)) returned nothing — \(error.localizedDescription)")
+                lastError = error
+            }
+        }
+        throw lastError
     }
 }

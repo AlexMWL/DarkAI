@@ -147,6 +147,88 @@ struct WebSearchClassifier {
         return nil
     }
 
+    // MARK: Query relevance
+
+    /// Filler with no lookup value — question scaffolding, pronouns, articles, and the verbs
+    /// people wrap a request in ("can you tell me…").
+    private static let stopWords: Set<String> = [
+        "a", "an", "and", "any", "are", "as", "at", "be", "been", "but", "by", "can", "could",
+        "did", "do", "does", "for", "from", "get", "give", "going", "had", "has", "have", "he",
+        "her", "him", "his", "how", "hows", "i", "if", "in", "into", "is", "it", "its", "know",
+        "lately", "let", "like", "look", "me", "much", "my", "of", "on", "or", "our", "out",
+        "please", "search", "she", "should", "show", "so", "some", "tell", "that", "the",
+        "their", "them", "then", "there", "these", "they", "this", "to", "up", "us", "was",
+        "we", "were", "what", "whats", "when", "whens", "where", "wheres", "which", "who",
+        "whos", "why", "will", "with", "would", "you", "your"
+    ]
+
+    /// Words that describe *what kind* of answer is wanted rather than its subject. Excluded
+    /// from relevance matching specifically: a query about "the latest news" must not be
+    /// considered satisfied by an article that merely happens to contain the word "news".
+    private static let genericQueryWords: Set<String> = [
+        "news", "latest", "recent", "current", "today", "todays", "now", "happening",
+        "happened", "update", "updates", "information", "info", "score", "scores", "price",
+        "prices", "weather", "forecast", "temperature"
+    ]
+
+    /// The words a result actually has to match to be considered on-topic — the query's real
+    /// subject, with scaffolding and answer-type words removed.
+    ///
+    /// Empty means the message named no subject at all ("can you tell me the latest news?"),
+    /// which is precisely the case where any keyword-matched article will be a coincidence.
+    /// Callers treat empty as "unverifiable, don't trust a result."
+    static func subjectTerms(in query: String) -> Set<String> {
+        Set(subjectWords(in: query))
+    }
+
+    /// The same subject words, in the order they were written, as a search phrase.
+    ///
+    /// `subjectTerms` returns a `Set` for membership testing, which has no order — feeding that
+    /// to a search endpoint would scramble "santa clara" into arbitrary word order. Empty when
+    /// the question named no subject ("tell me the latest news"), which callers use to choose a
+    /// general feed over a topic search.
+    static func subjectPhrase(in query: String) -> String {
+        subjectWords(in: query).joined(separator: " ")
+    }
+
+    private static func subjectWords(in query: String) -> [String] {
+        let cleaned = query.lowercased().map { $0.isLetter || $0.isNumber ? $0 : " " }
+        return String(cleaned)
+            .split(separator: " ")
+            .map(String.init)
+            .filter { $0.count >= 4 && !stopWords.contains($0) && !genericQueryWords.contains($0) }
+    }
+
+    /// Whether the question is asking about current events, which routes to the news feed ahead
+    /// of the encyclopedia — Wikipedia can describe a place perfectly and still say nothing
+    /// about what happened there this week.
+    static func isNewsQuery(_ query: String) -> Bool {
+        let lower = query.lowercased()
+        return newsIndicators.contains { lower.contains($0) }
+    }
+
+    private static let newsIndicators: [String] = [
+        "news", "headline", "headlines", "happening", "happened", "current events",
+        "breaking", "latest on", "what's new", "whats new", "recently"
+    ]
+
+    /// Whether `text` (a result title) plausibly answers a query with these subject terms.
+    ///
+    /// Guards against full-text search returning a confident, completely unrelated article —
+    /// Wikipedia answered "Can you search and tell me the latest news?" with the TV series
+    /// "Can This Love Be Translated?", matching on the conversational wrapper alone. Handing
+    /// that to the model as sourced fact is worse than admitting nothing was found.
+    static func isPlausiblyRelevant(_ text: String, toSubjectTerms terms: Set<String>) -> Bool {
+        guard !terms.isEmpty else { return false }
+        let cleaned = text.lowercased().map { $0.isLetter || $0.isNumber ? $0 : " " }
+        let words = Set(String(cleaned).split(separator: " ").map(String.init))
+        // Prefix-tolerant so "california" still matches "californian", and singular/plural pairs
+        // line up, without pulling in a full stemmer.
+        return terms.contains { term in
+            words.contains { $0 == term || $0.hasPrefix(term) || term.hasPrefix($0) && $0.count >= 4 }
+        }
+    }
+
     // MARK: Helpers
 
     private static func strip(_ trigger: String, from original: String) -> String {
