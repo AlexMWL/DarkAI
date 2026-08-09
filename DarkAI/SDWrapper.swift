@@ -11,7 +11,6 @@ import CoreGraphics
 nonisolated class SDWrapper: @unchecked Sendable {
     private var sd_ctx: OpaquePointer?
     private var isLoaded: Bool = false
-    private var maxVRAMPointer: UnsafeMutablePointer<CChar>? = nil
     
     init() {
         sd_set_log_callback({ level, text, user_data in
@@ -28,15 +27,10 @@ nonisolated class SDWrapper: @unchecked Sendable {
     /// Loads the diffusion model.
     /// Note: `modelPath` should point to a standard SD1.5 or SDXL GGUF model.
     /// - Parameter availableMemoryGB: the process's real current headroom
-    ///   (`os_proc_available_memory()`) measured by the caller right before this call —
-    ///   not total device RAM. See the matching comment on
-    ///   `LlamaRunner.safeContextTokens` for why: a static total-RAM-based budget has no
-    ///   idea whether something else (an LLM that hasn't fully released its Metal buffers
-    ///   yet, RAG/conversation state, a large denoising history) is already using a chunk
-    ///   of that RAM right now, and previously routinely asked stable-diffusion.cpp to size
-    ///   its allocations against memory that wasn't actually free.
-    /// - Parameter modelSizeGB: the diffusion model file's own size, used as a hard floor
-    ///   on the VRAM budget below (see the comment at `modelFloorGB`).
+    ///   (`os_proc_available_memory()`) measured by the caller right before this call — not
+    ///   total device RAM. Recorded in the log alongside the load so a later failure can be
+    ///   read against what was actually free at the time.
+    /// - Parameter modelSizeGB: the checkpoint's own file size, logged for the same reason.
     func loadModel(modelPath: String, availableMemoryGB: Double, modelSizeGB: Double) throws {
         unload()
 
@@ -48,51 +42,49 @@ nonisolated class SDWrapper: @unchecked Sendable {
         // Assign a stable copy; sd_ctx owns nothing, so we can free after new_sd_ctx returns
         ctxParams.model_path = UnsafePointer(pathCStr)
 
-        let physicalMemory = ProcessInfo.processInfo.physicalMemory
-        let totalGiB = Double(physicalMemory) / 1024 / 1024 / 1024
-
-        // iOS limits Metal memory to ~60% of total physical RAM (before increased-memory-limit).
-        // We use 55% as a safe upper limit for all Metal allocations.
-        let metalLimitGiB = totalGiB * 0.55
-        // We must subtract ~0.6 GiB to leave room for the required intermediate compute buffers,
-        // leaving the remainder purely for the model weights.
-        var staticWeightVRAM = metalLimitGiB - 0.6
-        if staticWeightVRAM < 1.0 { staticWeightVRAM = 1.0 } // Minimum fallback to prevent weird edge cases
-
-        // The caller (DiffusionManager.checkMemorySafety) already confirmed there's enough
-        // real headroom for this model before this function is ever reached, using a full
-        // required-vs-available margin. So the model's own file size (plus a small margin)
-        // is a *safe floor* for the VRAM budget here — not an arbitrary constant.
+        // `max_vram` is deliberately left unset (nullptr, the library's default).
         //
-        // Without this floor, a low `availableMemoryGB` reading clamps the dynamic budget
-        // below what the model itself needs, and stable-diffusion.cpp does not fail cleanly
-        // on an undersized budget — it silently drops/truncates tensors instead of throwing,
-        // which is what a fully-generated-but-blank image actually looks like. A low reading
-        // is a real risk right after unloading a fully-GPU-offloaded LLM (e.g. Llama 3, which
-        // — unlike Gemma's GPU-layer-capped large-vocab path — gets every layer on GPU): its
-        // Metal buffers can take longer to actually release than the settle window gives them,
-        // so `os_proc_available_memory()` reads lower than the true post-flush figure.
-        let modelFloorGB = modelSizeGB + 0.5
-
-        // Dynamic cap: never budget more than a fraction of what's actually free right now,
-        // regardless of what the static total-RAM formula above thinks is theoretically
-        // available. Only 70% of current headroom — loading isn't instantaneous, and peak
-        // usage during weight mmap page-in plus the denoising compute graph can exceed
-        // steady-state, so headroom measured before the load starts needs real margin.
-        let dynamicWeightVRAM = max(modelFloorGB, availableMemoryGB * 0.7 - 0.6)
-
-        let weightVRAM = max(modelFloorGB, min(staticWeightVRAM, dynamicWeightVRAM))
-
-        let vramString = String(format: "%.1f", weightVRAM)
-        let maxVRAM = strdup(vramString)
-        self.maxVRAMPointer = maxVRAM
-        ctxParams.max_vram = UnsafePointer(maxVRAM)
+        // This used to be set to a computed "weight VRAM budget". That was based on a
+        // misreading of the parameter. In stable-diffusion.cpp `max_vram` does not cap weight
+        // residency at all — it parses into `MaxVramAssignment` and becomes
+        // `max_graph_vram_bytes`, a budget for *compute graph* segmentation. Worse, a non-zero
+        // value is the sole gate that switches the runner onto the graph-cut segmented compute
+        // path (`should_use_graph_cut_segmented_compute` requires `max_graph_vram_bytes > 0`
+        // plus a non-CPU, single-device backend — exactly this configuration).
+        //
+        // On device that path returned an empty result from the CLIP text encoder, tripping
+        // `GGML_ASSERT(!chunk_hidden_states.empty())` in `get_learned_condition_common` and
+        // calling `abort()` — an uncatchable SIGABRT partway into image generation, before the
+        // first denoising step. Leaving the parameter unset keeps the library on its ordinary
+        // unsegmented compute path.
+        //
+        // Nothing is lost by removing it: the memory controls that actually matter here are the
+        // library's lazy per-module weight preparation (see the `enable_mmap` note below) and
+        // `DiffusionManager.checkMemorySafety`, which refuses the load up front if the model
+        // genuinely can't fit. `availableMemoryGB` and `modelSizeGB` are still taken as
+        // parameters because both are worth logging next to a failure.
+        LogManager.shared.log(String(
+            format: "SD: loading (mmap off, lazy prep), %.1f GB model, %.1f GB process headroom",
+            modelSizeGB, availableMemoryGB
+        ))
         // SD_TYPE_COUNT = use the model's native quantized types; do NOT re-quantize on load
         ctxParams.wtype = SD_TYPE_COUNT
-        // mmap = true: weights are paged in from flash on demand rather than fully read into RAM.
-        // This is CRITICAL on iOS — without it a 3.7 GB SDXL model will exceed the OS memory limit
-        // and jetsam will kill the process before the first denoising step.
-        ctxParams.enable_mmap = true
+
+        // mmap is off, and that is not the memory regression it looks like.
+        //
+        // `ModelManager::mmap_params` points `tensor->data` at the mapped region but never
+        // assigns `tensor->buffer` — the mmap storage block carries no backend buffer at all.
+        // `can_mmap_storage` still allows it here because Metal reports host-buffer support on
+        // Apple's unified memory. The result is a tensor with data and no Metal buffer, so the
+        // first CLIP kernel dispatch hit `ggml_metal_buffer_get_id: tensor '...' buffer is nil`
+        // and Metal killed the process on `missing Buffer binding at index 1 for src0[0]`.
+        //
+        // Peak memory is held down by the library's lazy per-module preparation instead, which
+        // is doing the real work here regardless of this flag: it reported
+        // "weights will be prepared lazily" and loaded 178 of 2513 tensors to build the
+        // conditioning graph, preparing the text encoders, UNet, and VAE as each is needed
+        // rather than making all 2.7 GB resident at once.
+        ctxParams.enable_mmap = false
         // Use 2 threads on iOS devices to keep peak RAM within limits during the denoising loop.
         // Each extra thread requires additional working memory for intermediate ggml tensors.
         // Reducing to 1 strictly limits the intermediate compute buffers.
@@ -117,10 +109,17 @@ nonisolated class SDWrapper: @unchecked Sendable {
     }
     private var isCurrentlyGenerating: Bool = false
     
-    func unload() {
+    /// Frees the diffusion context.
+    ///
+    /// Returns `false` when the request was refused because generation is in flight — freeing
+    /// `sd_ctx` while the C++ denoising loop is running on another thread is a use-after-free.
+    /// The return value matters: `DiffusionRunner` used to clear its `loadedPath` unconditionally
+    /// after calling this, so a refused unload left the actor believing no model was loaded while
+    /// the context was in fact still alive and generating.
+    @discardableResult
+    func unload() -> Bool {
         guard !isCurrentlyGenerating else {
-            // Cannot unload the model while it's actively generating on a background thread!
-            return
+            return false
         }
         if let ctx = sd_ctx {
             autoreleasepool {
@@ -128,11 +127,8 @@ nonisolated class SDWrapper: @unchecked Sendable {
             }
             sd_ctx = nil
         }
-        if let ptr = maxVRAMPointer {
-            free(ptr)
-            maxVRAMPointer = nil
-        }
         isLoaded = false
+        return true
     }
     
     func generateImage(
@@ -156,26 +152,49 @@ nonisolated class SDWrapper: @unchecked Sendable {
         
         isCurrentlyGenerating = true
         defer { isCurrentlyGenerating = false }
-        
+
+        // CLIP works in 77-token chunks and every extra chunk is another full text-encoder
+        // graph. Keeping both prompts inside roughly two chunks bounds that work and keeps the
+        // conditioning stage well away from the size at which it has been seen to fail. The
+        // limit is generous — SD ignores most of what lands past the first couple of chunks
+        // anyway, so truncating here costs nothing a user would notice.
+        let boundedPrompt = String(trimmedPrompt.prefix(600))
+        let boundedNegative = String(negativePrompt.prefix(600))
+
         class ProgressContext {
             var handler: ((Double) -> Void)?
+            /// Sampler step count this generation asked for. Used to tell denoising progress
+            /// apart from weight-loading progress — see the callback below.
+            var samplerSteps: Int32 = 0
         }
         let progressCtx = ProgressContext()
         progressCtx.handler = progressHandler
+        progressCtx.samplerSteps = Int32(steps)
         
         // Use passRetained so it stays alive during generation
         let unmanagedCtx = Unmanaged.passRetained(progressCtx).toOpaque()
         
+        // stable-diffusion.cpp routes two unrelated things through this one callback:
+        // `pretty_progress` reports denoising steps, and `pretty_bytes_progress` reports tensor
+        // loading (`model_loader.cpp`). Because weights are prepared lazily *inside*
+        // `generate_image`, both fire during a single generation — which is why the bar used to
+        // fill to 100%, reset, and fill again.
+        //
+        // The callback carries no phase identifier, but the two differ in their denominator:
+        // sampling reports out of the step count this call requested, while loading reports out
+        // of a tensor count. Matching on that keeps the bar showing generation progress only.
+        // Loading is still visible to the user — it's the "Loading diffusion model…" stage,
+        // which shows an indeterminate spinner rather than a bar that lies about being done.
         sd_set_progress_callback({ step, steps, time, data in
             guard let data = data else { return }
             let pCtx = Unmanaged<ProgressContext>.fromOpaque(data).takeUnretainedValue()
-            let progress = steps > 0 ? Double(step) / Double(steps) : 0.0
-            pCtx.handler?(progress)
+            guard steps == pCtx.samplerSteps, steps > 0 else { return }
+            pCtx.handler?(Double(step) / Double(steps))
         }, unmanagedCtx)
         
         // Properly manage C strings
-        let promptCStr = strdup(prompt)
-        let negPromptCStr = strdup(negativePrompt)
+        let promptCStr = strdup(boundedPrompt)
+        let negPromptCStr = strdup(boundedNegative)
         
         defer {
             sd_set_progress_callback(nil, nil)

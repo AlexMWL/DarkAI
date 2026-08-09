@@ -9,6 +9,7 @@ struct ContentView: View {
     @StateObject private var conversationManager = ConversationManager()
     @StateObject private var personalityManager = PersonalityManager()
     @StateObject private var diffusionManager = DiffusionManager()
+    @StateObject private var webSearchManager = WebSearchManager()
 
     @AppStorage("customInstructions") private var customInstructions: String = "You are a local assistant. Respond with precise answers."
     @State private var enableRAG = true
@@ -27,6 +28,22 @@ struct ContentView: View {
     @State private var showDiffusionNotLoadedBanner = false
     @State private var diffusionBannerTask: Task<Void, Never>? = nil
 
+    // Content safety + one-off notices (blocked prompts, Photos permission, save results)
+    @State private var notice: Notice? = nil
+    @State private var reportTarget: ChatMessage? = nil
+
+    // Crash recovered from the previous run, offered once on launch
+    /// Crash recovered from the previous run, shown as a dismissible banner.
+    @State private var recoveredCrash: CrashReporter.Report? = nil
+    /// Set only when the user taps through from that banner.
+    @State private var crashToInspect: CrashReporter.Report? = nil
+
+    struct Notice: Identifiable {
+        let id = UUID()
+        let title: String
+        let message: String
+    }
+
     // Pulse animation state
     @State private var pulseActive = false
     
@@ -37,10 +54,13 @@ struct ContentView: View {
                 
                 // Custom Premium Navigation Header
                 customHeaderView
-                
+
+                // Recovered-crash notice, if the previous run ended badly
+                crashRecoveryBanner
+
                 // Active status banner
                 modelBanner
-                
+
                 // Messages board
                 if let activeConv = conversationManager.activeConversation, !activeConv.messages.isEmpty {
                     ScrollViewReader { proxy in
@@ -146,6 +166,7 @@ struct ContentView: View {
                 ragManager: ragManager,
                 personalityManager: personalityManager,
                 diffusionManager: diffusionManager,
+                webSearchManager: webSearchManager,
                 customInstructions: $customInstructions,
                 enableRAG: $enableRAG,
                 enableMemories: $enableMemories
@@ -169,29 +190,66 @@ struct ContentView: View {
                 conversationManager.createConversation()
             }
             
-            if llmManager.lastUsedModelPath != nil && llmManager.activeModelURL == nil {
+            // A recovered crash is surfaced as a banner, never as a modal at launch.
+            //
+            // `takePendingReport()` consumes the file immediately, so even if the banner or the
+            // detail sheet fails to render, the next launch starts clean instead of replaying
+            // the same failure forever. The report is held in memory for this session and is
+            // still reachable from Settings → Safety & Legal.
+            recoveredCrash = CrashReporter.takePendingReport()
+
+            if let queued = OnboardingHandoff.takeAutoLoadURL(), llmManager.activeModelURL == nil {
+                // Straight to loading, no prompt: this model was chosen moments ago during setup.
+                // The delay is the same one the manual auto-load path uses — competing with the
+                // app's own launch work for memory was a reliable way to fail a load that would
+                // succeed fine a second later.
+                Task {
+                    try? await Task.sleep(nanoseconds: 1_500_000_000)
+                    llmManager.loadModel(at: queued)
+                }
+            } else if recoveredCrash == nil,
+                      llmManager.lastUsedModelPath != nil,
+                      llmManager.activeModelURL == nil {
                 showAutoLoadAlert = true
             }
         }
-        .alert(isPresented: $showAutoLoadAlert) {
-            Alert(
-                title: Text("Load Previous Model?"),
-                message: Text("Would you like to auto-load the last used model?"),
-                primaryButton: .default(Text("Load")) {
-                    if let path = llmManager.lastUsedModelPath {
-                        // Give the app's own launch sequence (SwiftUI setup, asset
-                        // decoding, etc.) a moment to settle before competing with it for
-                        // memory — loading immediately on first launch was a common cause
-                        // of an avoidable out-of-memory failure that wouldn't reproduce
-                        // moments later loading the identical model from Settings.
-                        Task {
-                            try? await Task.sleep(nanoseconds: 1_500_000_000)
-                            llmManager.loadModel(at: URL(fileURLWithPath: path))
-                        }
+        .sheet(item: $reportTarget) { message in
+            ReportContentView(
+                content: message.imageData != nil ? "" : message.text,
+                modelName: llmManager.activeModelURL?.lastPathComponent ?? "none",
+                wasImage: message.imageData != nil
+            ) {
+                conversationManager.deleteMessage(id: message.id)
+            }
+        }
+        .alert(
+            notice?.title ?? "",
+            isPresented: Binding(get: { notice != nil }, set: { if !$0 { notice = nil } })
+        ) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(notice?.message ?? "")
+        }
+        // Uses the iOS 15+ alert API rather than the older `Alert`-returning form so it can
+        // coexist with the safety and report presentations above — mixing the two generations
+        // of alert modifier on one view lets the last one silently win.
+        .alert("Load Previous Model?", isPresented: $showAutoLoadAlert) {
+            Button("Load") {
+                if let path = llmManager.lastUsedModelPath {
+                    // Give the app's own launch sequence (SwiftUI setup, asset decoding, etc.)
+                    // a moment to settle before competing with it for memory — loading
+                    // immediately on first launch was a common cause of an avoidable
+                    // out-of-memory failure that wouldn't reproduce moments later loading the
+                    // identical model from Settings.
+                    Task {
+                        try? await Task.sleep(nanoseconds: 1_500_000_000)
+                        llmManager.loadModel(at: URL(fileURLWithPath: path))
                     }
-                },
-                secondaryButton: .cancel(Text("No"))
-            )
+                }
+            }
+            Button("Not Now", role: .cancel) {}
+        } message: {
+            Text("Would you like to load the model you used last?")
         }
     }
     
@@ -216,7 +274,7 @@ struct ContentView: View {
             HStack(spacing: 4) {
                 Text("DARK")
                     .font(.system(size: 20, weight: .black))
-                    .foregroundColor(.white)
+                    .foregroundColor(Theme.textPrimary)
                 Text("AI")
                     .font(.system(size: 20, weight: .black))
                     .foregroundColor(Theme.accent)
@@ -257,7 +315,7 @@ struct ContentView: View {
                 // Settings button
                 Button(action: { showSettings = true }) {
                     Image(systemName: "gearshape.fill")
-                        .foregroundColor(.white)
+                        .foregroundColor(Theme.textPrimary)
                         .font(.system(size: 18))
                         .frame(width: 32, height: 32)
                 }
@@ -267,7 +325,7 @@ struct ContentView: View {
         .padding(.top, 48) // Account for safe area
         .padding(.bottom, 12)
         .background(
-            Color.black.opacity(0.9)
+            Theme.chrome
                 .overlay(
                     Rectangle()
                         .frame(height: 1)
@@ -284,16 +342,123 @@ struct ContentView: View {
         return false
     }
     
+    /// Non-modal replacement for the launch-time crash dialog. Inline, dismissible, and it
+    /// cannot block the app if anything about it fails to draw.
+    @ViewBuilder
+    private var crashRecoveryBanner: some View {
+        if let crash = recoveredCrash {
+            HStack(spacing: 10) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundColor(.orange)
+                    .font(.system(size: 14))
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("\(AppInfo.displayName) closed unexpectedly last time")
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundColor(Theme.textPrimary)
+                    Text(crash.reason)
+                        .font(.system(size: 11))
+                        .foregroundColor(Theme.textSecondary)
+                        .lineLimit(2)
+                }
+
+                Spacer(minLength: 4)
+
+                Button("View") { crashToInspect = crash }
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(RoundedRectangle(cornerRadius: 8).fill(Color.orange.opacity(0.85)))
+
+                Button {
+                    withAnimation { recoveredCrash = nil }
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundColor(Theme.textSecondary)
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(Color.orange.opacity(0.12))
+            .overlay(
+                Rectangle().frame(height: 1).foregroundColor(Color.orange.opacity(0.4)),
+                alignment: .bottom
+            )
+            // Attached here rather than to the root ZStack so it isn't competing with the
+            // settings and content-report sheets during launch layout.
+            .sheet(item: $crashToInspect) { report in
+                CrashReportView(report: report) { }
+            }
+        }
+    }
+
+    /// Either actively generating, or unwinding a cancelled run that hasn't released the
+    /// checkpoint yet. Both are states where the bar should describe the image pipeline rather
+    /// than the chat model, which is unloaded throughout.
+    private var diffusionBusy: Bool {
+        diffusionManager.isGenerating || diffusionManager.isFinishingCancelledRun
+    }
+
+    /// Diffusion checkpoint driving the current generation.
+    ///
+    /// Prefers the name the loader reported, since that is the checkpoint actually resident.
+    /// Falls back to the selected file's name for the stretch before the load completes — the
+    /// banner needs something to say from the moment generation starts, not just once the
+    /// weights are up.
+    private var activeDiffusionModelName: String? {
+        if case let .loaded(name, _) = diffusionManager.diffusionLoadState {
+            return name
+        }
+        if let url = diffusionManager.activeDiffusionURL {
+            return url.lastPathComponent
+        }
+        if let path = diffusionManager.lastDiffusionModelPath {
+            return URL(fileURLWithPath: path).lastPathComponent
+        }
+        return nil
+    }
+
     // Model detail banner
     @ViewBuilder
     private var modelBanner: some View {
         HStack {
-            Image(systemName: "cpu.fill")
-                .foregroundColor(Theme.accent)
-            
+            Image(systemName: diffusionBusy ? "photo.fill" : "cpu.fill")
+                .foregroundColor(diffusionBusy ? .purple : Theme.accent)
+
+            // Image generation evicts the chat model to make room, so `llmManager.loadState`
+            // reads `.unloaded` for the whole operation — the bar used to say "No model loaded.
+            // Choose one in Settings to start." while the app was visibly busy generating.
+            // Show what is actually running instead, and let it fall back to the LLM state on
+            // its own once the session ends and the chat model is reloaded.
+            if diffusionManager.isFinishingCancelledRun {
+                // The sampler can't be interrupted, so this covers the gap between the user
+                // cancelling and the run unwinding far enough to put the chat model back.
+                Text("Cancelling — the chat model will reload when the current step finishes.")
+                    .foregroundColor(Theme.textSecondary)
+                    .lineLimit(2)
+            } else if diffusionManager.isGenerating {
+                HStack(spacing: 8) {
+                    Text("Generating with \(activeDiffusionModelName ?? "diffusion model")")
+                        .foregroundColor(Theme.textPrimary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+
+                    if diffusionManager.generationProgress > 0 {
+                        Text("\(Int(diffusionManager.generationProgress * 100))%")
+                            .foregroundColor(.purple)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.purple.opacity(0.15))
+                            .cornerRadius(4)
+                    }
+                }
+                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+            } else {
             switch llmManager.loadState {
             case .unloaded:
-                Text("Bypass active. Select a GGUF model in settings.")
+                Text("No model loaded. Choose one in Settings to start.")
                     .foregroundColor(Theme.textSecondary)
             case .loading(_, let status):
                 Text(status)
@@ -314,16 +479,19 @@ struct ContentView: View {
                 }
                 .font(.system(size: 11, weight: .semibold, design: .monospaced))
             case .failed(let error):
-                Text("Crash prevention: \(error)")
+                Text(error)
                     .foregroundColor(Theme.accent)
+                    .lineLimit(2)
             }
-            
+            }
+
             Spacer()
         }
         .font(.system(size: 12))
         .padding(.horizontal, 16)
         .padding(.vertical, 8)
-        .background(Theme.background)
+        .background(diffusionBusy ? Color.purple.opacity(0.10) : Theme.background)
+        .animation(.easeInOut(duration: 0.25), value: diffusionBusy)
         .overlay(
             Rectangle()
                 .frame(height: 1)
@@ -332,45 +500,80 @@ struct ContentView: View {
         )
     }
     
-    // Welcome Instructions empty view
+    // Welcome / empty conversation view
     @ViewBuilder
     private var emptyStateView: some View {
-        VStack(spacing: 20) {
+        VStack(spacing: 18) {
             Spacer()
-            
-            Image(systemName: "shield.fill")
-                .font(.system(size: 60))
-                .foregroundColor(Theme.accent)
-                .neonGlow(color: Theme.accent, radius: 10)
-            
-            Text("LOCAL RUNNER v5.7.7")
-                .font(.system(size: 15, weight: .bold))
-                .foregroundColor(.white)
-                .kerning(1.5)
-            
-            VStack(alignment: .leading, spacing: 10) {
-                Text("• Local & offline text generation active.")
-                Text("• RAG document storage active.")
-                Text("• Memory safety limits validator active.")
-            }
-            .font(.system(size: 12))
-            .foregroundColor(Theme.textSecondary)
-            .padding()
-            .glassCard(cornerRadius: 14)
-            .frame(width: 290)
-            
+
+            welcomePanel
+
             Spacer()
         }
+        .padding(.horizontal, 20)
+    }
+
+    /// The welcome copy and its shade panel. Split out from `emptyStateView` so the panel wraps
+    /// only the content — wrapping the enclosing `VStack` would stretch it across the spacers
+    /// and shade the entire screen, which is the thing this is meant to avoid.
+    @ViewBuilder
+    private var welcomePanel: some View {
+        VStack(spacing: 18) {
+            Image(systemName: isModelActive ? "bubble.left.and.bubble.right.fill" : "square.and.arrow.down.fill")
+                .font(.system(size: 52))
+                .foregroundColor(Theme.accent)
+                .neonGlow(color: Theme.accent, radius: 10)
+
+            Text(isModelActive ? "Ask me anything" : "Add a model to begin")
+                .font(.system(size: 19, weight: .bold))
+                .foregroundColor(Theme.textPrimary)
+
+            Text(isModelActive
+                 ? "Everything runs on this device. Try a question, or describe a picture to generate one."
+                 : "\(AppInfo.displayName) needs a model to run. Open Settings to download one — it only takes a minute.")
+                .font(.system(size: 13))
+                .foregroundColor(Theme.textSecondary)
+                .multilineTextAlignment(.center)
+                .lineSpacing(3)
+                .frame(maxWidth: 300)
+
+            if !isModelActive {
+                Button {
+                    showSettings = true
+                } label: {
+                    Text("Open Settings")
+                        .font(.system(size: 14, weight: .bold))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 26)
+                        .padding(.vertical, 11)
+                        .background(RoundedRectangle(cornerRadius: 12).fill(Theme.accent))
+                }
+            }
+
+            // Sets expectations before the first response rather than after — a reviewer
+            // opening a fresh install sees this, and so does a user about to trust an answer.
+            Text("Responses are generated by a model on this device and can be inaccurate. Check anything important.")
+                .font(.system(size: 11))
+                .foregroundColor(Theme.textMuted)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 290)
+                .padding(.top, 6)
+        }
+        .padding(.horizontal, 24)
+        .padding(.vertical, 26)
+        // Shade behind the copy rather than over the whole screen, so the backdrop stays part
+        // of the design while the text sitting on it keeps its contrast.
+        .readablePanel(cornerRadius: 28)
     }
     
     // Indicator pills
     @ViewBuilder
     private var activeParametersIndicator: some View {
         HStack(spacing: 12) {
-            if conversationManager.stealthMode {
+            if conversationManager.privateMode {
                 HStack(spacing: 4) {
                     Image(systemName: "eye.slash.fill")
-                    Text("STEALTH ACTIVE")
+                    Text("PRIVATE — NOT SAVED")
                 }
                 .font(.system(size: 9, weight: .bold))
                 .foregroundColor(Theme.accent)
@@ -378,7 +581,7 @@ struct ContentView: View {
             } else {
                 HStack(spacing: 4) {
                     Image(systemName: "tray.full.fill")
-                    Text("LOGGING ACTIVE")
+                    Text("SAVED ON DEVICE")
                 }
                 .font(.system(size: 9, weight: .bold))
                 .foregroundColor(.green)
@@ -435,7 +638,7 @@ struct ContentView: View {
         }
         .padding(.vertical, 8)
         .padding(.horizontal, 16)
-        .background(Color.black.opacity(0.8))
+        .background(Theme.chrome)
         .overlay(
             Rectangle()
                 .frame(height: 1)
@@ -682,7 +885,7 @@ struct ContentView: View {
                             .stroke(Color.purple.opacity(0.35), lineWidth: 1))
                         .contextMenu {
                             Button {
-                                UIImageWriteToSavedPhotosAlbum(uiImg, nil, nil, nil)
+                                saveToPhotos(uiImg)
                             } label: {
                                 Label("Save to Photos", systemImage: "square.and.arrow.down")
                             }
@@ -691,17 +894,19 @@ struct ContentView: View {
                             } label: {
                                 Label("Copy Image", systemImage: "doc.on.doc")
                             }
+                            Divider()
+                            Button(role: .destructive) {
+                                reportTarget = message
+                            } label: {
+                                Label("Report a Concern", systemImage: "flag")
+                            }
                         }
 
                     // Always-visible action row
                     HStack(spacing: 10) {
                         // Save button
                         Button {
-                            PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
-                                if status == .authorized || status == .limited {
-                                    UIImageWriteToSavedPhotosAlbum(uiImg, nil, nil, nil)
-                                }
-                            }
+                            saveToPhotos(uiImg)
                         } label: {
                             Label("Save", systemImage: "square.and.arrow.down")
                                 .font(.system(size: 11, weight: .semibold))
@@ -729,14 +934,23 @@ struct ContentView: View {
                                 )
                         }
 
-                        // RAG badge
-                        HStack(spacing: 3) {
-                            Image(systemName: "brain")
-                                .font(.system(size: 9))
-                            Text("In RAG")
-                                .font(.system(size: 10, weight: .medium))
+                        // Report button — a visible, one-tap path to flag generated imagery,
+                        // not just a hidden long-press affordance.
+                        Button {
+                            reportTarget = message
+                        } label: {
+                            Label("Report", systemImage: "flag")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundColor(Theme.textSecondary)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 5)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 7)
+                                        .fill(Theme.border.opacity(0.5))
+                                )
                         }
-                        .foregroundColor(Color.purple.opacity(0.6))
+
+                        Spacer(minLength: 0)
                     }
 
                     if !message.text.isEmpty {
@@ -757,14 +971,38 @@ struct ContentView: View {
                     .background(Theme.border.opacity(0.4))
                     .clipShape(Circle())
 
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Generating image... \(Int(diffusionManager.generationProgress * 100))%")
+                VStack(alignment: .leading, spacing: 7) {
+                    // Naming the stage matters here: loading a 3 GB checkpoint shows no sampler
+                    // progress at all, so a bare "0%" for two minutes reads as a frozen app.
+                    Text(diffusionManager.generationStage.isEmpty ? "Working…" : diffusionManager.generationStage)
                         .font(.system(size: 13, design: .monospaced))
-                        .foregroundColor(Color.purple.opacity(0.8))
-                    
-                    ProgressView(value: diffusionManager.generationProgress)
-                        .progressViewStyle(LinearProgressViewStyle(tint: Color.purple))
-                        .frame(width: 150)
+                        .foregroundColor(Theme.textPrimary)
+
+                    if diffusionManager.generationProgress > 0 {
+                        ProgressView(value: diffusionManager.generationProgress)
+                            .progressViewStyle(LinearProgressViewStyle(tint: Color.purple))
+                            .frame(width: 170)
+                        Text("\(Int(diffusionManager.generationProgress * 100))%")
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundColor(Theme.textSecondary)
+                    } else {
+                        ProgressView()
+                            .progressViewStyle(CircularProgressViewStyle(tint: Color.purple))
+                            .scaleEffect(0.7)
+                            .frame(height: 18, alignment: .leading)
+                    }
+
+                    // An escape hatch that always works. Generation itself can't be aborted, but
+                    // the user should never be stuck staring at a bar with no way back.
+                    Button {
+                        diffusionManager.cancelGeneration()
+                        conversationManager.updateLastMessage(text: "[Image generation cancelled.]")
+                        conversationManager.saveConversations()
+                    } label: {
+                        Text("Cancel")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundColor(Theme.accent)
+                    }
                 }
                 .padding(.horizontal, 14)
                 .padding(.vertical, 10)
@@ -792,24 +1030,61 @@ struct ContentView: View {
                     ? "Thinking... (\(llmManager.thinkingTokensUsed)T)"
                     : "Thinking..."
 
-                Text(isThinking ? thinkingLabel : filteredText)
-                    .font(.system(size: 14, design: .monospaced))
-                    .foregroundColor(isThinking ? Theme.textSecondary : Theme.textPrimary)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 10)
-                    .background(Theme.cardBackground)
-                    .cornerRadius(14)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 14)
-                            .stroke(Theme.border, lineWidth: 1)
-                    )
-                    .contextMenu {
-                        Button {
-                            UIPasteboard.general.string = isThinking ? message.text : filteredText
-                        } label: {
-                            Label("Copy", systemImage: "doc.on.doc")
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(isThinking ? thinkingLabel : filteredText)
+                        .font(.system(size: 14, design: .monospaced))
+                        .foregroundColor(isThinking ? Theme.textSecondary : Theme.textPrimary)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 10)
+                        .background(Theme.cardBackground)
+                        .cornerRadius(14)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 14)
+                                .stroke(Theme.border, lineWidth: 1)
+                        )
+                        .contextMenu {
+                            Button {
+                                UIPasteboard.general.string = isThinking ? message.text : filteredText
+                            } label: {
+                                Label("Copy", systemImage: "doc.on.doc")
+                            }
+                            Divider()
+                            Button(role: .destructive) {
+                                reportTarget = message
+                            } label: {
+                                Label("Report a Concern", systemImage: "flag")
+                            }
+                        }
+
+                    // ── Web search offer buttons ────────────────────────────
+                    // Only ever set on an assistant message asking whether to search — see
+                    // `respondToSearchOffer`. Cleared the moment either button is tapped, so
+                    // this never lingers once the user has answered.
+                    if let query = message.pendingSearchQuery {
+                        HStack(spacing: 8) {
+                            Button {
+                                respondToSearchOffer(accepted: true, query: query, offerMessageId: message.id)
+                            } label: {
+                                Label("Search", systemImage: "magnifyingglass")
+                                    .font(.system(size: 12, weight: .semibold))
+                                    .foregroundColor(.white)
+                                    .padding(.horizontal, 12)
+                                    .padding(.vertical, 6)
+                                    .background(RoundedRectangle(cornerRadius: 8).fill(Theme.accentCyan))
+                            }
+                            Button {
+                                respondToSearchOffer(accepted: false, query: query, offerMessageId: message.id)
+                            } label: {
+                                Text("No, just answer")
+                                    .font(.system(size: 12, weight: .semibold))
+                                    .foregroundColor(Theme.textSecondary)
+                                    .padding(.horizontal, 12)
+                                    .padding(.vertical, 6)
+                                    .background(RoundedRectangle(cornerRadius: 8).fill(Theme.border.opacity(0.5)))
+                            }
                         }
                     }
+                }
                 Spacer()
                 // ───────────────────────────────────────────────────────────
             }
@@ -859,27 +1134,28 @@ struct ContentView: View {
                     .overlay(Circle().stroke(Theme.accentCyan.opacity(0.4), lineWidth: 1))
             }
             
-            // Stealth Mode Toggle
+            // Private-chat toggle — this conversation is kept in memory only
             Button(action: {
-                conversationManager.stealthMode.toggle()
+                conversationManager.privateMode.toggle()
             }) {
-                Image(systemName: conversationManager.stealthMode ? "eye.slash.fill" : "eye.fill")
-                    .foregroundColor(conversationManager.stealthMode ? Theme.accent : Theme.textSecondary)
+                Image(systemName: conversationManager.privateMode ? "eye.slash.fill" : "eye.fill")
+                    .foregroundColor(conversationManager.privateMode ? Theme.accent : Theme.textSecondary)
                     .font(.system(size: 18))
                     .frame(width: 40, height: 40)
                     .background(Theme.border.opacity(0.3))
                     .clipShape(Circle())
                     .overlay(
                         Circle()
-                            .stroke(conversationManager.stealthMode ? Theme.accent : Color.clear, lineWidth: 1.5)
+                            .stroke(conversationManager.privateMode ? Theme.accent : Color.clear, lineWidth: 1.5)
                     )
             }
+            .accessibilityLabel(conversationManager.privateMode ? "Private chat on" : "Private chat off")
             
             // Text Entry
             TextField(isModelActive ? "Execute prompt..." : "Model unloaded...", text: $inputText, axis: .vertical)
                 .lineLimit(1...8)
                 .font(.system(size: 14))
-                .foregroundColor(.white)
+                .foregroundColor(Theme.textPrimary)
                 .padding(.horizontal, 14)
                 .padding(.vertical, 10)
                 .background(Theme.background)
@@ -906,7 +1182,7 @@ struct ContentView: View {
             }
         }
         .padding()
-        .background(Color.black.opacity(0.9))
+        .background(Theme.chrome)
         .overlay(
             Rectangle()
                 .frame(height: 1)
@@ -1005,7 +1281,7 @@ struct ContentView: View {
                 
                 // Drawer Footer status
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("DarkAI Local OS bypass")
+                    Text("\(AppInfo.displayName) · runs entirely on device")
                         .font(.system(size: 10))
                         .foregroundColor(Theme.textMuted)
                 }
@@ -1013,7 +1289,7 @@ struct ContentView: View {
                 .padding(.bottom, 24)
             }
             .frame(width: 270)
-            .background(Color(hex: "06060c"))
+            .background(Theme.background)
             .overlay(
                 Rectangle()
                     .frame(width: 1)
@@ -1028,9 +1304,16 @@ struct ContentView: View {
     }
     
     private func sendMessage() {
-        // Prevent sending new messages while an image is currently generating
-        // to avoid launching multiple 5GB models into memory at the same time (OOM crash).
+        // Only one heavy model can be resident at a time, so a second request during image
+        // generation would put two multi-gigabyte models in memory at once and get the app
+        // killed. Say so rather than dropping the message on the floor — silently discarding
+        // input is what made the earlier stuck-flag bug present as a dead app rather than a
+        // visible error.
         if diffusionManager.isGenerating {
+            notice = Notice(
+                title: "Still Generating",
+                message: "Wait for the current image to finish, or tap Cancel on it, before sending another message."
+            )
             return
         }
 
@@ -1044,11 +1327,49 @@ struct ContentView: View {
         guard !text.isEmpty || pendingAttachmentText != nil else { return }
 
         inputText = ""
+        // Clear again on the next main-queue turn.
+        //
+        // The field is a `TextField(axis: .vertical)`, which is UIKit underneath. When a send
+        // happens while the keyboard still has work in flight — an autocorrection, a predictive
+        // suggestion, dictation, a marked composition region — UIKit delivers that pending text
+        // to the binding *after* this synchronous block finishes, which put the prompt straight
+        // back into a box the user had just watched empty. The message itself always sent, so it
+        // looked like a duplicate waiting to happen.
+        //
+        // Guarded on the value so it only undoes that specific late delivery: if the user has
+        // genuinely started typing something new by the time this runs, it leaves it alone.
+        DispatchQueue.main.async {
+            if inputText == text { inputText = "" }
+        }
 
         // ── Prompt Intent Classification ──────────────────────────────────────
         // Check whether the user is requesting image generation BEFORE attaching
         // files so that file context doesn't accidentally override intent.
         let intent = PromptClassifier.classify(text)
+        let isImageRequest: Bool = {
+            if case .imageGeneration = intent { return true }
+            return false
+        }()
+
+        // ── Content policy ────────────────────────────────────────────────────
+        // Runs before the prompt reaches any model, and before the message is even added to
+        // the conversation, so blocked material is never persisted. The surface matters: an
+        // image request is held to the stricter standard, since Guideline 1.1.4 is about what
+        // the app *renders*.
+        let promptDecision = ContentSafety.review(text, surface: isImageRequest ? .imagePrompt : .chatPrompt)
+        guard promptDecision.isAllowed else {
+            // Hand the text back rather than swallowing it. Any lexical filter has false
+            // positives, and silently destroying what someone typed is the wrong way to be
+            // wrong about one.
+            inputText = text
+            notice = Notice(
+                title: "Request Blocked",
+                message: promptDecision.message ?? "This request isn't allowed under the app's content policy."
+            )
+            LogManager.shared.log("ContentSafety: blocked prompt — \(promptDecision.category?.rawValue ?? "unknown")")
+            return
+        }
+
         if case .imageGeneration(let refinedPrompt) = intent, pendingAttachmentText == nil {
             // Add the user message bubble
             conversationManager.addMessageToActive(isUser: true, text: text)
@@ -1072,89 +1393,141 @@ struct ContentView: View {
             // Add a placeholder bubble (shows the spinner while generating)
             conversationManager.addMessageToActive(isUser: false, text: refinedPrompt)
 
-            // SET UI STATE IMMEDIATELY so the progress bar shows while loading
-            diffusionManager.isGenerating = true
-            diffusionManager.generationProgress = 0.0
+            diffusionManager.beginGenerationSession(stage: "Preparing…")
 
             Task {
+                // Closes the session on every exit path — success, thrown error, early return.
+                // The previous version reset the flag by hand at some exit points and missed
+                // others, which is what left the app permanently refusing new messages.
+                defer { diffusionManager.endGenerationSession() }
+
+                // Falls back to the last-used model rather than only the currently resident one.
+                //
+                // `activeModelURL` is nil whenever no chat model happens to be loaded, and that
+                // is exactly the state a previous cancellation leaves behind — so the failure
+                // compounded: one cancelled generation unloaded the model, and every attempt
+                // afterwards captured nil and had nothing to put back. Resolving through
+                // `lastUsedModelPath` means "restore the last used LLM" holds even when the run
+                // started with nothing loaded.
                 let savedLLMUrl = llmManager.activeModelURL
+                    ?? llmManager.lastUsedModelPath.map { URL(fileURLWithPath: $0) }
 
                 // Ask the currently loaded chat model to expand the request into a
                 // richer SD prompt — must happen BEFORE the unload below, since it needs
                 // the model resident. Falls back to the rule-based `refinedPrompt` if no
                 // model is loaded, the actor is busy, or the model's output isn't usable.
                 var finalPrompt = refinedPrompt
-                if llmManager.isModelLoaded,
-                   let llmPrompt = await llmManager.generateImagePrompt(from: refinedPrompt) {
-                    finalPrompt = llmPrompt
-                    conversationManager.updateLastMessage(text: finalPrompt)
+                if llmManager.isModelLoaded {
+                    diffusionManager.updateGenerationStage("Writing the image prompt…")
+                    if let llmPrompt = await llmManager.generateImagePrompt(from: refinedPrompt) {
+                        // The expansion is model output, and an imported model can embellish an
+                        // innocuous request into something that would never have passed the
+                        // original screen. Re-check what actually reaches the sampler; fall back
+                        // to the rule-based prompt, which has already been cleared, rather than
+                        // failing the whole request over the model's phrasing.
+                        if ContentSafety.review(llmPrompt, surface: .imagePrompt).isAllowed {
+                            finalPrompt = llmPrompt
+                            conversationManager.updateLastMessage(text: finalPrompt)
+                        } else {
+                            LogManager.shared.log("ContentSafety: rejected LLM-expanded image prompt, using original")
+                        }
+                    }
                 }
+                guard !diffusionManager.isCancelled else { return }
 
+                diffusionManager.updateGenerationStage("Freeing memory…")
                 await llmManager.unloadModelAsync()
-                // Allow the OS time to flush Metal memory buffers released by llama.cpp
-                // before we attempt to map SDXL's massive weights into RAM.
-                do {
-                    try await Task.sleep(nanoseconds: 1_000_000_000)
-                } catch {
-                    print("Generation task was cancelled during initial sleep.")
-                    diffusionManager.isGenerating = false
-                    return
+                // Wait for the LLM's memory to actually come back before attempting to map
+                // SDXL's massive weights into RAM. A flat sleep here was the same mistake
+                // already fixed on the reverse handoff below (see `MemoryBudget.waitForRelease`):
+                // Metal returns buffers to the system on its own schedule, so a fixed delay is
+                // routinely too short and makes the diffusion safety check read less headroom
+                // than is really about to be available.
+                let diffSizeGB = diffusionManager.getFileSizeGB(at: URL(fileURLWithPath: diffPath))
+                await MemoryBudget.waitForRelease(atLeastGB: diffusionManager.memoryHeadroomNeededGB(
+                    forModelSizeGB: diffSizeGB, outputSize: diffusionManager.outputSize
+                ))
+
+                var resultData: Data? = nil
+                var failureMessage: String? = nil
+
+                // Cancelling here skips the work but must NOT skip the teardown below. The chat
+                // model has already been evicted at this point, so returning early — which is
+                // what this path used to do — left the user with no model loaded at all and a
+                // bar reading "No model loaded", as though cancelling had unloaded their model
+                // on purpose. Falling through restores it exactly as a completed run does.
+                if !diffusionManager.isCancelled {
+                    do {
+                        diffusionManager.updateGenerationStage("Loading diffusion model…")
+                        try await diffusionManager.loadDiffusionModelAsync(at: URL(fileURLWithPath: diffPath))
+
+                        diffusionManager.updateGenerationStage("Generating…")
+                        // Each `await` inside releases the MainActor, so the UI stays responsive
+                        // throughout the multi-minute denoising loop.
+                        resultData = try await diffusionManager.generateImageAsync(prompt: finalPrompt)
+                    } catch {
+                        failureMessage = error.localizedDescription
+                        LogManager.shared.log("Image generation failed — \(error.localizedDescription)")
+                    }
                 }
 
-                do {
-                    // Load the diffusion model — suspends here (MainActor is free during this)
-                    try await diffusionManager.loadDiffusionModelAsync(at: URL(fileURLWithPath: diffPath))
+                // Teardown runs whether or not generation succeeded, so a failure never strands
+                // several gigabytes of checkpoint resident with no chat model loaded.
+                diffusionManager.updateGenerationStage("Freeing memory…")
+                await diffusionManager.unloadDiffusionModelAsync()
 
-                    // Run image generation — each `await` inside releases the MainActor, so
-                    // the UI stays responsive throughout the multi-minute denoising loop.
-                    let imageData = await diffusionManager.generateImageAsync(prompt: finalPrompt)
+                if let llm = savedLLMUrl {
+                    // Wait for the checkpoint's memory to actually come back before asking the
+                    // chat model to load. A flat sleep here meant the reload ran its safety
+                    // check while Metal was still handing several gigabytes back to the system,
+                    // so a successful generation could still end with an out-of-memory error
+                    // sitting in the model bar.
+                    let needed = llmManager.memoryHeadroomNeededGB(
+                        forModelSizeGB: llmManager.getModelSizeGB(at: llm)
+                    )
+                    await MemoryBudget.waitForRelease(atLeastGB: needed)
 
-                    // Cleanup: unload diffusion model then reload the LLM
-                    await diffusionManager.unloadDiffusionModelAsync()
-
-                    // Allow the OS time to flush Metal memory buffers released by stable-diffusion.cpp
-                    do {
-                        try await Task.sleep(nanoseconds: 1_000_000_000)
-                    } catch {
-                        print("Generation task was cancelled during final sleep.")
-                    }
-
-                    if let llm = savedLLMUrl {
-                        llmManager.loadModel(at: llm)
-                    }
-
-                    // Update the chat bubble with the result
-                    if let data = imageData {
-                        conversationManager.updateLastMessageImage(imageData: data)
-                        conversationManager.saveConversations()
-
-                        // ── Auto-ingest to RAG ────────────────────────────────
-                        ragManager.ingestGeneratedImage(prompt: finalPrompt, imageData: data)
-
-                    } else {
-                        conversationManager.updateLastMessage(text: "[Image generation failed. Check the diffusion model and try again.]")
-                        conversationManager.saveConversations()
-                    }
-                } catch {
-                    conversationManager.updateLastMessage(text: "[Failed to load diffusion model: \(error.localizedDescription)]")
-                    conversationManager.saveConversations()
-                    diffusionManager.isGenerating = false
-
-                    await diffusionManager.unloadDiffusionModelAsync()
-                    do {
-                        try await Task.sleep(nanoseconds: 1_000_000_000)
-                    } catch {
-                        print("Generation task was cancelled during error sleep.")
-                    }
-
-                    if let llm = savedLLMUrl {
-                        llmManager.loadModel(at: llm)
-                    }
+                    diffusionManager.updateGenerationStage("Restoring chat model…")
+                    llmManager.loadModel(at: llm)
                 }
+
+                // A cancelled run has already had its bubble replaced and its session closed;
+                // dropping the result here is the whole point of cancellation.
+                guard !diffusionManager.isCancelled else { return }
+
+                if let data = resultData {
+                    // Screen the pixels, not just the prompt. Prompt filtering only governs what
+                    // was asked for; an uncensored checkpoint can produce explicit output from a
+                    // request that contained nothing to object to. This is the only point where
+                    // that can actually be caught, so a flagged image is discarded here — never
+                    // shown in the conversation, never written to RAG, never saved to Photos.
+                    diffusionManager.updateGenerationStage("Checking result…")
+                    let verdict = await ImageSafetyAnalyzer.screen(imageData: data)
+                    if case .blocked(let reason) = verdict {
+                        conversationManager.updateLastMessage(
+                            text: "[The generated image was blocked by the content filter (\(reason)) and has been discarded.]"
+                        )
+                        conversationManager.saveConversations()
+                        LogManager.shared.log("ContentSafety: discarded generated image — \(reason)")
+                        return
+                    }
+
+                    conversationManager.updateLastMessageImage(imageData: data)
+                    ragManager.ingestGeneratedImage(prompt: finalPrompt, imageData: data)
+                } else {
+                    conversationManager.updateLastMessage(
+                        text: "[Couldn't generate the image. \(failureMessage ?? "The diffusion model failed to run.")]"
+                    )
+                }
+                conversationManager.saveConversations()
             }
             return
         }
         // ─────────────────────────────────────────────────────────────────────
+
+        // Captured before the attachment merge below clears these — needed to keep the web
+        // search offer from firing on a message that's really "analyze this attachment."
+        let hadAttachment = pendingAttachmentText != nil
 
         let history = conversationManager.activeConversation?.messages ?? []
 
@@ -1175,22 +1548,80 @@ struct ContentView: View {
             conversationManager.addMessageToActive(isUser: true, text: text)
         }
 
+        // Distress signals get resources attached, not a refusal. The model still answers
+        // normally below — this appears alongside the conversation rather than replacing it,
+        // because cutting someone off mid-sentence is not help.
+        if promptDecision.attachesCrisisResources {
+            conversationManager.addMessageToActive(isUser: false, text: LegalText.crisisResources)
+        }
+
+        // ── Web search offer ──────────────────────────────────────────────────
+        // Gated entirely on the user having turned internet access on in Settings — when it's
+        // off, nothing here runs at all, so behavior is byte-for-byte unchanged for anyone who
+        // hasn't opted in. Never fires on an attachment turn (that's "analyze this," not "look
+        // this up"), and never auto-searches — this only ever offers, the app never decides on
+        // the user's behalf. See `respondToSearchOffer` for what happens when they answer.
+        if webSearchManager.isEnabled, !hadAttachment,
+           WebSearchClassifier.classify(text) != nil {
+            conversationManager.addSearchOfferToActive(
+                text: "This looks like it might need current information from the internet. Want me to search, or should I just answer from what I already know?",
+                query: text
+            )
+            return
+        }
+
+        generateTextResponse(text: text, promptText: promptText, history: history)
+    }
+
+    /// Runs a normal (no web search) response for a captured user turn. This is the exact body
+    /// that used to live inline in `sendMessage()`'s `Task`, factored out so both the everyday
+    /// path and "user declined the search offer" (`respondToSearchOffer`) share one
+    /// implementation instead of two copies that could drift.
+    ///
+    /// `extraRagContext` / `responseSuffix` / `createsNewBubble` exist only for
+    /// `performWebSearchAndRespond`: folding search results into context, appending a Sources
+    /// footer once the answer clears content review, and continuing to stream into the
+    /// "Searching the interwebs…" bubble that already exists instead of creating a second one.
+    /// All three default to a no-op, so the everyday call site behaves exactly as the original
+    /// inline code did.
+    private func generateTextResponse(
+        text: String,
+        promptText: String,
+        history: [ChatMessage],
+        extraRagContext: String = "",
+        responseSuffix: String = "",
+        createsNewBubble: Bool = true
+    ) {
         let capturedPromptText = promptText
-        
+        let scanner = StreamSafetyScanner()
+
         Task {
-            // Evict Stable Diffusion from RAM before running the LLM
-            await diffusionManager.unloadDiffusionModelAsync()
-            do {
-                try await Task.sleep(nanoseconds: 1_000_000_000)
-            } catch {
-                print("Generation task was cancelled during text sleep.")
+            // Evict Stable Diffusion from RAM before running the LLM — only if something is
+            // actually resident. This used to unload (a harmless no-op when nothing was
+            // loaded) and then sleep a flat second unconditionally on *every* chat message,
+            // adding a full second of dead latency to the app's most common interaction
+            // regardless of whether there was ever anything to free.
+            let wasDiffusionLoaded = await MainActor.run { diffusionManager.diffusionLoadState.isLoaded }
+            if wasDiffusionLoaded {
+                await diffusionManager.unloadDiffusionModelAsync()
+                // Wait for the freed memory to actually come back before reloading the LLM
+                // below, same reasoning as the image-generation handoff: a flat sleep here
+                // was routinely too short and raced Metal's own buffer-release schedule.
+                // Skipped when there's no LLM to reload — nothing downstream needs the
+                // memory back immediately in that case.
+                if let llm = await MainActor.run(body: { llmManager.activeModelURL }) {
+                    let neededGB = await MainActor.run {
+                        llmManager.memoryHeadroomNeededGB(forModelSizeGB: llmManager.getModelSizeGB(at: llm))
+                    }
+                    await MemoryBudget.waitForRelease(atLeastGB: neededGB)
+                }
             }
-            
+
             await MainActor.run {
                 if !llmManager.isModelLoaded, let llm = llmManager.activeModelURL {
                     llmManager.loadModel(at: llm)
                 }
-                
+
                 if enableMemories && !text.isEmpty {
                     memoryManager.extractMemories(from: text)
                     // NOTE: personality analysis can trigger its own background LLM call
@@ -1199,12 +1630,14 @@ struct ContentView: View {
                     // whichever reaches the actor first runs, silently delaying replies.
                     // It's fired from onComplete instead, strictly after this turn finishes.
                 }
-        
-                let ragContext = enableRAG ? ragManager.retrieveRelevantContext(query: text) : ""
+
+                let ragContext = (enableRAG ? ragManager.retrieveRelevantContext(query: text) : "") + extraRagContext
                 let memoriesContext = enableMemories ? memoryManager.getFormattedMemoriesForContext() : ""
-        
-                conversationManager.addMessageToActive(isUser: false, text: "")
-        
+
+                if createsNewBubble {
+                    conversationManager.addMessageToActive(isUser: false, text: "")
+                }
+
                 var finalSystemPrompt = customInstructions
                 if let activeModel = llmManager.activeModelURL?.lastPathComponent {
                     let personality = personalityManager.getPersonality(for: activeModel)
@@ -1227,7 +1660,7 @@ struct ContentView: View {
                         }
                     }
                 }
-        
+
                 llmManager.generateResponse(
                     prompt: capturedPromptText,
                     history: history,
@@ -1235,12 +1668,37 @@ struct ContentView: View {
                     memoriesContext: memoriesContext,
                     ragContext: ragContext
                 ) { token in
-                    conversationManager.updateLastMessage(text: (conversationManager.activeConversation?.messages.last?.text ?? "") + token)
+                    let updated = (conversationManager.activeConversation?.messages.last?.text ?? "") + token
+                    conversationManager.updateLastMessage(text: updated)
+
+                    // Abort mid-stream rather than rendering violating tokens and retracting
+                    // them a second later. Only screens the non-negotiable category, and only
+                    // every few hundred characters, so it costs nothing per token.
+                    if scanner.shouldScan(updated),
+                       let violation = ContentSafety.streamingViolation(in: updated) {
+                        llmManager.cancelGeneration()
+                        conversationManager.updateLastMessage(
+                            text: "[Response stopped by the content filter — \(violation.reportLabel).]"
+                        )
+                        LogManager.shared.log("ContentSafety: cancelled stream — \(violation.rawValue)")
+                    }
                 } onComplete: { finalText in
                     var cleanedText = self.filterThoughts(from: finalText, stripMarkdown: self.personalityManager.isMature)
                     if cleanedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                         cleanedText = "[No response content was generated — the model may have only produced internal notes for this turn. Try regenerating or rephrasing your prompt.]"
                     }
+
+                    // Final screen of the completed response. The streaming check runs on
+                    // partial text and can't see a violation that only forms across the last
+                    // few tokens, so this is the one that actually has to hold.
+                    let outputDecision = ContentSafety.review(cleanedText, surface: .modelOutput)
+                    if !outputDecision.isAllowed {
+                        cleanedText = outputDecision.message ?? "[This response was withheld by the content filter.]"
+                        LogManager.shared.log("ContentSafety: withheld response — \(outputDecision.category?.rawValue ?? "unknown")")
+                    } else if !responseSuffix.isEmpty {
+                        cleanedText += responseSuffix
+                    }
+
                     conversationManager.updateLastMessage(text: cleanedText)
                     conversationManager.saveConversations()
 
@@ -1255,6 +1713,137 @@ struct ContentView: View {
                     if enableMemories, let activeModel = llmManager.activeModelURL?.lastPathComponent {
                         personalityManager.analyzeAssistantMessage(cleanedText, modelName: activeModel)
                     }
+                }
+            }
+        }
+    }
+
+    // MARK: - Web search
+
+    /// Handles the user tapping Search or No on a pending offer bubble — see
+    /// `messageBubble(for:)` and `ChatMessage.pendingSearchQuery`. `query` is the original user
+    /// message the offer was generated from; re-classified here rather than persisted as a
+    /// `WebSearchQueryType`, since classification is cheap and deterministic and this keeps
+    /// `ChatMessage` from needing to know that type exists at all.
+    private func respondToSearchOffer(accepted: Bool, query: String, offerMessageId: UUID) {
+        guard let messages = conversationManager.activeConversation?.messages,
+              let offerIndex = messages.firstIndex(where: { $0.id == offerMessageId }) else { return }
+
+        conversationManager.clearPendingSearch(messageId: offerMessageId)
+
+        // History is everything before the user message this offer answers — excluding both
+        // that message and the offer bubble itself, the same split `sendMessage` already draws
+        // between `history` and the turn's own `prompt`. Indexed off the offer's actual position
+        // rather than assumed to be "the last two messages": nothing stops the user from sending
+        // something newer before getting back to an older, still-pending offer.
+        let history = Array(messages[0..<max(0, offerIndex - 1)])
+
+        guard accepted else {
+            generateTextResponse(text: query, promptText: query, history: history)
+            return
+        }
+        performWebSearchAndRespond(query: query, history: history)
+    }
+
+    /// Runs the actual search, then generation, for an accepted offer. Owns its own placeholder
+    /// bubble ("🔍 Searching the interwebs…") so there's always visible feedback during the
+    /// network round trip — replaced in place by the streamed answer once the search resolves,
+    /// or by a plain failure message if it doesn't.
+    private func performWebSearchAndRespond(query: String, history: [ChatMessage]) {
+        conversationManager.addMessageToActive(isUser: false, text: "🔍 Searching the interwebs…")
+
+        Task {
+            let queryType = WebSearchClassifier.classify(query) ?? .general(query: query)
+            do {
+                let result = try await webSearchManager.search(queryType)
+                let extraContext = "\n\nWeb search results for \"\(query)\":\n\(result.answer)\n\nUse this information to help answer the question, and mention that it came from a web search."
+                let sourcesFooter = result.sources.isEmpty ? "" :
+                    "\n\nSources:\n" + result.sources.map { "• \($0.title) — \($0.url)" }.joined(separator: "\n")
+
+                await MainActor.run {
+                    // Clears the "Searching…" placeholder text so the token-streaming callback's
+                    // accumulate-by-appending logic starts from empty rather than appending onto
+                    // the stage text.
+                    conversationManager.updateLastMessage(text: "")
+                    generateTextResponse(
+                        text: query, promptText: query, history: history,
+                        extraRagContext: extraContext, responseSuffix: sourcesFooter,
+                        createsNewBubble: false
+                    )
+                }
+            } catch WebSearchError.blocked(let message) {
+                // A deliberate content-policy refusal — this one stays a hard stop, not
+                // something to paper over with a normal answer.
+                await MainActor.run {
+                    conversationManager.updateLastMessage(text: "[\(message)]")
+                    conversationManager.saveConversations()
+                }
+            } catch {
+                // Any technical failure — no results, a network hiccup, an unparseable
+                // response — degrades to a normal answer instead of a dead end. The free
+                // keyless providers (DuckDuckGo's instant-answer API especially) often have
+                // nothing for a given query even though the search itself worked correctly;
+                // the model can still be useful from what it already knows, honestly framed
+                // as not having found live results, rather than the user getting nothing.
+                LogManager.shared.log("WebSearch: search failed, answering without results — \(error.localizedDescription)")
+                let extraContext = "\n\n(A web search for \"\(query)\" was attempted but didn't return usable results. Briefly say you couldn't find live results for this, then answer as well as you can from what you already know.)"
+                await MainActor.run {
+                    conversationManager.updateLastMessage(text: "")
+                    generateTextResponse(
+                        text: query, promptText: query, history: history,
+                        extraRagContext: extraContext, createsNewBubble: false
+                    )
+                }
+            }
+        }
+    }
+
+    // MARK: - Photos
+
+    /// Saves a generated image to the user's library, asking for add-only access first.
+    ///
+    /// The previous version called `UIImageWriteToSavedPhotosAlbum` directly from the context
+    /// menu with no authorization check at all, which on a device that had never been asked
+    /// simply did nothing — no prompt, no error, no image. Add-only is the narrowest scope that
+    /// does the job: the app never gains the ability to read the user's photos.
+    private func saveToPhotos(_ image: UIImage) {
+        let status = PHPhotoLibrary.authorizationStatus(for: .addOnly)
+        switch status {
+        case .authorized, .limited:
+            performPhotoSave(image)
+        case .notDetermined:
+            PHPhotoLibrary.requestAuthorization(for: .addOnly) { newStatus in
+                DispatchQueue.main.async {
+                    if newStatus == .authorized || newStatus == .limited {
+                        performPhotoSave(image)
+                    } else {
+                        notice = Notice(
+                            title: "Photos Access Needed",
+                            message: "To save images, allow \(AppInfo.displayName) to add photos in Settings › Privacy & Security › Photos."
+                        )
+                    }
+                }
+            }
+        default:
+            notice = Notice(
+                title: "Photos Access Needed",
+                message: "To save images, allow \(AppInfo.displayName) to add photos in Settings › Privacy & Security › Photos."
+            )
+        }
+    }
+
+    private func performPhotoSave(_ image: UIImage) {
+        PHPhotoLibrary.shared().performChanges {
+            PHAssetChangeRequest.creationRequestForAsset(from: image)
+        } completionHandler: { success, error in
+            DispatchQueue.main.async {
+                if success {
+                    notice = Notice(title: "Saved", message: "The image was added to your photo library.")
+                } else {
+                    notice = Notice(
+                        title: "Couldn't Save",
+                        message: error?.localizedDescription ?? "The image couldn't be added to your photo library."
+                    )
                 }
             }
         }
@@ -1317,6 +1906,12 @@ struct ContentView: View {
                         if cleanedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                             cleanedText = "[Context exhausted. Could not produce a description.]"
                         }
+                        // Attached files are an untrusted input path into the model just like a
+                        // typed prompt is, so the description it produces gets the same screen.
+                        let outputDecision = ContentSafety.review(cleanedText, surface: .modelOutput)
+                        if !outputDecision.isAllowed {
+                            cleanedText = outputDecision.message ?? "[This response was withheld by the content filter.]"
+                        }
                         conversationManager.updateLastMessage(text: cleanedText)
                         conversationManager.saveConversations()
 
@@ -1338,5 +1933,23 @@ struct ContentView: View {
 extension View {
     func endEditing() {
         UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+    }
+}
+
+/// Throttles the mid-stream safety scan.
+///
+/// A reference type because the token callback is an escaping closure captured from a SwiftUI
+/// `View` struct, which has nowhere to put mutable per-generation state. Scanning the whole
+/// accumulated buffer on every token would be quadratic in response length; scanning it every
+/// few hundred characters bounds that to something that doesn't show up in a profile, and the
+/// completed response is screened in full afterwards regardless.
+final class StreamSafetyScanner {
+    private var lastScannedLength = 0
+    private let interval = 240
+
+    func shouldScan(_ text: String) -> Bool {
+        guard text.count - lastScannedLength >= interval else { return false }
+        lastScannedLength = text.count
+        return true
     }
 }

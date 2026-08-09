@@ -112,6 +112,100 @@ enum GGUFValidator {
         }
     }
 
+    // MARK: - Diffusion checkpoint compatibility
+
+    /// ggml stores a tensor's name in a fixed `char name[GGML_MAX_NAME]` buffer.
+    ///
+    /// stable-diffusion.cpp's CMakeLists compiles its ggml with `GGML_MAX_NAME=160` precisely
+    /// because SD checkpoints carry names around 83 bytes. Keep this in sync with that value —
+    /// if the vendored library's setting ever changes, this check silently becomes wrong.
+    private static let ggmlMaxNameBytes = 160
+
+    /// Rejects diffusion checkpoints whose tensor names are too long for ggml to hold.
+    ///
+    /// Backstop rather than the primary defence. The crash this originally guarded against —
+    /// names truncated to 63 characters, CLIP failing to resolve its weights, and
+    /// `GGML_ASSERT(!chunk_hidden_states.empty())` calling `abort()` — turned out to be a
+    /// *linking* fault, not a file problem: the app links two builds of ggml (this library's,
+    /// with `GGML_MAX_NAME=160`, and llama.cpp's, with the default 64) and SD's calls were
+    /// binding to llama's. `build_sd_ios.sh` now demotes this library's ggml symbols to private
+    /// extern so each side calls the ggml it was compiled against.
+    ///
+    /// The check stays because the failure mode it catches is uncatchable once it happens: the
+    /// `abort()` fires inside C++ on a background thread, so the process dies with no chance to
+    /// show an error. A checkpoint that genuinely exceeds 160 bytes, or a future regression in
+    /// the symbol privatisation, should surface as a readable message rather than a silent death.
+    static func validateDiffusionCheckpoint(path: String) throws {
+        let url = URL(fileURLWithPath: path)
+
+        // Only GGUF carries tensor names in this layout; safetensors/ckpt take a different
+        // path through the loader and are left to the library to accept or reject.
+        guard url.pathExtension.lowercased() == "gguf" else { return }
+
+        guard let handle = FileHandle(forReadingAtPath: path) else {
+            throw error("Cannot open \(url.lastPathComponent) for reading.")
+        }
+        defer { handle.closeFile() }
+
+        guard let magic = try? handle.read(upToCount: 4), magic == Data("GGUF".utf8) else {
+            throw error("\(url.lastPathComponent) is not a valid GGUF file.")
+        }
+        let versionData = handle.readData(ofLength: 4)
+        let tensorCountData = handle.readData(ofLength: 8)
+        let kvCountData = handle.readData(ofLength: 8)
+        guard versionData.count == 4, tensorCountData.count == 8, kvCountData.count == 8 else {
+            throw error("\(url.lastPathComponent) has a truncated GGUF header.")
+        }
+        let tensorCount = tensorCountData.withUnsafeBytes { $0.load(as: UInt64.self).littleEndian }
+        let kvCount = kvCountData.withUnsafeBytes { $0.load(as: UInt64.self).littleEndian }
+
+        // Walk past the metadata block to reach the tensor-info section.
+        for _ in 0..<kvCount {
+            guard (try? readGGUFString(from: handle)) != nil else { return }
+            let vtData = handle.readData(ofLength: 4)
+            guard vtData.count == 4 else { return }
+            let vtRaw = vtData.withUnsafeBytes { $0.load(as: UInt32.self).littleEndian }
+            guard let vt = GGUFValueType(rawValue: vtRaw) else { return }
+            guard (try? skipGGUFValue(type: vt, from: handle)) != nil else { return }
+        }
+
+        // Scan tensor names. Capped so a corrupt count can't spin: the offending names in real
+        // checkpoints are the text-encoder ones, which appear early.
+        var longestName = 0
+        var longestExample = ""
+        let scanLimit = min(tensorCount, 8192)
+
+        for _ in 0..<scanLimit {
+            guard let name = try? readGGUFString(from: handle) else { break }
+            let byteCount = name.utf8.count
+            if byteCount > longestName {
+                longestName = byteCount
+                longestExample = name
+            }
+            // n_dims, dims[n_dims], type, offset
+            let dimsData = handle.readData(ofLength: 4)
+            guard dimsData.count == 4 else { break }
+            let nDims = dimsData.withUnsafeBytes { $0.load(as: UInt32.self).littleEndian }
+            guard nDims <= 8 else { break }
+            let skip = Int(nDims) * 8 + 4 + 8
+            guard handle.readData(ofLength: skip).count == skip else { break }
+        }
+
+        guard longestName < ggmlMaxNameBytes else {
+            throw error("""
+            \(url.lastPathComponent) can't be used on this device.
+
+            Its tensor names are longer than this build supports (\(longestName) characters, \
+            limit \(ggmlMaxNameBytes - 1)). Loading it would crash the app rather than fail \
+            cleanly, so it has been rejected.
+
+            Try a different conversion of the same model.
+
+            Longest name: \(longestExample)
+            """)
+        }
+    }
+
     // MARK: - Private Helpers
 
     private static func error(_ message: String) -> NSError {

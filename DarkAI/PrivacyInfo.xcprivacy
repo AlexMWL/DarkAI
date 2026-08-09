@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  Privacy manifest. Required for App Store submission since May 2024; a build without one,
+	  or one that uses a required-reason API without declaring it here, is rejected at upload.
+
+	  DarkAI collects nothing and tracks nobody by default: no analytics SDK, no ad SDK, no
+	  crash reporter that phones home, no account. The one declared exception below is Internet
+	  Access (Settings → Internet Access), an off-by-default, opt-in feature — when a user turns
+	  it on *and* explicitly approves an individual search (the app always asks first, never
+	  searches on its own), the search text is sent to Open-Meteo, DuckDuckGo, or — only if the
+	  user has supplied their own key — Brave. Nothing else about the user or the device is sent
+	  with it. See `WebSearchManager.swift` and `LegalText.privacyPolicy`.
+	-->
+
+	<key>NSPrivacyTracking</key>
+	<false/>
+
+	<key>NSPrivacyTrackingDomains</key>
+	<array/>
+
+	<key>NSPrivacyCollectedDataTypes</key>
+	<array>
+		<!--
+		  Search query text, sent only when a user has (1) turned Internet Access on in Settings
+		  and (2) explicitly approved that specific search. Not linked to identity — no account,
+		  no device or advertising identifier accompanies the request — and never used for
+		  tracking or advertising, only to answer the question that was asked.
+		-->
+		<dict>
+			<key>NSPrivacyCollectedDataType</key>
+			<string>NSPrivacyCollectedDataTypeSearchHistory</string>
+			<key>NSPrivacyCollectedDataTypeLinked</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypeTracking</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypePurposes</key>
+			<array>
+				<string>NSPrivacyCollectedDataTypePurposeAppFunctionality</string>
+			</array>
+		</dict>
+	</array>
+
+	<key>NSPrivacyAccessedAPITypes</key>
+	<array>
+		<!--
+		  UserDefaults: conversations, memories, learned style profile, RAG index, content
+		  reports, and every user setting. All of it is this app's own data, read back only by
+		  this app — CA92.1.
+		-->
+		<dict>
+			<key>NSPrivacyAccessedAPIType</key>
+			<string>NSPrivacyAccessedAPICategoryUserDefaults</string>
+			<key>NSPrivacyAccessedAPITypeReasons</key>
+			<array>
+				<string>CA92.1</string>
+			</array>
+		</dict>
+
+		<!--
+		  Disk space: checked before a multi-gigabyte model download or import so the app can
+		  refuse with a real number instead of failing part-way through (E174.1), and shown in
+		  Settings so the user can see what the app is occupying (85F4.1).
+		-->
+		<dict>
+			<key>NSPrivacyAccessedAPIType</key>
+			<string>NSPrivacyAccessedAPICategoryDiskSpace</string>
+			<key>NSPrivacyAccessedAPITypeReasons</key>
+			<array>
+				<string>E174.1</string>
+				<string>85F4.1</string>
+			</array>
+		</dict>
+
+		<!--
+		  File timestamps: reached through FileManager attribute reads on files inside this
+		  app's own container while listing installed models and generated images — C617.1.
+		-->
+		<dict>
+			<key>NSPrivacyAccessedAPIType</key>
+			<string>NSPrivacyAccessedAPICategoryFileTimestamp</string>
+			<key>NSPrivacyAccessedAPITypeReasons</key>
+			<array>
+				<string>C617.1</string>
+			</array>
+		</dict>
+	</array>
+</dict>
+</plist>

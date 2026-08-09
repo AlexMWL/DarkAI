@@ -1,6 +1,149 @@
 import Foundation
 import Combine
 
+/// Running measurements of how the user actually writes.
+///
+/// The original personality system learned style by looking for words from a fixed slang list.
+/// That only fires when someone happens to type "lmao", says nothing about the far more visible
+/// traits — sentence length, whether they capitalise, whether they punctuate at all — and learns
+/// nothing from a user whose voice is distinctive but doesn't use listed slang.
+///
+/// These are cumulative rates over every message, so the profile sharpens continuously instead of
+/// waiting for keyword hits, and it describes the user in terms the model can actually imitate.
+struct StyleMetrics: Codable {
+    var messageCount: Int = 0
+    var totalWords: Int = 0
+    var lowercaseStarts: Int = 0
+    var missingTerminalPunctuation: Int = 0
+    var questions: Int = 0
+    var exclamations: Int = 0
+    var emojiMessages: Int = 0
+    var contractions: Int = 0
+    var slangHits: Int = 0
+    var profanityHits: Int = 0
+    var multiSentence: Int = 0
+    var totalWordLength: Int = 0
+
+    var averageWords: Double { messageCount > 0 ? Double(totalWords) / Double(messageCount) : 0 }
+    var averageWordLength: Double { totalWords > 0 ? Double(totalWordLength) / Double(totalWords) : 0 }
+
+    private func rate(_ count: Int) -> Double {
+        messageCount > 0 ? Double(count) / Double(messageCount) : 0
+    }
+
+    var lowercaseRate: Double { rate(lowercaseStarts) }
+    var noPunctuationRate: Double { rate(missingTerminalPunctuation) }
+    var questionRate: Double { rate(questions) }
+    var exclamationRate: Double { rate(exclamations) }
+    var emojiRate: Double { rate(emojiMessages) }
+    var contractionRate: Double { rate(contractions) }
+    var slangRate: Double { rate(slangHits) }
+    var profanityRate: Double { rate(profanityHits) }
+    var multiSentenceRate: Double { rate(multiSentence) }
+
+    /// Enough signal to be worth acting on. Deliberately low — a handful of messages is plenty
+    /// to tell a terse all-lowercase writer from someone who writes full paragraphs.
+    var hasSignal: Bool { messageCount >= 4 }
+
+    /// Turns the measurements into instructions the model can follow.
+    ///
+    /// Only traits that are clearly present are described. Emitting every metric on every turn
+    /// would bury the strong signals among noise and waste context.
+    func directives() -> [String] {
+        guard hasSignal else { return [] }
+        var lines: [String] = []
+
+        switch averageWords {
+        case ..<8:    lines.append("The user writes very short messages. Keep replies brief and direct — a few sentences at most.")
+        case ..<25:   lines.append("The user writes fairly short messages. Favour concise replies over long ones.")
+        case 60...:   lines.append("The user writes long, detailed messages. Match that depth rather than answering in one line.")
+        default:      break
+        }
+
+        if lowercaseRate > 0.6 {
+            lines.append("The user rarely capitalises. Write casually and don't over-format.")
+        }
+        if noPunctuationRate > 0.5 {
+            lines.append("The user often skips ending punctuation. Keep a relaxed, unpolished tone.")
+        }
+        if slangRate > 0.3 {
+            lines.append("The user uses casual slang. Match that register — informal, never stiff or corporate.")
+        }
+        if contractionRate > 0.5 {
+            lines.append("The user speaks in contractions. Use them too; avoid formal phrasing.")
+        }
+        if emojiRate > 0.25 {
+            lines.append("The user uses emoji. An occasional one in reply is welcome.")
+        } else if emojiRate < 0.02 && messageCount > 10 {
+            lines.append("The user never uses emoji. Don't use them.")
+        }
+        if questionRate > 0.6 {
+            lines.append("The user mostly asks questions. Lead with the answer, then any detail.")
+        }
+        if exclamationRate > 0.35 {
+            lines.append("The user writes with energy and exclamation. Be warm rather than flat.")
+        }
+        if profanityRate > 0.2 {
+            lines.append("The user swears casually. Don't moralise about language or sanitise your tone.")
+        }
+        if averageWordLength > 5.6 && messageCount > 8 {
+            lines.append("The user's vocabulary is precise and technical. Don't over-explain basics.")
+        }
+        if multiSentenceRate < 0.2 && messageCount > 8 {
+            lines.append("The user writes in single thoughts, not paragraphs. Keep structure flat — avoid headers and long bullet lists.")
+        }
+        return lines
+    }
+
+    /// Folds one message into the running totals.
+    mutating func record(_ message: String) {
+        let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        messageCount += 1
+
+        let words = trimmed
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+        totalWords += words.count
+        totalWordLength += words.reduce(0) { $0 + $1.count }
+
+        if let first = trimmed.first, first.isLetter, first.isLowercase { lowercaseStarts += 1 }
+        if let last = trimmed.last, !".!?".contains(last) { missingTerminalPunctuation += 1 }
+        if trimmed.contains("?") { questions += 1 }
+        if trimmed.contains("!") { exclamations += 1 }
+        if trimmed.unicodeScalars.contains(where: { $0.properties.isEmojiPresentation }) { emojiMessages += 1 }
+        if trimmed.contains("'") || trimmed.lowercased().contains("dont") || trimmed.lowercased().contains("cant") {
+            contractions += 1
+        }
+
+        let sentenceCount = trimmed
+            .components(separatedBy: CharacterSet(charactersIn: ".!?"))
+            .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+            .count
+        if sentenceCount > 1 { multiSentence += 1 }
+
+        let lowerWords = Set(words.map {
+            $0.lowercased().trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
+        })
+        if !lowerWords.isDisjoint(with: StyleMetrics.slangWords) { slangHits += 1 }
+        if !lowerWords.isDisjoint(with: StyleMetrics.profanityWords) { profanityHits += 1 }
+    }
+
+    private static let slangWords: Set<String> = [
+        "lol", "lmao", "lmfao", "bruh", "tbh", "fr", "frfr", "ngl", "idk", "idc", "rn",
+        "gotcha", "yep", "yeah", "yup", "nah", "dude", "hey", "yo", "bet", "cap", "vibes",
+        "sus", "lowkey", "highkey", "deadass", "bruv", "mate", "innit", "imo", "imho",
+        "afaik", "btw", "omg", "wtf", "smh", "ikr", "ty", "thx", "pls", "plz", "u", "ur",
+        "rly", "kinda", "sorta", "gonna", "wanna", "gimme", "dunno", "aight", "sup"
+    ]
+
+    private static let profanityWords: Set<String> = [
+        "damn", "hell", "crap", "shit", "fuck", "fucking", "fuckin", "ass", "bastard",
+        "bitch", "piss", "bollocks", "bloody", "wtf", "af"
+    ]
+}
+
 class PersonalityManager: ObservableObject {
     @Published var modelPersonalities: [String: String] = [:]
     @Published var maturityScore: Double = 0.0
@@ -8,10 +151,32 @@ class PersonalityManager: ObservableObject {
     
     private let storageKey = "DarkAI_ModelPersonalities"
     private let maturityKey = "DarkAI_MaturityScore"
+    private let metricsKey = "DarkAI_StyleMetrics"
     private var messageBatch: [String] = []
-    
+
+    /// Per-model style measurements. Keyed by model so switching models doesn't inherit a voice
+    /// learned against a different one.
+    @Published private(set) var styleMetrics: [String: StyleMetrics] = [:]
+
     init() {
         loadPersonalities()
+        loadMetrics()
+    }
+
+    private func loadMetrics() {
+        guard let data = UserDefaults.standard.data(forKey: metricsKey),
+              let decoded = try? JSONDecoder().decode([String: StyleMetrics].self, from: data) else { return }
+        styleMetrics = decoded
+    }
+
+    private func saveMetrics() {
+        guard let encoded = try? JSONEncoder().encode(styleMetrics) else { return }
+        UserDefaults.standard.set(encoded, forKey: metricsKey)
+    }
+
+    /// Messages observed for a model — drives the maturity readout in Settings.
+    func observedMessageCount(for modelName: String) -> Int {
+        styleMetrics[modelName]?.messageCount ?? 0
     }
     
     private func loadPersonalities() {
@@ -57,20 +222,38 @@ class PersonalityManager: ObservableObject {
     
     func getPersonality(for modelName: String) -> String {
         let profile = modelPersonalities[modelName] ?? ""
-        guard !profile.isEmpty else { return "" }
+        let styleDirectives = (styleMetrics[modelName] ?? StyleMetrics()).directives()
 
-        // Require at least 2 distinct trait lines before personality has enough signal to apply
+        // Measured style stands on its own. It's available after a handful of messages, well
+        // before the LLM-written prose profile has anything in it, so the assistant starts
+        // adapting early rather than waiting for the slower path to accumulate.
+        if profile.isEmpty {
+            guard !styleDirectives.isEmpty else { return "" }
+            return "[How the user writes — match this]\n" + styleDirectives.joined(separator: "\n")
+        }
+
+        // The prose profile needs a couple of entries before it's worth applying — but the
+        // measured style is independent of it and shouldn't be discarded just because the
+        // slower LLM-written half hasn't filled in yet.
         let entryCount = profile.components(separatedBy: "\n")
             .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
             .count
-        guard entryCount >= 2 else { return "" }
+        guard entryCount >= 2 else {
+            return styleDirectives.isEmpty
+                ? ""
+                : "[How the user writes — match this]\n" + styleDirectives.joined(separator: "\n")
+        }
 
         // CRITICAL: lines starting "The AI has previously said..." are the model's OWN
         // established opinions/preferences — separate from the "Long-Term Conversational
         // Memories" block elsewhere in the prompt, which is about the USER. Without this
         // explicit split the model tends to answer "what's your favorite X" by echoing back
         // something it saw stored about the user instead of forming/recalling its own answer.
-        return """
+        let stylePreamble = styleDirectives.isEmpty
+            ? ""
+            : "[How the user writes — match this]\n" + styleDirectives.joined(separator: "\n") + "\n\n"
+
+        return stylePreamble + """
         [AI Personality Matrix — two distinct kinds of entries below, do not mix them up:
         • Lines starting "The AI has previously said..." are YOUR OWN opinions and preferences. \
         If asked again, give the SAME answer for consistency. Never state something from the \
@@ -83,26 +266,18 @@ class PersonalityManager: ObservableObject {
     
     func analyzeUserMessage(_ message: String, modelName: String, llmManager: LLMManager?) {
         guard !modelName.isEmpty else { return }
-        
-        // --- 1. Basic Fast Extraction (Main Thread) ---
+
+        // --- 1. Style measurement (every message, no keyword required) ---
+        // This runs unconditionally rather than only when a listed slang word appears, which is
+        // what makes the profile sharpen from ordinary messages instead of stalling on users
+        // whose voice is distinctive but doesn't happen to use the vocabulary in a fixed list.
+        var metrics = styleMetrics[modelName] ?? StyleMetrics()
+        metrics.record(message)
+        styleMetrics[modelName] = metrics
+        saveMetrics()
+
         var currentProfile = modelPersonalities[modelName] ?? ""
-        let lower = message.lowercased()
-        let words = lower.components(separatedBy: .punctuationCharacters).joined().components(separatedBy: .whitespaces)
-        
-        let slangList = ["lol", "lmao", "bruh", "tbh", "fr", "frfr", "ngl", "idk", "rn", "gotcha", "yep", "yeah", "dude", "hey", "yo", "bet", "cap", "vibes"]
-        var usedSlang = Set<String>()
-        for word in words {
-            if slangList.contains(word) {
-                usedSlang.insert(word)
-            }
-        }
-        
         var newTraits: [String] = []
-        for slang in usedSlang {
-            if !currentProfile.contains("'\(slang)'") {
-                newTraits.append("Occasionally use casual slang like '\(slang)'.")
-            }
-        }
         
         let sentences = message.components(separatedBy: CharacterSet(charactersIn: ".!?\n"))
         let aggressiveTriggers = ["i like ", "i am ", "i plan to ", "i need to ", "i want to ", "my favorite ", "i have ", "my goal is ", "i love ", "i hate ", "im ", "i'm "]
@@ -130,7 +305,7 @@ class PersonalityManager: ObservableObject {
             }
             modelPersonalities[modelName] = currentProfile
             
-            maturityScore = min(1.0, maturityScore + (Double(newTraits.count) * 0.05))
+            maturityScore = min(1.0, maturityScore + (Double(newTraits.count) * 0.08))
             isMature = maturityScore >= 0.7
             
             savePersonalities()
@@ -139,7 +314,7 @@ class PersonalityManager: ObservableObject {
         // --- 2. Batching & Background Style Analysis ---
         messageBatch.append(message)
         
-        if messageBatch.count >= 3 {
+        if messageBatch.count >= 2 {
             let batchedText = messageBatch.joined(separator: "\n\n")
             messageBatch.removeAll() // Always clear batch to prevent unbounded growth
             
@@ -189,7 +364,7 @@ class PersonalityManager: ObservableObject {
                             
                             self.modelPersonalities[modelName] = updatedProfile
                             
-                            self.maturityScore = min(1.0, self.maturityScore + 0.10)
+                            self.maturityScore = min(1.0, self.maturityScore + 0.15)
                             self.isMature = self.maturityScore >= 0.7
                             
                             self.savePersonalities()
@@ -278,7 +453,7 @@ class PersonalityManager: ObservableObject {
         }
         modelPersonalities[modelName] = currentProfile
 
-        maturityScore = min(1.0, maturityScore + (Double(newTraits.count) * 0.05))
+        maturityScore = min(1.0, maturityScore + (Double(newTraits.count) * 0.08))
         isMature = maturityScore >= 0.7
 
         savePersonalities()
