@@ -123,8 +123,16 @@ struct PromptClassifier {
     /// e.g. "generate a sunset over the ocean" → "sunset over the ocean"
     ///      "draw me a dragon" → "a dragon"
     private static func stripTrigger(_ trigger: String, from original: String) -> String {
-        let lower = original.lowercased()
-        guard let range = lower.range(of: trigger) else {
+        // Searched case-insensitively on `original` rather than on a lowercased copy, so the
+        // range belongs to the string it's used on.
+        //
+        // The previous version took the range from `original.lowercased()` and applied it to
+        // `original`. Swift string indices carry UTF-8 offsets, and lowercasing can change the
+        // byte length — "İ" (U+0130, 2 bytes) lowercases to "i̇" (3 bytes) — so a few of those
+        // ahead of the trigger pushed the range past the end of `original` and the removal
+        // trapped with "String index range is out of bounds". That is an uncatchable crash on
+        // a path that runs on every message the user sends.
+        guard let range = original.range(of: trigger, options: [.caseInsensitive]) else {
             return original.trimmingCharacters(in: .whitespacesAndNewlines)
         }
         var cleaned = original

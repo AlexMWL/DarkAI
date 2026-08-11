@@ -149,7 +149,10 @@ actor LlamaRunner {
         // formula even runs — never request more than this for a model of this size, in case
         // a given architecture's real memory behavior (e.g. Gemma's mixed local/global
         // attention layers) doesn't match this generic per-layer estimate.
-        let hardCeiling = modelSizeGB > 4.0 ? 8192 : (modelSizeGB > 2.0 ? 16384 : 32768)
+        // Raised now that the budget below is derived from real, itemised deductions rather than
+        // a blanket halving — the memory maths is what protects the load, and this only guards
+        // against a given architecture's per-layer cost differing from the generic estimate.
+        let hardCeiling = modelSizeGB > 4.0 ? 16384 : (modelSizeGB > 2.0 ? 32768 : 65536)
         let safeRequestedClamp = min(requestedClamp, hardCeiling)
 
         let nLayer = Int(llama_model_n_layer(model))
@@ -176,16 +179,27 @@ actor LlamaRunner {
         let bytesPerTokenAllLayers = Double(nLayer * nHeadKV) * Double(headDimK + headDimV) * 2.0
         guard bytesPerTokenAllLayers > 0 else { return safeRequestedClamp }
 
-        // `availableMemoryGB` is the process's real current headroom (os_proc_available_memory),
-        // already netting out whatever else is using memory right now — not total device RAM.
-        // Still only budget a fraction of it: loading is not instantaneous, and peak memory
-        // during the load (mmap page-in, KV cache allocation, compute buffer setup) can exceed
-        // steady-state usage, so headroom measured before the load starts needs real margin.
-        let usableGB = availableMemoryGB * 0.5
+        // Budget against the process's real memory *allowance*, with named deductions.
+        //
+        // `availableMemoryGB` is `os_proc_available_memory()` measured just before the load: the
+        // headroom this process has against its own jetsam limit, not the device's free RAM.
+        // iOS hands that allowance out dynamically, so it is already the correct quantity to
+        // plan against — the previous formula then halved it *and* subtracted the weights, which
+        // double-charged for the same memory and left almost nothing for the KV cache. On an
+        // 11 GB device with ~6 GB of headroom and a 2.2 GB model, that yielded roughly 0.5 GB of
+        // cache — about 4.6k tokens, against a 128k-token-capable model and an 8k user setting.
+        //
+        // Every reduction below is now something concrete, so the budget can be reasoned about
+        // rather than scaled down by a guess.
+        //
+        // Reserve for the OS and for transient spikes during the load itself (mmap page-in, KV
+        // allocation, compute buffer setup), which can briefly exceed steady state.
+        let safetyMarginGB = max(1.0, availableMemoryGB * 0.10)
 
         // Weights are mmap'd (evictable) but with GPU offload restricted on large-vocab models
         // (see the vocab probe above), most layers run on CPU and stay actively resident across
         // every forward pass — budget close to the model's full file size, not a token discount.
+        // This is measured before the load, so the weights are not yet in `availableMemoryGB`.
         let residentWeightGB = modelSizeGB * 0.8
 
         // Compute/activation buffers (attention scratch space, batch buffers) scale with
@@ -193,13 +207,19 @@ actor LlamaRunner {
         // more scratch space than a small one.
         let computeOverheadGB = max(0.5, Double(safeRequestedClamp) / 8192.0 * 0.75)
 
-        let availableForKVGB = usableGB - residentWeightGB - computeOverheadGB
+        let availableForKVGB = availableMemoryGB - safetyMarginGB - residentWeightGB - computeOverheadGB
         guard availableForKVGB > 0.05 else { return 512 }
 
         let availableForKVBytes = availableForKVGB * 1024.0 * 1024.0 * 1024.0
         let maxCtxByMemory = Int(availableForKVBytes / bytesPerTokenAllLayers)
 
-        return max(512, min(safeRequestedClamp, maxCtxByMemory))
+        let resolved = max(512, min(safeRequestedClamp, maxCtxByMemory))
+        LogManager.shared.log(String(
+            format: "Context budget: %.2f GB free − %.2f margin − %.2f weights − %.2f compute = %.2f GB KV → %d tokens (requested %d, trained %d, applied %d)",
+            availableMemoryGB, safetyMarginGB, residentWeightGB, computeOverheadGB,
+            availableForKVGB, maxCtxByMemory, requestedLimit, trainedCtx, resolved
+        ))
+        return resolved
     }
 
     /// Unloads only the model+context, leaving the backend alive for the next load.
@@ -511,16 +531,48 @@ actor LlamaRunner {
                 if cumulative >= topP { break }
             }
 
-            // Sample from nucleus
+            // Sample from nucleus.
+            //
+            // Guarded because `Float.random(in:)` traps on an empty range. When every logit
+            // comes back as -inf or NaN — which is what a broken compute buffer looks like,
+            // and this backend has produced garbage tensors before (see the flash-attention
+            // notes in `SDWrapper`) — the threshold filter above keeps nothing, the nucleus is
+            // empty, and `nucleusSum` is 0. That trapped with "Range requires lowerBound <
+            // upperBound" and killed the app mid-answer. A model returning unusable numbers has
+            // to be a survivable state, not an uncatchable crash.
             let nucleusSum = nucleus.reduce(0) { $0 + $1.1 }
-            var rand = Float.random(in: 0..<nucleusSum)
-            var sampledId = nucleus.first?.0 ?? 0
-            for (idx, prob) in nucleus {
-                rand -= prob
-                if rand <= 0 {
-                    sampledId = idx
+            var sampledId: Int
+            if nucleusSum.isFinite, nucleusSum > 0 {
+                var rand = Float.random(in: 0..<nucleusSum)
+                sampledId = nucleus.first?.0 ?? 0
+                for (idx, prob) in nucleus {
+                    rand -= prob
+                    if rand <= 0 {
+                        sampledId = idx
+                        break
+                    }
+                }
+            } else {
+                // Greedy fallback — highest finite logit, skipping NaN/inf entries.
+                var bestIdx = -1
+                var bestVal = -Float.greatestFiniteMagnitude
+                for i in 0..<nVocab {
+                    let value = logits[i]
+                    if value.isFinite && value > bestVal {
+                        bestVal = value
+                        bestIdx = i
+                    }
+                }
+                guard bestIdx >= 0 else {
+                    // Not a single usable number in the whole distribution. Stop cleanly and
+                    // say so rather than emitting noise or dying.
+                    Task { @MainActor in
+                        LogManager.shared.log("LlamaRunner: sampler got unusable logits (all NaN/inf) — stopping generation.")
+                    }
+                    continuation.yield("\n\n[Generation stopped — the model returned unusable output. Try reloading the model, or loading a different one.]")
                     break
                 }
+                sampledId = bestIdx
             }
 
             let bestId = llama_token(sampledId)
@@ -727,8 +779,8 @@ class LLMManager: ObservableObject {
         didSet { UserDefaults.standard.set(temperature, forKey: "temperature") }
     }
     
-    @Published var chaosModeEnabled: Bool = UserDefaults.standard.bool(forKey: "chaosModeEnabled") {
-        didSet { UserDefaults.standard.set(chaosModeEnabled, forKey: "chaosModeEnabled") }
+    @Published var highVariabilityEnabled: Bool = UserDefaults.standard.bool(forKey: "highVariabilityEnabled") {
+        didSet { UserDefaults.standard.set(highVariabilityEnabled, forKey: "highVariabilityEnabled") }
     }
     
     // Reconstructed from the current Models directory + a stored filename rather than a
@@ -748,10 +800,7 @@ class LLMManager: ObservableObject {
     }
 
     private static func resolveLastUsedModelPath() -> String? {
-        guard let docsUrl = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
-            return nil
-        }
-        let modelsDir = docsUrl.appendingPathComponent("Models")
+        let modelsDir = AppFiles.models
 
         if let fileName = UserDefaults.standard.string(forKey: "lastUsedModelFileName") {
             let url = modelsDir.appendingPathComponent(fileName)
@@ -772,22 +821,89 @@ class LLMManager: ObservableObject {
         return nil
     }
     
+    // MARK: - Device context ceiling
+
+    /// The largest context window this *hardware* can be asked for, before any model is loaded.
+    ///
+    /// Separate from `safeContextLimit`, which is model-aware and only meaningful once something
+    /// is loaded. This is the hard ceiling that follows from the device's physical RAM, and it's
+    /// what the settings slider is bounded by — a 4 GB iPhone should never be able to request a
+    /// 32k context in the first place, rather than accepting the number and having it silently
+    /// clamped at load time to something a quarter the size.
+    /// Upper bound offered by the Settings slider for this device.
+    ///
+    /// Only the selectable range — `LlamaRunner.safeContextTokens` still decides what a given
+    /// model actually gets at load time, against real memory, and reports when it lowers the
+    /// figure. These tiers were raised once that budget stopped double-charging for the weights:
+    /// the top tier previously stopped at 32768 even on a 12 GB device, capping a 128k-capable
+    /// model well below what its memory could hold.
+    var deviceContextCeiling: Int {
+        switch systemMemoryGB {
+        case ..<3.5:  return 4096    // 2–3 GB devices: iPhone SE, older SoCs
+        case ..<5.5:  return 8192    // 4 GB: iPhone 12/13/14 non-Pro
+        case ..<7.5:  return 16384   // 6 GB: recent Pro models
+        case ..<9.5:  return 32768   // 8 GB
+        default:      return 65536   // 12 GB+: iPhone 17 Pro Max and later
+        }
+    }
+
+    /// The ceiling actually in force right now: hardware bound, tightened by the loaded model's
+    /// own memory profile once one exists.
+    var effectiveContextCeiling: Int {
+        if case .loaded = loadState {
+            return min(deviceContextCeiling, safeContextLimit)
+        }
+        return deviceContextCeiling
+    }
+
+    /// Set when the stored limit had to be lowered, so Settings can explain the change rather
+    /// than leaving the user staring at a number they didn't choose.
+    @Published var contextLimitAutoAdjustedTo: Int? = nil
+
+    /// Clamps the persisted context limit down to what the device (and, if loaded, the model)
+    /// can actually sustain.
+    ///
+    /// Only ever lowers. If the user deliberately picked something smaller than the ceiling,
+    /// that choice is theirs and is left alone — the point of this is to stop an impossible
+    /// setting from surviving, not to push everyone to the maximum.
+    @discardableResult
+    func applyContextCeiling() -> Bool {
+        let ceiling = effectiveContextCeiling
+        guard contextTokenLimit > ceiling else {
+            contextLimitAutoAdjustedTo = nil
+            return false
+        }
+        let previous = contextTokenLimit
+        contextTokenLimit = ceiling
+        contextLimitAutoAdjustedTo = ceiling
+        LogManager.shared.log("LLMManager: context limit lowered \(previous) → \(ceiling) (device RAM \(String(format: "%.1f", systemMemoryGB)) GB)")
+        return true
+    }
+
+    /// Advisory ceiling shown in Settings — the point past which the slider warns.
+    ///
+    /// Budgets from the process's actual allowance (`os_proc_available_memory()`), matching what
+    /// `LlamaRunner.safeContextTokens` will really apply at load time. It used to work from
+    /// `systemMemoryGB * 0.40`, a fraction of *device* RAM, which bore no relation to what iOS
+    /// had actually granted this process and warned far too early on a large-memory device.
     var safeContextLimit: Int {
-        let maxMemory = systemMemoryGB * 0.40
+        let availableGB = MemoryBudget.plannableHeadroomGB()
+        let safetyMarginGB = max(1.0, availableGB * 0.10)
+
         switch loadState {
         case .loaded(_, let sizeGB):
-            let activeModelWeightRAM = sizeGB * 0.10
-            let availableForKV = maxMemory - activeModelWeightRAM
+            // Weights are already resident, so they're accounted for in `availableGB` — only the
+            // compute buffers still need reserving on top of the margin.
+            let availableForKV = availableGB - safetyMarginGB - 0.75
             if availableForKV <= 0 { return 2048 }
             let gbPer1kTokens = max(0.04, sizeGB * 0.02)
-            let safeLimit = (availableForKV / gbPer1kTokens) * 1000
-            return max(2048, min(32768, Int(safeLimit)))
+            return max(2048, min(65536, Int((availableForKV / gbPer1kTokens) * 1000)))
         default:
-            let availableForKV = maxMemory - 1.5
+            // Nothing loaded yet: leave room for a typical model plus its compute buffers.
+            let availableForKV = availableGB - safetyMarginGB - 2.5
             if availableForKV <= 0 { return 4096 }
             let gbPer1kTokens = 0.08
-            let safeLimit = (availableForKV / gbPer1kTokens) * 1000
-            return max(2048, min(32768, Int(safeLimit)))
+            return max(2048, min(65536, Int((availableForKV / gbPer1kTokens) * 1000)))
         }
     }
 
@@ -796,6 +912,10 @@ class LLMManager: ObservableObject {
     init() {
         self.systemMemoryGB = getPhysicalMemory()
         setupAppLifecycleObservers()
+        // Runs before anything can read the setting. A limit persisted on one device (or from a
+        // build with a higher default) is otherwise carried forward unchanged onto hardware that
+        // can't honour it.
+        applyContextCeiling()
     }
 
     // MARK: - App Lifecycle - Clean unload on background/termination
@@ -835,7 +955,9 @@ class LLMManager: ObservableObject {
     /// getPhysicalMemory() (a constant), this reflects whatever else is using memory right
     /// now. Model loading should always budget against this, not total device RAM.
     func getAvailableMemoryGB() -> Double {
-        return Double(os_proc_available_memory()) / (1024.0 * 1024.0 * 1024.0)
+        // Plannable headroom, not the raw instantaneous reading — see `MemoryBudget`. This is
+        // what gets passed to `LlamaRunner.safeContextTokens`, so it decides the context window.
+        return MemoryBudget.plannableHeadroomGB()
     }
 
     func getModelSizeGB(at url: URL) -> Double {
@@ -843,9 +965,20 @@ class LLMManager: ObservableObject {
         return Double(size) / (1024.0 * 1024.0 * 1024.0)
     }
 
+    /// Process headroom a model of this size needs before `checkMemorySafety` will pass it.
+    ///
+    /// Derived from the same constants the check itself uses, so callers that need to *wait* for
+    /// memory rather than merely test it can target the real threshold instead of guessing.
+    /// Reloading the chat model after image generation is the case that matters: a fixed sleep
+    /// after unloading a multi-gigabyte diffusion checkpoint was routinely too short, and the
+    /// reload then failed its own safety check over memory that was about to come back.
+    func memoryHeadroomNeededGB(forModelSizeGB modelSizeGB: Double) -> Double {
+        (modelSizeGB * 1.15 + 2.0) / 0.85
+    }
+
     func checkMemorySafety(modelSizeGB: Double) -> MemorySafetyStatus {
         let total = systemMemoryGB
-        let availableNowGB = Double(os_proc_available_memory()) / (1024.0 * 1024.0 * 1024.0)
+        let availableNowGB = MemoryBudget.plannableHeadroomGB()
         // Overhead for app context, system tasks, and the KV-cache/compute buffers that get
         // allocated on top of the model weights (this pre-check runs before the model is
         // loaded, so it can't size those precisely the way safeContextTokens does downstream —
@@ -878,8 +1011,20 @@ class LLMManager: ObservableObject {
     func loadModel(at url: URL, forceLoad: Bool = false) {
         let sizeGB = getModelSizeGB(at: url)
 
+        // Whether we're replacing a resident model. `LlamaRunner.load` does unload the old one
+        // first, but that happens deep inside the load — after the memory pre-flight below has
+        // already run and after the context window has been sized. Both were therefore budgeting
+        // against memory the outgoing model was still holding: swapping a large model for
+        // another could fail the safety check outright, or succeed with a context window sized
+        // for the leftovers. Evicting up front, and waiting for the memory to actually return,
+        // means the incoming model is measured against a clean process.
+        let needsEviction = isModelLoaded
+
         activeModelURL = url
-        self.loadState = .loading(progress: 0.1, status: "Initialising llama.cpp backend…")
+        self.loadState = .loading(
+            progress: 0.05,
+            status: needsEviction ? "Unloading previous model…" : "Initialising llama.cpp backend…"
+        )
 
         // NOTE: the load itself below is deliberately a single attempt, not a retry loop. A
         // previous version retried up to 3 times on failure to work around a transient
@@ -891,6 +1036,22 @@ class LLMManager: ObservableObject {
         // launch case instead: refuse to attempt when there genuinely isn't headroom, rather
         // than attempting and repeatedly retrying a risky allocation.
         Task {
+            if needsEviction {
+                await self.unloadModelAsync()
+                // `unloadModelAsync` clears these, so restore the incoming model's state before
+                // the load continues — otherwise the bar reads "No model loaded" mid-swap.
+                await MainActor.run {
+                    self.activeModelURL = url
+                    self.loadState = .loading(progress: 0.15, status: "Freeing previous model…")
+                }
+                await MemoryBudget.waitForRelease(
+                    atLeastGB: self.memoryHeadroomNeededGB(forModelSizeGB: sizeGB)
+                )
+                await MainActor.run {
+                    self.loadState = .loading(progress: 0.25, status: "Initialising llama.cpp backend…")
+                }
+            }
+
             if !forceLoad {
                 // iOS manages memory dynamically — it can reclaim room from suspended/cached
                 // background processes as foreground memory pressure increases, so a single
@@ -922,7 +1083,16 @@ class LLMManager: ObservableObject {
 
                 let availMem = await MainActor.run { self.getAvailableMemoryGB() }
 
-                let currentContextLimit = min(self.contextTokenLimit, self.safeContextLimit)
+                let currentContextLimit = await MainActor.run {
+                    min(self.contextTokenLimit, self.effectiveContextCeiling)
+                }
+                // Checkpoint before the single largest allocation the app makes. If the process
+                // is jetsam-killed during this load there is no handler to run, so this
+                // breadcrumb plus the memory reading is the only evidence the next launch has.
+                await MainActor.run {
+                    CrashReporter.note("loading chat model \(url.lastPathComponent) (\(String(format: "%.1f", sizeGB)) GB, ctx \(currentContextLimit))")
+                    CrashReporter.noteChatModel(url.lastPathComponent)
+                }
                 try await runner.load(
                     path: url.path,
                     availableMemoryGB: availMem,
@@ -940,6 +1110,10 @@ class LLMManager: ObservableObject {
                     self.loadedContextWindow = appliedContextWindow
                     self.contextTokensUsed = 0
                     self.currentResponseTokenCount = 0
+                    // Now that a model is resident, the ceiling is model-aware and usually
+                    // tighter. Re-clamp so the stored setting reflects what will actually be
+                    // honoured next time instead of drifting back to an unreachable number.
+                    self.applyContextCeiling()
                 }
             } catch {
                 await MainActor.run {
@@ -966,6 +1140,7 @@ class LLMManager: ObservableObject {
             self.loadedContextWindow = 0
             self.contextTokensUsed = 0
             self.currentResponseTokenCount = 0
+            CrashReporter.noteChatModel(nil)
         }
     }
 
@@ -1085,7 +1260,7 @@ class LLMManager: ObservableObject {
                     await runner.generateStream(
                         messages: swiftMessages,
                         maxTokens: tokenLimit,
-                        temperature: self.chaosModeEnabled ? 2.5 : Float(self.temperature) + temperatureBoost,
+                        temperature: self.highVariabilityEnabled ? 2.5 : Float(self.temperature) + temperatureBoost,
                         continuation: continuation,
                         onContextTruncated: {
                             Task { @MainActor in self.isContextTruncating = true }
