@@ -232,8 +232,10 @@ struct WebSearchClassifier {
     // MARK: Helpers
 
     private static func strip(_ trigger: String, from original: String) -> String {
-        let lower = original.lowercased()
-        guard let range = lower.range(of: trigger) else {
+        // Case-insensitive search on `original`, not on a lowercased copy — see the matching
+        // comment in `PromptClassifier.stripTrigger`. Reusing an index across the two strings
+        // traps once lowercasing changes the UTF-8 length.
+        guard let range = original.range(of: trigger, options: [.caseInsensitive]) else {
             return original.trimmingCharacters(in: .whitespacesAndNewlines)
         }
         var cleaned = original

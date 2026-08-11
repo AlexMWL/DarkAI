@@ -281,12 +281,61 @@ enum GGUFValidator {
         LogManager.shared.log("Checkpoint verified: \(fileName) — \(names.count) tensors, UNet + text encoder + VAE present")
     }
 
+    // MARK: - Resident weight size
+
+    /// How much RAM a checkpoint's weights actually occupy once loaded, which is **not** the
+    /// same as its size on disk.
+    ///
+    /// stable-diffusion.cpp has no 8-bit float tensor type. `safetensors_io.cpp` maps both
+    /// `F8_E4M3` and `F8_E5M2` to `GGML_TYPE_F16`, and `tensor_storage.h` reads
+    /// `nbytes() / 2` from disk and expands each byte into two — so an FP8 checkpoint takes
+    /// **double** its file size in memory. A 4 GB FP8 SDXL file needs ~8 GB resident.
+    ///
+    /// Budgeting off file size therefore understated FP8 checkpoints by 2×, which is exactly
+    /// how a 4.05 GB file was labelled SAFE on an 11.4 GB device and then killed the app
+    /// mid-generation. `nil` means "couldn't determine" — callers fall back to file size,
+    /// which is correct for GGUF (whose types are already ggml-native, so no conversion
+    /// happens) and for ordinary F16 safetensors.
+    static func residentWeightBytes(path: String) -> Int64? {
+        let url = URL(fileURLWithPath: path)
+        guard url.pathExtension.lowercased() == "safetensors",
+              let handle = FileHandle(forReadingAtPath: path) else { return nil }
+        defer { handle.closeFile() }
+        guard let header = try? safetensorsHeader(from: handle, fileName: url.lastPathComponent) else { return nil }
+
+        var total: Int64 = 0
+        for (name, value) in header where name != "__metadata__" {
+            guard let entry = value as? [String: Any],
+                  let dtype = entry["dtype"] as? String,
+                  let shape = entry["shape"] as? [Any] else { continue }
+            let elements = shape.reduce(Int64(1)) { partial, dim in
+                partial * Int64((dim as? NSNumber)?.int64Value ?? 1)
+            }
+            total += elements * Int64(inMemoryBytesPerElement(forDType: dtype))
+        }
+        return total > 0 ? total : nil
+    }
+
+    /// Bytes each element occupies **after** the loader's dtype conversion — mirrors
+    /// `safetensors_dtype_to_ggml_type` in the vendored `safetensors_io.cpp`.
+    private static func inMemoryBytesPerElement(forDType dtype: String) -> Int {
+        switch dtype.uppercased() {
+        case "F8_E4M3", "F8_E5M2": return 2   // → GGML_TYPE_F16: one disk byte becomes two
+        case "F16", "BF16":        return 2
+        case "F32", "F64":         return 4   // F64 → GGML_TYPE_F32
+        case "I32", "I64":         return 4   // I64 → GGML_TYPE_I32
+        case "I16", "U16":         return 2
+        case "I8", "U8", "BOOL":   return 1
+        default:                   return 2   // unknown: assume F16, the common case
+        }
+    }
+
     // MARK: Tensor-name enumeration
 
-    /// Reads the safetensors header: an 8-byte little-endian length, then that many bytes of
-    /// JSON whose keys are the tensor names. Only the header is read, so this costs the same
-    /// on a 2 GB file as on a 200 MB one.
-    private static func safetensorsTensorNames(from handle: FileHandle, fileName: String) throws -> [String] {
+    /// Reads and parses the safetensors header: an 8-byte little-endian length, then that many
+    /// bytes of JSON. Only the header is read, so this costs the same on a 2 GB file as on a
+    /// 200 MB one.
+    private static func safetensorsHeader(from handle: FileHandle, fileName: String) throws -> [String: Any] {
         guard let lengthData = try? handle.read(upToCount: 8), lengthData.count == 8 else {
             throw error("\(fileName) is too short to be a valid safetensors file.")
         }
@@ -303,8 +352,12 @@ enum GGUFValidator {
         guard let json = try? JSONSerialization.jsonObject(with: headerData) as? [String: Any] else {
             throw error("\(fileName) is not a valid safetensors file (unreadable header).")
         }
+        return json
+    }
+
+    private static func safetensorsTensorNames(from handle: FileHandle, fileName: String) throws -> [String] {
         // `__metadata__` is the format's own reserved key, not a tensor.
-        return json.keys.filter { $0 != "__metadata__" }
+        try safetensorsHeader(from: handle, fileName: fileName).keys.filter { $0 != "__metadata__" }
     }
 
     /// Walks the GGUF metadata block to the tensor-info section and collects every tensor name,

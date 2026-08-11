@@ -359,7 +359,8 @@ class DiffusionManager: ObservableObject {
             throw error
         }
 
-        let sizeGB = getFileSizeGB(at: url)
+        // Resident size, not file size — an FP8 checkpoint doubles when loaded.
+        let sizeGB = effectiveWeightSizeGB(at: url)
         let safety = checkMemorySafety(modelSizeGB: sizeGB, outputSize: outputSize)
         if case .dangerous(let requiredGB, let availableGB) = safety {
             let req = String(format: "%.1f", requiredGB)
@@ -463,5 +464,48 @@ class DiffusionManager: ObservableObject {
     func getFileSizeGB(at url: URL) -> Double {
         guard let sz = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize else { return 0 }
         return Double(sz) / (1024.0 * 1024.0 * 1024.0)
+    }
+
+    /// Parsed resident sizes, keyed by path. The Settings list re-evaluates every row on each
+    /// render, and each miss reads a multi-megabyte header — without this the picker would
+    /// re-parse every checkpoint on screen on every layout pass.
+    private var residentSizeCache: [String: Double] = [:]
+
+    /// What the weights will actually occupy in RAM — the number every memory decision should
+    /// be made against, rather than the size on disk.
+    ///
+    /// These differ for FP8 checkpoints, and by a full 2×: stable-diffusion.cpp has no 8-bit
+    /// float type, so it expands every FP8 tensor to F16 while loading (see
+    /// `GGUFValidator.residentWeightBytes`). Sizing off the file made a 4.05 GB FP8 SDXL
+    /// checkpoint look like it needed 4.85 GB when it really needed ~8.9 GB — comfortably
+    /// "safe" on an 11.4 GB device, and reliably fatal a minute into generation.
+    ///
+    /// Falls back to file size when the format can't be inspected, which is the right answer
+    /// for GGUF (already ggml-native types, so nothing expands) and for plain F16 safetensors.
+    func effectiveWeightSizeGB(at url: URL) -> Double {
+        if let cached = residentSizeCache[url.path] { return cached }
+        let fileSizeGB = getFileSizeGB(at: url)
+        var resolved = fileSizeGB
+        if let bytes = GGUFValidator.residentWeightBytes(path: url.path) {
+            let residentGB = Double(bytes) / (1024.0 * 1024.0 * 1024.0)
+            // Only ever revise *upward*. A header that undercounts (metadata-only tensors, a
+            // partial parse) must not be allowed to talk the budget down below what the file
+            // itself already proves is there.
+            resolved = max(fileSizeGB, residentGB)
+            if residentGB > fileSizeGB * 1.2 {
+                LogManager.shared.log(String(
+                    format: "Diffusion weights expand on load: %@ is %.2f GB on disk but ~%.2f GB resident (8-bit weights converted to F16)",
+                    url.lastPathComponent, fileSizeGB, residentGB
+                ))
+            }
+        }
+        residentSizeCache[url.path] = resolved
+        return resolved
+    }
+
+    /// True when the checkpoint's weights take meaningfully more RAM than its file size, so the
+    /// UI can explain *why* a 4 GB file is being refused on a device with 8 GB free.
+    func weightsExpandOnLoad(at url: URL) -> Bool {
+        effectiveWeightSizeGB(at: url) > getFileSizeGB(at: url) * 1.2
     }
 }

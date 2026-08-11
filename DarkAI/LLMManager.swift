@@ -531,16 +531,48 @@ actor LlamaRunner {
                 if cumulative >= topP { break }
             }
 
-            // Sample from nucleus
+            // Sample from nucleus.
+            //
+            // Guarded because `Float.random(in:)` traps on an empty range. When every logit
+            // comes back as -inf or NaN — which is what a broken compute buffer looks like,
+            // and this backend has produced garbage tensors before (see the flash-attention
+            // notes in `SDWrapper`) — the threshold filter above keeps nothing, the nucleus is
+            // empty, and `nucleusSum` is 0. That trapped with "Range requires lowerBound <
+            // upperBound" and killed the app mid-answer. A model returning unusable numbers has
+            // to be a survivable state, not an uncatchable crash.
             let nucleusSum = nucleus.reduce(0) { $0 + $1.1 }
-            var rand = Float.random(in: 0..<nucleusSum)
-            var sampledId = nucleus.first?.0 ?? 0
-            for (idx, prob) in nucleus {
-                rand -= prob
-                if rand <= 0 {
-                    sampledId = idx
+            var sampledId: Int
+            if nucleusSum.isFinite, nucleusSum > 0 {
+                var rand = Float.random(in: 0..<nucleusSum)
+                sampledId = nucleus.first?.0 ?? 0
+                for (idx, prob) in nucleus {
+                    rand -= prob
+                    if rand <= 0 {
+                        sampledId = idx
+                        break
+                    }
+                }
+            } else {
+                // Greedy fallback — highest finite logit, skipping NaN/inf entries.
+                var bestIdx = -1
+                var bestVal = -Float.greatestFiniteMagnitude
+                for i in 0..<nVocab {
+                    let value = logits[i]
+                    if value.isFinite && value > bestVal {
+                        bestVal = value
+                        bestIdx = i
+                    }
+                }
+                guard bestIdx >= 0 else {
+                    // Not a single usable number in the whole distribution. Stop cleanly and
+                    // say so rather than emitting noise or dying.
+                    Task { @MainActor in
+                        LogManager.shared.log("LlamaRunner: sampler got unusable logits (all NaN/inf) — stopping generation.")
+                    }
+                    continuation.yield("\n\n[Generation stopped — the model returned unusable output. Try reloading the model, or loading a different one.]")
                     break
                 }
+                sampledId = bestIdx
             }
 
             let bestId = llama_token(sampledId)

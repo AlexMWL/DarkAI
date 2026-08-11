@@ -696,9 +696,21 @@ struct ContentView: View {
             "|channel>thought", "self-correction", "self_correction",
             "correction", "reflection", "reasoning", "internal"
         ]
-        for tag in xmlTags {
+        // Longest tag first: "<think" is a prefix of "<thinking", so checking "think" first
+        // matched the opening of a `<thinking>` block and then failed to find its `</think>`
+        // close, deleting the entire rest of the message.
+        for tag in xmlTags.sorted(by: { $0.count > $1.count }) {
             while let startRange = filtered.range(of: "<\(tag)", options: .caseInsensitive) {
-                if let endRange = filtered.range(of: "</\(tag)>", options: .caseInsensitive) {
+                // The close tag is searched for strictly *after* the open tag.
+                //
+                // Searching the whole string was a crash: a stray "</think>" ahead of the
+                // "<think>" (models do emit unbalanced tags) produced an end bound lower than
+                // the start bound, and `lowerBound..<upperBound` traps when inverted —
+                // "Fatal error: Range requires lowerBound <= upperBound", an uncatchable
+                // SIGTRAP on a function that runs over every response and every streamed token.
+                if let endRange = filtered.range(of: "</\(tag)>",
+                                                 options: .caseInsensitive,
+                                                 range: startRange.upperBound..<filtered.endIndex) {
                     filtered.removeSubrange(startRange.lowerBound..<endRange.upperBound)
                 } else {
                     filtered.removeSubrange(startRange.lowerBound..<filtered.endIndex)
@@ -717,7 +729,13 @@ struct ContentView: View {
         let plaintextHeaders = ["Thinking Process:", "Thought Process:", "Internal Reasoning:", "Chain of Thought:"]
         for header in plaintextHeaders {
             while let startRange = filtered.range(of: header, options: .caseInsensitive) {
-                if let endRange = filtered.range(of: "Response:", options: .caseInsensitive) {
+                // Same inverted-range crash as the tag loop above, and far easier to hit here:
+                // any reply that says "Response:" before "Thinking Process:" — entirely
+                // ordinary phrasing — produced an inverted range and trapped. Bound the search
+                // to the text after the header so the end can never precede the start.
+                if let endRange = filtered.range(of: "Response:",
+                                                 options: .caseInsensitive,
+                                                 range: startRange.upperBound..<filtered.endIndex) {
                     filtered.removeSubrange(startRange.lowerBound..<endRange.upperBound)
                 } else {
                     filtered.removeSubrange(startRange.lowerBound..<filtered.endIndex)
@@ -1434,7 +1452,7 @@ struct ContentView: View {
                 // Metal returns buffers to the system on its own schedule, so a fixed delay is
                 // routinely too short and makes the diffusion safety check read less headroom
                 // than is really about to be available.
-                let diffSizeGB = diffusionManager.getFileSizeGB(at: URL(fileURLWithPath: diffPath))
+                let diffSizeGB = diffusionManager.effectiveWeightSizeGB(at: URL(fileURLWithPath: diffPath))
                 await MemoryBudget.waitForRelease(atLeastGB: diffusionManager.memoryHeadroomNeededGB(
                     forModelSizeGB: diffSizeGB, outputSize: diffusionManager.outputSize
                 ))

@@ -1450,7 +1450,10 @@ struct SettingsView: View {
         let isSelected = diffusionManager.lastDiffusionModelPath == url.path
         // Live, resolution-aware — re-evaluates if the user changes Output Resolution above,
         // same as `modelRow`'s safety tag re-evaluates against the LLM's context setting.
-        let safety = diffusionManager.checkMemorySafety(modelSizeGB: sizeGB, outputSize: diffusionManager.outputSize)
+        // Judged on resident size, which for an FP8 checkpoint is double the file size.
+        let residentGB = diffusionManager.effectiveWeightSizeGB(at: url)
+        let expands = diffusionManager.weightsExpandOnLoad(at: url)
+        let safety = diffusionManager.checkMemorySafety(modelSizeGB: residentGB, outputSize: diffusionManager.outputSize)
 
         return HStack(spacing: 12) {
             Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
@@ -1469,6 +1472,13 @@ struct SettingsView: View {
                         .foregroundColor(Theme.textSecondary)
 
                     safetyTag(for: safety)
+                }
+                // Without this a 4 GB file refused on a device showing 8 GB free looks like a
+                // bug in the check rather than a property of the file.
+                if expands {
+                    Text(String(format: "8-bit weights — needs ~%.1f GB in memory", residentGB))
+                        .font(.system(size: 10))
+                        .foregroundColor(.orange)
                 }
             }
 
