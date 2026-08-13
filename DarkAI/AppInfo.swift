@@ -5,7 +5,13 @@ import Foundation
 ///
 /// ⚠️ SUBMISSION CHECKLIST — every value marked `REQUIRED` must be real before you upload a
 /// build. App Review will tap these. A placeholder here is a rejection.
-enum AppInfo {
+///
+/// `nonisolated` because the app's name and version are needed by code that has no business
+/// hopping to the main actor to read a constant: `ContentSafety` puts the app name in every
+/// refusal message, `ConversationExport` stamps it into exported transcripts, and both run off
+/// the UI thread. Everything here is either a `let` or a computed read of `Bundle.main`, which is
+/// thread-safe.
+nonisolated enum AppInfo {
 
     // MARK: - Identity
 
@@ -68,7 +74,11 @@ enum AppInfo {
 /// Bundled offline copies of everything the user has to be able to read without a network
 /// connection. The app is fully offline by design, so linking out to a website for the terms
 /// would leave an airplane-mode user unable to read what they agreed to.
-enum LegalText {
+///
+/// `nonisolated` for the same reason as `AppInfo` above: these are immutable strings, and one of
+/// them (`crisisResources`) is attached to model output by a screening path that does not run on
+/// the main actor.
+nonisolated enum LegalText {
 
     static let acceptableUse = """
     ACCEPTABLE USE POLICY

@@ -36,6 +36,17 @@ struct CatalogModel: Identifiable, Hashable {
     /// Approximate peak RAM to run it, weights plus a default context. Drives the
     /// "may not run on this device" warning before a user spends a gigabyte of cellular data.
     let approxRuntimeGB: Double
+    /// Physical RAM below which this model is not worth recommending.
+    ///
+    /// Derived by running each model's real geometry — layer count, KV head count, head dims and
+    /// trained context, all read from its GGUF header — through `LlamaRunner.planOffload` and
+    /// `safeContextTokens` at each iPhone memory tier, and taking the lowest tier that still
+    /// yields a usable context window rather than merely loading. A model that loads with 512
+    /// tokens is not one to recommend.
+    let minimumRAMGB: Double
+    /// The earliest iPhone at `minimumRAMGB`, for a human-readable tag. iOS 17 is the app's
+    /// floor, so the oldest hardware in scope is the 4 GB generation (iPhone 11, SE 3rd gen).
+    let minimumDevice: String
     /// Overrides `fileName` when `url` doesn't end in the real filename. Hugging Face URLs are
     /// self-describing (`.../resolve/main/some-model.gguf`), but Civitai's download endpoint is
     /// `/api/download/models/{versionId}` — the actual filename only ever appears in the
@@ -46,7 +57,8 @@ struct CatalogModel: Identifiable, Hashable {
 
     init(id: String, kind: ModelKind, displayName: String, publisher: String, byteSize: Int64,
          parameterCount: String, quantization: String, license: String, attribution: String?,
-         summary: String, url: URL, approxRuntimeGB: Double, fileNameOverride: String? = nil) {
+         summary: String, url: URL, approxRuntimeGB: Double,
+         minimumRAMGB: Double, minimumDevice: String, fileNameOverride: String? = nil) {
         self.id = id
         self.kind = kind
         self.displayName = displayName
@@ -59,6 +71,8 @@ struct CatalogModel: Identifiable, Hashable {
         self.summary = summary
         self.url = url
         self.approxRuntimeGB = approxRuntimeGB
+        self.minimumRAMGB = minimumRAMGB
+        self.minimumDevice = minimumDevice
         self.fileNameOverride = fileNameOverride
     }
 
@@ -69,13 +83,23 @@ struct CatalogModel: Identifiable, Hashable {
 
 enum ModelCatalog {
 
-    /// Curated starter models. All are instruction-tuned, all are small enough to run on any
-    /// device that meets the app's deployment target, and all are redistributable under a
+    /// Curated starter models. All are instruction-tuned and all are redistributable under a
     /// license that permits this use.
     ///
     /// Sizes are the exact byte counts served by the host — they are checked after download, so
     /// if a host ever republishes a file at a different size the verification fails loudly
     /// instead of leaving a truncated model that only misbehaves at inference time.
+    ///
+    /// One entry is a mixture-of-experts model, and it is listed on its merits rather than for
+    /// any memory advantage. There was supposed to be one: pin the routed experts to mmap and a
+    /// sparse model needs only its dense remainder resident. That does not work on Metal —
+    /// llama.cpp gives each device a single mapping spanning its first tensor to its last, and
+    /// because MoE files interleave expert and attention tensors, pinning experts still forces
+    /// the whole file to be mapped (see `LlamaRunner.planOffload` for the measurements). So a
+    /// sparse model here costs what a dense one of the same size costs, and is judged the same
+    /// way. What it still offers is quality per *compute*: only a fraction of its weights run
+    /// for each token, so a 7B-class model answers at roughly 1B-class speed.
+    ///
     static let chatModels: [CatalogModel] = [
         CatalogModel(
             id: "llama-3.2-1b-instruct-q4km",
@@ -89,7 +113,9 @@ enum ModelCatalog {
             attribution: "Built with Llama. Llama 3.2 is licensed under the Llama 3.2 Community License, Copyright © Meta Platforms, Inc. All Rights Reserved.",
             summary: "Smallest and fastest. A good first download and the least demanding on memory.",
             url: URL(string: "https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.gguf")!,
-            approxRuntimeGB: 1.6
+            approxRuntimeGB: 1.6,
+            minimumRAMGB: 6.0,
+            minimumDevice: "minimum iPhone 12 Pro / 14 or newer"
         ),
         CatalogModel(
             id: "qwen2.5-1.5b-instruct-q4km",
@@ -103,7 +129,9 @@ enum ModelCatalog {
             attribution: nil,
             summary: "Stronger at reasoning and code than the 1B models, still comfortable on most devices.",
             url: URL(string: "https://huggingface.co/bartowski/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/Qwen2.5-1.5B-Instruct-Q4_K_M.gguf")!,
-            approxRuntimeGB: 1.9
+            approxRuntimeGB: 1.9,
+            minimumRAMGB: 6.0,
+            minimumDevice: "minimum iPhone 12 Pro / 14 or newer"
         ),
         CatalogModel(
             id: "smollm2-1.7b-instruct-q4km",
@@ -117,7 +145,9 @@ enum ModelCatalog {
             attribution: nil,
             summary: "Conversational and well-behaved on short prompts. Trained on openly documented data.",
             url: URL(string: "https://huggingface.co/bartowski/SmolLM2-1.7B-Instruct-GGUF/resolve/main/SmolLM2-1.7B-Instruct-Q4_K_M.gguf")!,
-            approxRuntimeGB: 2.0
+            approxRuntimeGB: 2.0,
+            minimumRAMGB: 6.0,
+            minimumDevice: "minimum iPhone 12 Pro / 14 or newer"
         ),
         CatalogModel(
             id: "llama-3.2-3b-instruct-q4km",
@@ -129,25 +159,51 @@ enum ModelCatalog {
             quantization: "Q4_K_M",
             license: "Llama 3.2 Community License",
             attribution: "Built with Llama. Llama 3.2 is licensed under the Llama 3.2 Community License, Copyright © Meta Platforms, Inc. All Rights Reserved.",
-            summary: "The most capable chat model here — noticeably better at reasoning and long answers. Needs a device with plenty of memory.",
+            summary: "Strong at reasoning and long answers, and the best balance of quality against download size here. Needs a device with plenty of memory.",
             url: URL(string: "https://huggingface.co/hugging-quants/Llama-3.2-3B-Instruct-Q4_K_M-GGUF/resolve/main/llama-3.2-3b-instruct-q4_k_m.gguf")!,
-            approxRuntimeGB: 3.4
+            approxRuntimeGB: 3.4,
+            minimumRAMGB: 6.0,
+            minimumDevice: "minimum iPhone 12 Pro / 14 or newer"
+        ),
+
+        CatalogModel(
+            id: "olmoe-1b-7b-0924-instruct-q4km",
+            kind: .chat,
+            displayName: "OLMoE 1B-7B Instruct",
+            publisher: "Ai2",
+            byteSize: 4_213_512_672,
+            parameterCount: "7B total, 1B active",
+            quantization: "Q4_K_M",
+            license: "Apache 2.0",
+            attribution: nil,
+            // 16 blocks, 64 experts each, 8 active per token. Resident cost is the whole file
+            // like any other model, so this is sized as such — the earlier 1.6 GB figure assumed
+            // an expert-pinning saving that Metal does not permit.
+            summary: "A 7B model that only uses about an eighth of itself for each word, so it answers about as fast as a 1B while knowing more. Needs as much memory as its file size, like any other model here.",
+            url: URL(string: "https://huggingface.co/allenai/OLMoE-1B-7B-0924-Instruct-GGUF/resolve/main/olmoe-1b-7b-0924-instruct-q4_k_m.gguf")!,
+            approxRuntimeGB: 4.6,
+            minimumRAMGB: 8.0,
+            minimumDevice: " minimum iPhone 15 Pro / 16 or newer"
+        ),
+        CatalogModel(
+            id: "meta-llama-3-8b-instruct-q4km",
+            kind: .chat,
+            displayName: "Llama 3 8B Instruct",
+            publisher: "Meta (GGUF build by QuantFactory)",
+            byteSize: 4_920_734_272,
+            parameterCount: "8B",
+            quantization: "Q4_K_M",
+            license: "Meta Llama 3 Community License",
+            attribution: "Built with Meta Llama 3. Llama 3 is licensed under the Meta Llama 3 Community License, Copyright © Meta Platforms, Inc. All Rights Reserved.",
+            
+            summary: "The most capable model here, and the largest. On 8GB memory iPhones, part of it is read from storage each word, so replies come noticeably slower. Even at full speed expect it to be about half the speed of the 3B. **currently prone to crashing, use with caution**",
+            url: URL(string: "https://huggingface.co/QuantFactory/Meta-Llama-3-8B-Instruct-GGUF/resolve/main/Meta-Llama-3-8B-Instruct.Q4_K_M.gguf")!,
+            approxRuntimeGB: 5.2,
+            minimumRAMGB: 12.0,
+            minimumDevice: "iPhone 17 Pro or newer"
         )
     ]
 
-    /// Diffusion checkpoints offered for download.
-    ///
-    /// One entry, chosen conservatively. Image generation loads the full UNet, the CLIP text
-    /// encoder, and the VAE at once, and the app has to evict the chat model to make room — so
-    /// the smallest complete checkpoint that produces good 512×512 output is the right default,
-    /// not the most capable one.
-    ///
-    /// Verified before listing, which earlier entries were not: the file is a single-file
-    /// checkpoint carrying all three components (686 UNet tensors under `model.diffusion_model`,
-    /// 248 VAE under `first_stage_model`, 196 CLIP under `cond_stage_model`), and its longest
-    /// tensor name is 83 bytes — within the 160-byte `GGML_MAX_NAME` that stable-diffusion.cpp
-    /// is compiled with, now that `build_sd_ios.sh` stops those symbols binding to llama.cpp's
-    /// 64-byte build.
     static let diffusionModels: [CatalogModel] = [
         CatalogModel(
             id: "sd-1.5-emaonly-q4_0",
@@ -161,23 +217,11 @@ enum ModelCatalog {
             attribution: "Stable Diffusion v1-5 is licensed under the CreativeML OpenRAIL-M license, which prohibits generating illegal or harmful content.",
             summary: "Generates 512×512 images. The EMA-only pruned build — the smallest complete Stable Diffusion checkpoint, and the most forgiving on memory.",
             url: URL(string: "https://huggingface.co/second-state/stable-diffusion-v1-5-GGUF/resolve/main/stable-diffusion-v1-5-pruned-emaonly-Q4_0.gguf")!,
-            approxRuntimeGB: 3.0
+            approxRuntimeGB: 3.0,
+            minimumRAMGB: 6.0,
+            minimumDevice: "minimum iPhone 12 Pro / 14 or newer"
         ),
-        // Sourced from Civitai rather than Hugging Face — verified before listing:
-        //  - Checkpoint (not a LoRA/embedding), base model "SD 1.5 Hyper" (standard SD 1.5
-        //    architecture, same UNet/CLIP/VAE shapes the app already runs).
-        //  - Model-level flags: nsfw=false, poi=false, minor=false, sfwOnly=false — Civitai's
-        //    own moderation classifies it general-audience. It is still an uncensored base
-        //    checkpoint like the SD 1.5 entry above, so the app's own ContentSafety /
-        //    ImageSafetyAnalyzer layers are what actually bound output, not this flag.
-        //  - File passed Civitai's pickle and virus scans ("No Pickle imports" — pure tensor
-        //    data, nothing executable).
-        //  - Byte size (2,132,625,894) confirmed directly from the CDN's `Content-Range`
-        //    header, not just the catalog API's rounded `sizeKB` — matches exactly.
-        //  - `fileNameOverride` is required here: Civitai's download endpoint is
-        //    `/api/download/models/{versionId}`, which carries no filename of its own — the
-        //    real name only ever appears in the response's `Content-Disposition` header. See
-        //    the doc comment on `fileNameOverride` above.
+        
         CatalogModel(
             id: "realistic-vision-v6-b1-hyper-vae",
             kind: .diffusion,
@@ -191,6 +235,8 @@ enum ModelCatalog {
             summary: "Photorealistic portraits and scenes. One of the most widely used SD 1.5 checkpoints on Civitai, tuned for good results in as few as 4–6 steps and with a VAE already baked in.",
             url: URL(string: "https://civitai.com/api/download/models/501240?fileId=418901")!,
             approxRuntimeGB: 3.5,
+            minimumRAMGB: 8.0,
+            minimumDevice: "minimum iPhone 15 Pro / 16 or newer",
             fileNameOverride: "realisticVisionV60B1_v51HyperVAE.safetensors"
         )
     ]
@@ -227,6 +273,8 @@ final class ModelDownloadManager: NSObject, ObservableObject {
         var fractionCompleted: Double
         var bytesWritten: Int64
         var totalBytes: Int64
+        /// True when this transfer picked up from a saved partial rather than starting over.
+        var isResumed: Bool = false
 
         var writtenDescription: String {
             ByteCountFormatter.string(fromByteCount: bytesWritten, countStyle: .file)
@@ -241,6 +289,15 @@ final class ModelDownloadManager: NSObject, ObservableObject {
     /// Set when a download finishes so the UI can advance without polling the filesystem.
     @Published private(set) var lastCompletedModelID: String?
 
+    /// Catalog IDs with a partial transfer saved on disk that can be picked up where it stopped.
+    ///
+    /// Before this existed, *any* interruption — a dropped connection, the user tapping Cancel, iOS
+    /// terminating the app, or an app update landing mid-transfer — threw away every byte and
+    /// started the next attempt from zero. On a 2 GB checkpoint over a phone connection that is the
+    /// difference between a download that eventually finishes and one that never does, and it is
+    /// the most likely thing behind "I have to download the model again after every update".
+    @Published private(set) var resumableModelIDs: Set<String> = []
+
     /// Off by default. A ~1 GB download on a metered plan is not something to start on the
     /// user's behalf without an explicit opt-in.
     @Published var allowsCellularDownload: Bool = UserDefaults.standard.bool(forKey: "allowsCellularDownload") {
@@ -254,6 +311,9 @@ final class ModelDownloadManager: NSObject, ObservableObject {
     private var session: URLSession!
     private var currentTask: URLSessionDownloadTask?
     private var currentModel: CatalogModel?
+    /// Whether the in-flight task was created from saved resume data. Read by `finish(with:)` to
+    /// tell a stale resume blob apart from an ordinary network failure.
+    private var isResumedTask = false
 
     private override init() {
         super.init()
@@ -263,6 +323,7 @@ final class ModelDownloadManager: NSObject, ObservableObject {
         configuration.sessionSendsLaunchEvents = true
         configuration.waitsForConnectivity = true
         session = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
+        resumableModelIDs = Self.savedResumableModelIDs()
     }
 
     var isDownloading: Bool { active != nil }
@@ -303,32 +364,108 @@ final class ModelDownloadManager: NSObject, ObservableObject {
         }
 
         AppFiles.prepare()
+        start(model, resuming: Self.savedResumeData(for: model))
+    }
 
-        var request = URLRequest(url: model.url)
-        request.allowsCellularAccess = allowsCellularDownload
-        request.allowsExpensiveNetworkAccess = allowsCellularDownload
-        request.timeoutInterval = 60
-
-        let task = session.downloadTask(with: request)
+    /// Creates and starts the task, from saved resume data when there is any.
+    ///
+    /// `resumeData` is opaque and can be rejected by the system — it goes stale if the server no
+    /// longer supports the byte range, if the temporary file behind it has been reclaimed, or
+    /// simply if too much time has passed. That failure arrives as an ordinary task error rather
+    /// than a throw, so `finish(with:)` handles it by discarding the partial and saying the
+    /// download restarted, instead of leaving the user stuck retrying a resume that can never work.
+    private func start(_ model: CatalogModel, resuming resumeData: Data?) {
+        let task: URLSessionDownloadTask
+        if let resumeData {
+            task = session.downloadTask(withResumeData: resumeData)
+            isResumedTask = true
+            LogManager.shared.log("ModelDownload: resuming \(model.displayName)")
+        } else {
+            var request = URLRequest(url: model.url)
+            request.allowsCellularAccess = allowsCellularDownload
+            request.allowsExpensiveNetworkAccess = allowsCellularDownload
+            request.timeoutInterval = 60
+            task = session.downloadTask(with: request)
+            isResumedTask = false
+            LogManager.shared.log("ModelDownload: starting \(model.displayName) (\(model.sizeDescription))")
+        }
         task.countOfBytesClientExpectsToReceive = model.byteSize
 
         currentTask = task
         currentModel = model
-        active = Progress(modelID: model.id, kind: model.kind, fractionCompleted: 0, bytesWritten: 0, totalBytes: model.byteSize)
-
-        LogManager.shared.log("ModelDownload: starting \(model.displayName) (\(model.sizeDescription))")
+        active = Progress(
+            modelID: model.id,
+            kind: model.kind,
+            fractionCompleted: 0,
+            bytesWritten: 0,
+            totalBytes: model.byteSize,
+            isResumed: resumeData != nil
+        )
         task.resume()
     }
 
+    /// Stops the transfer but keeps what has already been fetched, so tapping Get again picks up
+    /// where this left off. Use `discardPartial(for:)` to throw the bytes away instead.
     func cancel() {
-        currentTask?.cancel()
+        guard let task = currentTask, let model = currentModel else { return }
+        // Goes through the singleton rather than capturing `self`: this callback is delivered on a
+        // background queue and outlives the call, and reaching back through `shared` keeps that
+        // free of a cross-actor capture instead of relying on one being tolerated.
+        task.cancel { resumeData in
+            Task { @MainActor in
+                let manager = ModelDownloadManager.shared
+                if let resumeData {
+                    Self.saveResumeData(resumeData, for: model)
+                    manager.resumableModelIDs.insert(model.id)
+                    LogManager.shared.log("ModelDownload: paused \(model.displayName), \(ByteCountFormatter.string(fromByteCount: Int64(resumeData.count), countStyle: .file)) of resume state kept")
+                } else {
+                    LogManager.shared.log("ModelDownload: cancelled \(model.displayName) — the server didn't support resuming")
+                }
+            }
+        }
         currentTask = nil
         currentModel = nil
         active = nil
-        LogManager.shared.log("ModelDownload: cancelled by user")
+    }
+
+    /// Throws away a saved partial transfer. Offered next to the resume affordance so a user who
+    /// changed their mind isn't stuck carrying a gigabyte of a model they no longer want.
+    func discardPartial(for model: CatalogModel) {
+        Self.deleteResumeData(for: model)
+        resumableModelIDs.remove(model.id)
+        LogManager.shared.log("ModelDownload: discarded partial download of \(model.displayName)")
     }
 
     func clearError() { lastError = nil }
+
+    // MARK: Resume state
+
+    /// Resume blobs live beside partial downloads, in the directory that already exists for
+    /// exactly this purpose and is already excluded from backup.
+    private static func resumeFileURL(for modelID: String) -> URL {
+        AppFiles.downloadsInProgress.appendingPathComponent("\(modelID).resume")
+    }
+
+    private static func savedResumeData(for model: CatalogModel) -> Data? {
+        try? Data(contentsOf: resumeFileURL(for: model.id))
+    }
+
+    private static func saveResumeData(_ data: Data, for model: CatalogModel) {
+        AppFiles.createIfNeeded(AppFiles.downloadsInProgress)
+        let url = resumeFileURL(for: model.id)
+        try? data.write(to: url, options: .atomic)
+        AppFiles.excludeFromBackup(url)
+    }
+
+    private static func deleteResumeData(for model: CatalogModel) {
+        try? FileManager.default.removeItem(at: resumeFileURL(for: model.id))
+    }
+
+    private static func savedResumableModelIDs() -> Set<String> {
+        let files = AppFiles.contents(of: AppFiles.downloadsInProgress, matchingExtensions: ["resume"])
+        let known = Set(ModelCatalog.all.map(\.id))
+        return Set(files.map { ($0.lastPathComponent as NSString).deletingPathExtension }.filter(known.contains))
+    }
 
     // MARK: Verification
 
@@ -424,6 +561,17 @@ extension ModelDownloadManager: URLSessionDownloadDelegate {
                 try FileManager.default.moveItem(at: temporaryCopy, to: destination)
                 AppFiles.excludeFromBackup(destination)
 
+                // The partial is worthless now, and the ledger entry is what lets the app tell the
+                // user *which* model vanished if this device is ever restored without it.
+                Self.deleteResumeData(for: model)
+                self.resumableModelIDs.remove(model.id)
+                ModelInventory.shared.record(
+                    fileName: model.fileName,
+                    kind: model.kind,
+                    catalogID: model.id,
+                    byteSize: model.byteSize
+                )
+
                 LogManager.shared.log("ModelDownload: installed \(model.fileName)")
                 self.lastCompletedModelID = model.id
                 self.finish(with: nil)
@@ -439,9 +587,22 @@ extension ModelDownloadManager: URLSessionDownloadDelegate {
                                 didCompleteWithError error: Error?) {
         guard let error else { return }   // success is handled in didFinishDownloadingTo
         let nsError = error as NSError
-        // A user-initiated cancel is not a failure worth surfacing as one.
+        // A user-initiated cancel is not a failure worth surfacing as one, and its resume data
+        // arrives through `cancel(byProducingResumeData:)` rather than here.
         guard nsError.code != NSURLErrorCancelled else { return }
-        Task { @MainActor in self.finish(with: error) }
+
+        // The bytes already fetched are salvageable whenever the system hands back resume state —
+        // a dropped connection nine-tenths of the way through a 2 GB checkpoint should cost the
+        // remaining tenth, not the whole thing.
+        let resumeData = nsError.userInfo[NSURLSessionDownloadTaskResumeData] as? Data
+
+        Task { @MainActor in
+            if let resumeData, let model = self.currentModel {
+                Self.saveResumeData(resumeData, for: model)
+                self.resumableModelIDs.insert(model.id)
+            }
+            self.finish(with: error, producedResumeData: resumeData != nil)
+        }
     }
 
     nonisolated func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
@@ -452,19 +613,38 @@ extension ModelDownloadManager: URLSessionDownloadDelegate {
     }
 
     @MainActor
-    private func finish(with error: Error?) {
-        if let error {
-            let nsError = error as NSError
-            if nsError.domain == NSURLErrorDomain,
-               nsError.code == NSURLErrorDataNotAllowed || nsError.code == NSURLErrorInternationalRoamingOff {
-                lastError = "This download needs Wi-Fi. Connect to Wi-Fi, or turn on cellular downloads first."
-            } else {
-                lastError = error.localizedDescription
-            }
-            LogManager.shared.log("ModelDownload: failed — \(error.localizedDescription)")
-        }
+    private func finish(with error: Error?, producedResumeData: Bool = false) {
+        let model = currentModel
+        let bytesWritten = active?.bytesWritten ?? 0
+        let wasResumed = isResumedTask
+
         active = nil
         currentTask = nil
         currentModel = nil
+        isResumedTask = false
+
+        guard let error else { return }
+
+        // Stale resume state: the task was built from a saved partial, produced nothing, and the
+        // system declined to give any back. Retrying would fail identically every time, so drop it
+        // and start over once rather than stranding the model behind a permanently broken resume.
+        if wasResumed, !producedResumeData, bytesWritten == 0, let model {
+            Self.deleteResumeData(for: model)
+            resumableModelIDs.remove(model.id)
+            LogManager.shared.log("ModelDownload: saved partial for \(model.displayName) was no longer usable — restarting from the beginning")
+            start(model, resuming: nil)
+            return
+        }
+
+        let nsError = error as NSError
+        if nsError.domain == NSURLErrorDomain,
+           nsError.code == NSURLErrorDataNotAllowed || nsError.code == NSURLErrorInternationalRoamingOff {
+            lastError = "This download needs Wi-Fi. Connect to Wi-Fi, or turn on cellular downloads first."
+        } else if producedResumeData {
+            lastError = "\(error.localizedDescription) Your progress was kept — tap Resume to carry on from where it stopped."
+        } else {
+            lastError = error.localizedDescription
+        }
+        LogManager.shared.log("ModelDownload: failed — \(error.localizedDescription)")
     }
 }

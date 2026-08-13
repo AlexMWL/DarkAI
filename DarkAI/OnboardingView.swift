@@ -219,15 +219,18 @@ struct OnboardingView: View {
                     .foregroundColor(.green)
                     .font(.system(size: 20))
             } else {
+                // A partial transfer survives being interrupted, including by the app being killed
+                // mid-download during setup — offer to continue it rather than silently restarting.
+                let isResumable = downloads.resumableModelIDs.contains(model.id)
                 Button {
                     downloads.download(model)
                 } label: {
-                    Text("Get")
+                    Text(isResumable ? "Resume" : "Get")
                         .font(.system(size: 12, weight: .bold))
                         .foregroundColor(Theme.onAccent)
                         .padding(.horizontal, 16)
                         .padding(.vertical, 7)
-                        .background(RoundedRectangle(cornerRadius: 8).fill(Theme.accent))
+                        .background(RoundedRectangle(cornerRadius: 8).fill(isResumable ? Color.orange : Theme.accent))
                 }
             }
         }
@@ -239,7 +242,7 @@ struct OnboardingView: View {
 
     private func downloadProgressCard(_ progress: ModelDownloadManager.Progress) -> some View {
         VStack(spacing: 12) {
-            Text("Downloading…")
+            Text(progress.isResumed ? "Resuming…" : "Downloading…")
                 .font(.system(size: 14, weight: .semibold))
                 .foregroundColor(Theme.textPrimary)
 
@@ -250,14 +253,14 @@ struct OnboardingView: View {
                 .font(.system(size: 11, design: .monospaced))
                 .foregroundColor(Theme.textSecondary)
 
-            Text("You can leave the app — the download continues in the background.")
+            Text("You can leave the app — the download continues in the background, and picks up where it left off if it's interrupted.")
                 .font(.system(size: 11))
                 .foregroundColor(Theme.textMuted)
                 .multilineTextAlignment(.center)
 
-            Button("Cancel Download") { downloads.cancel() }
+            Button("Pause Download") { downloads.cancel() }
                 .font(.system(size: 12, weight: .semibold))
-                .foregroundColor(.red.opacity(0.9))
+                .foregroundColor(.orange)
         }
         .padding(16)
         .frame(maxWidth: .infinity)
@@ -331,9 +334,16 @@ struct OnboardingView: View {
             .disabled(!canAdvance)
 
             if page == 3 && !installedAModel {
+                // Padding plus an explicit hit shape, because a bare `Button(_:)` is tappable only
+                // across the glyphs themselves — a 16 pt-tall target sitting directly under a
+                // paged `TabView`, which reliably swallowed the first tap. This is the escape
+                // hatch from a required setup step, so it has to work the first time.
                 Button("Set this up later") { complete() }
                     .font(.system(size: 13))
                     .foregroundColor(Theme.textMuted)
+                    .padding(.horizontal, 24)
+                    .padding(.vertical, 10)
+                    .contentShape(Rectangle())
             }
         }
     }
@@ -384,6 +394,12 @@ struct OnboardingView: View {
             }
             try FileManager.default.copyItem(at: source, to: destination)
             AppFiles.excludeFromBackup(destination)
+            ModelInventory.shared.record(
+                fileName: destination.lastPathComponent,
+                kind: .chat,
+                catalogID: ModelCatalog.model(withFileName: destination.lastPathComponent)?.id,
+                byteSize: (try? destination.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init) ?? 0
+            )
             installedAModel = true
             OnboardingHandoff.requestAutoLoad(fileName: destination.lastPathComponent)
             LogManager.shared.log("Onboarding: imported \(destination.lastPathComponent), queued for auto-load")

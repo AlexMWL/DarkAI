@@ -32,6 +32,11 @@ struct ContentView: View {
     @State private var notice: Notice? = nil
     @State private var reportTarget: ChatMessage? = nil
 
+    /// Set when the user taps Export on a chat in the drawer. Holds a snapshot rather than an ID
+    /// so the sheet renders the conversation as it was at the moment it was opened, even if
+    /// generation is still streaming into the live one behind it.
+    @State private var conversationToExport: Conversation? = nil
+
     // Crash recovered from the previous run, offered once on launch
     /// Crash recovered from the previous run, shown as a dismissible banner.
     @State private var recoveredCrash: CrashReporter.Report? = nil
@@ -72,6 +77,12 @@ struct ContentView: View {
                                 }
                             }
                             .padding()
+                            // Centred column on wide layouts. See `Layout.contentMaxWidth` — this
+                            // is a no-op on every iPhone and on an 11-inch iPad in portrait, and
+                            // stops a reply being set as one line per sentence across a landscape
+                            // iPad.
+                            .frame(maxWidth: Layout.contentMaxWidth)
+                            .frame(maxWidth: .infinity)
                         }
                         // Keyboard Dismissal by Dragging List
                         .gesture(
@@ -152,7 +163,11 @@ struct ContentView: View {
                                 .stroke(Color.orange.opacity(0.5), lineWidth: 1))
                     )
                     .padding(.horizontal, 16)
-                    .padding(.top, 12)
+                    // Clears the header rather than landing on top of it. This overlay is a
+                    // separate ZStack child, so it is still safe-area inset while the chat column
+                    // is not — the header's own height has to be added back. See
+                    // `Layout.belowHeaderPadding`, which derives it instead of guessing.
+                    .padding(.top, Layout.belowHeaderPadding)
                     Spacer()
                 }
                 .transition(.move(edge: .top).combined(with: .opacity))
@@ -213,6 +228,14 @@ struct ContentView: View {
                 showAutoLoadAlert = true
             }
         }
+        .sheet(item: $conversationToExport) { conversation in
+            // The same cleanup the chat view applies before drawing a response — an export that
+            // reintroduced `<think>` blocks the user never saw would not be a transcript of the
+            // conversation they actually had.
+            ConversationExportSheet(conversation: conversation) { text in
+                filterThoughts(from: text, stripMarkdown: personalityManager.isMature)
+            }
+        }
         .sheet(item: $reportTarget) { message in
             ReportContentView(
                 content: message.imageData != nil ? "" : message.text,
@@ -255,7 +278,7 @@ struct ContentView: View {
     
     // Custom Navigation Header View
     private var customHeaderView: some View {
-        HStack(spacing: 16) {
+        HStack(spacing: 14) {
             // Left: Sidebar Toggle
             Button(action: {
                 withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
@@ -268,9 +291,10 @@ struct ContentView: View {
                     .frame(width: 44, height: 44)
                     .contentShape(Rectangle())
             }
-            
+            .accessibilityLabel("Conversations")
+
             // Center: Futuristic title
-            Spacer()
+            Spacer(minLength: 0)
             HStack(spacing: 4) {
                 Text("DARK")
                     .font(.system(size: 20, weight: .black))
@@ -281,10 +305,15 @@ struct ContentView: View {
                     .neonGlow(color: Theme.accent, radius: 4)
             }
             .kerning(1.5)
-            Spacer()
-            
+            .lineLimit(1)
+            // Last resort before truncation on the narrowest devices — a shrunken wordmark still
+            // reads as the app's name, "DARK…" does not.
+            .minimumScaleFactor(0.75)
+            .layoutPriority(1)
+            Spacer(minLength: 0)
+
             // Right: Status indicator pill + Gear icon
-            HStack(spacing: 12) {
+            HStack(spacing: 10) {
                 // Connection Status Pill
                 HStack(spacing: 6) {
                     Circle()
@@ -296,10 +325,16 @@ struct ContentView: View {
                                 pulseActive = true
                             }
                         }
-                    
+
+                    // `lineLimit(1)` + `fixedSize()` is what stopped this reading "OFFLIN / E" on
+                    // an iPhone SE. The pill now refuses to be compressed, and the wordmark's
+                    // `minimumScaleFactor` above gives way instead — which is the right order of
+                    // precedence, and needs no knowledge of how wide the screen is.
                     Text(isModelActive ? "READY" : "OFFLINE")
                         .font(.system(size: 10, weight: .bold, design: .monospaced))
                         .foregroundColor(isModelActive ? .green : Theme.textSecondary)
+                        .lineLimit(1)
+                        .fixedSize()
                 }
                 .padding(.horizontal, 10)
                 .padding(.vertical, 6)
@@ -311,7 +346,8 @@ struct ContentView: View {
                                 .stroke(isModelActive ? Color.green.opacity(0.3) : Theme.border, lineWidth: 1)
                         )
                 )
-                
+                .accessibilityLabel(isModelActive ? "Model ready" : "No model loaded")
+
                 // Settings button
                 Button(action: { showSettings = true }) {
                     Image(systemName: "gearshape.fill")
@@ -319,11 +355,15 @@ struct ContentView: View {
                         .font(.system(size: 18))
                         .frame(width: 32, height: 32)
                 }
+                .accessibilityLabel("Settings")
             }
+            .fixedSize(horizontal: true, vertical: false)
         }
         .padding(.horizontal, 12)
-        .padding(.top, 48) // Account for safe area
-        .padding(.bottom, 12)
+        // The device-dependent part of this is the safe-area inset the column already has; this is
+        // only the gap above the header's own content. See `Layout` for why it must stay a constant.
+        .padding(.top, Layout.barTopPadding)
+        .padding(.bottom, Layout.barBottomPadding)
         .background(
             Theme.chrome
                 .overlay(
@@ -399,6 +439,18 @@ struct ContentView: View {
     /// than the chat model, which is unloaded throughout.
     private var diffusionBusy: Bool {
         diffusionManager.isGenerating || diffusionManager.isFinishingCancelledRun
+    }
+
+    /// Whether either engine is parked on an error the user can be got out of.
+    ///
+    /// Not shown while something is actively running: a stale failure from a previous attempt is
+    /// still on screen during the next one, and offering to tear down a load in progress is how a
+    /// user turns a recovering app back into a broken one.
+    private var needsRecovery: Bool {
+        guard !diffusionBusy, !llmManager.isGenerating else { return false }
+        if case .failed = llmManager.loadState { return true }
+        if case .failed = diffusionManager.diffusionLoadState { return true }
+        return false
     }
 
     /// Diffusion checkpoint driving the current generation.
@@ -481,11 +533,20 @@ struct ContentView: View {
             case .failed(let error):
                 Text(error)
                     .foregroundColor(Theme.accent)
-                    .lineLimit(2)
+                    .lineLimit(3)
             }
             }
 
-            Spacer()
+            Spacer(minLength: 6)
+
+            // Recovery, right next to the failure that needs it. Every state this bar can report
+            // as `.failed` — a memory warning that unloaded the model, an image generation that
+            // evicted the chat model and then couldn't load the checkpoint — used to leave
+            // force-quitting as the only way forward.
+            if needsRecovery {
+                ResetModelsButton(llmManager: llmManager, diffusionManager: diffusionManager, compact: true)
+                    .fixedSize()
+            }
         }
         .font(.system(size: 12))
         .padding(.horizontal, 16)
@@ -503,14 +564,35 @@ struct ContentView: View {
     // Welcome / empty conversation view
     @ViewBuilder
     private var emptyStateView: some View {
-        VStack(spacing: 18) {
-            Spacer()
+        // Scrollable, and that is a keyboard fix rather than a scrolling feature.
+        //
+        // As a plain `VStack` this had a minimum height of roughly 400 pt — the welcome panel is
+        // fixed-size content and `Spacer`s can only collapse to zero around it. Add the header,
+        // banners, status strip, and input row and the column's minimum came to about 720 pt. On an
+        // iPhone SE the keyboard leaves 376 pt. When SwiftUI cannot shrink a column into the space
+        // the keyboard leaves, it slides it instead: the header went off the top of the screen and
+        // the input row — the one thing that must stay visible while typing — went underneath the
+        // keyboard.
+        //
+        // Inside a `ScrollView` the region's minimum height is zero, so the column always fits and
+        // the input row stays put. `minHeight` keeps the panel vertically centred whenever there is
+        // room, which is how it looked before, and it simply scrolls when there isn't.
+        GeometryReader { proxy in
+            ScrollView {
+                VStack(spacing: 18) {
+                    Spacer(minLength: 0)
 
-            welcomePanel
+                    welcomePanel
 
-            Spacer()
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 20)
+                .frame(maxWidth: Layout.contentMaxWidth)
+                .frame(maxWidth: .infinity, minHeight: proxy.size.height)
+            }
+            .scrollBounceBehavior(.basedOnSize)
+            .scrollDismissesKeyboard(.interactively)
         }
-        .padding(.horizontal, 20)
     }
 
     /// The welcome copy and its shade panel. Split out from `emptyStateView` so the panel wraps
@@ -567,8 +649,33 @@ struct ContentView: View {
     }
     
     // Indicator pills
+    //
+    // Horizontally scrollable rather than a plain `HStack`. Laid out flat, the strip needs roughly
+    // 390 pt with everything showing and about 460 pt once the TRUNCATING pill appears — so on an
+    // SE (375 pt) it was already clipping the context and token counters, and on a 15 Pro the
+    // truncation warning pushed them off too. A `Spacer` between the groups made it worse by
+    // guaranteeing the overflow landed on the right-hand readouts, which are the numbers most worth
+    // watching. Scrolling keeps every pill at full size and legible on every device; on wide screens
+    // the content simply doesn't fill the row and nothing scrolls.
     @ViewBuilder
     private var activeParametersIndicator: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            statusPills
+                .padding(.vertical, 8)
+                .padding(.horizontal, 16)
+        }
+        .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
+        .background(Theme.chrome)
+        .overlay(
+            Rectangle()
+                .frame(height: 1)
+                .foregroundColor(Theme.border),
+            alignment: .top
+        )
+    }
+
+    @ViewBuilder
+    private var statusPills: some View {
         HStack(spacing: 12) {
             if conversationManager.privateMode {
                 HStack(spacing: 4) {
@@ -586,9 +693,14 @@ struct ContentView: View {
                 .font(.system(size: 9, weight: .bold))
                 .foregroundColor(.green)
             }
-            
-            Spacer()
-            
+
+            // Was a `Spacer`, which is meaningless inside a horizontal scroll view — it has no
+            // width to expand into. A rule keeps the visual break between "where this chat is
+            // stored" and "what the model is doing" that the gap used to provide.
+            Rectangle()
+                .fill(Theme.border)
+                .frame(width: 1, height: 10)
+
             if enableRAG {
                 Text("RAG")
                     .font(.system(size: 9, weight: .bold))
@@ -636,231 +748,19 @@ struct ContentView: View {
                     .foregroundColor(Theme.textSecondary)
             }
         }
-        .padding(.vertical, 8)
-        .padding(.horizontal, 16)
-        .background(Theme.chrome)
-        .overlay(
-            Rectangle()
-                .frame(height: 1)
-                .foregroundColor(Theme.border),
-            alignment: .top
-        )
+        // Each pill keeps its ideal width. Without this the scroll view would still be free to
+        // compress a `Text` that has somewhere to truncate to, which is the behaviour being fixed.
+        .fixedSize(horizontal: true, vertical: false)
     }
-    
+
+
     // MARK: - Output Filtering
+
+    /// Forwards to `ModelOutput.filterThoughts`, which is where this logic now lives so the
+    /// exporter and the image-prompt writer can apply the identical cleanup. Kept as a method so
+    /// the several call sites in this file read the same as they always did.
     private func filterThoughts(from text: String, stripMarkdown: Bool = false) -> String {
-        var filtered = text
-
-        // --- 0. Strip format-agnostic reasoning/channel blocks ---
-        // Some models (gpt-oss, certain Gemma fine-tunes) use a "channel" convention with
-        // no matching close tag at all — e.g. <|channel|>analysis<|message|> ... reasoning ...
-        // <|channel|>final<|message|> — where analysis only ends when a new non-reasoning
-        // channel begins. The fixed open/close tag pairs in step 1 below can't express that,
-        // so this keys off vocabulary inside any bracketed tag (<tag>, </tag>, <|tag|>) and
-        // exits on whichever comes first: a real close tag, or a transition to a
-        // final/message/response/answer channel.
-        let reasoningOpenPattern = "<\\|?\\s*(think|thought|thinking|reflect|reason|channel|analysis|internal|scratchpad|deliberat)"
-        let reasoningClosePattern = "</\\s*(think|thought|thinking|reflect|reflection|reason|reasoning|channel|analysis|internal|scratchpad|deliberation)\\s*>"
-        let transitionPattern = "<\\|?/?\\s*(final|message|response|answer)[a-z]*\\s*\\|?>"
-        if let openRegex = try? NSRegularExpression(pattern: reasoningOpenPattern, options: [.caseInsensitive]),
-           let closeRegex = try? NSRegularExpression(pattern: reasoningClosePattern, options: [.caseInsensitive]),
-           let transitionRegex = try? NSRegularExpression(pattern: transitionPattern, options: [.caseInsensitive]) {
-            while let openMatch = openRegex.firstMatch(in: filtered, range: NSRange(filtered.startIndex..., in: filtered)),
-                  let openRange = Range(openMatch.range, in: filtered) {
-                let searchRange = NSRange(openRange.upperBound..., in: filtered)
-                let closeEnd = closeRegex.firstMatch(in: filtered, range: searchRange).flatMap { Range($0.range, in: filtered)?.upperBound }
-                let transEnd = transitionRegex.firstMatch(in: filtered, range: searchRange).flatMap { Range($0.range, in: filtered)?.upperBound }
-
-                let end: String.Index?
-                switch (closeEnd, transEnd) {
-                case let (c?, t?): end = min(c, t)
-                case let (c?, nil): end = c
-                case let (nil, t?): end = t
-                default: end = nil
-                }
-
-                if let end {
-                    filtered.removeSubrange(openRange.lowerBound..<end)
-                } else {
-                    filtered.removeSubrange(openRange.lowerBound..<filtered.endIndex)
-                    break
-                }
-            }
-        }
-
-        // --- 1. Strip XML-style thinking/correction/reflection tags ---
-        // Covers Gemma, Qwen, DeepSeek, Llama, and other instruct model variants
-        let xmlTags = [
-            "think", "thinking", "thought", "thoughts",
-            "channel thought", "channel thoughts", "channel>thought",
-            "|channel>thought", "self-correction", "self_correction",
-            "correction", "reflection", "reasoning", "internal"
-        ]
-        // Longest tag first: "<think" is a prefix of "<thinking", so checking "think" first
-        // matched the opening of a `<thinking>` block and then failed to find its `</think>`
-        // close, deleting the entire rest of the message.
-        for tag in xmlTags.sorted(by: { $0.count > $1.count }) {
-            while let startRange = filtered.range(of: "<\(tag)", options: .caseInsensitive) {
-                // The close tag is searched for strictly *after* the open tag.
-                //
-                // Searching the whole string was a crash: a stray "</think>" ahead of the
-                // "<think>" (models do emit unbalanced tags) produced an end bound lower than
-                // the start bound, and `lowerBound..<upperBound` traps when inverted —
-                // "Fatal error: Range requires lowerBound <= upperBound", an uncatchable
-                // SIGTRAP on a function that runs over every response and every streamed token.
-                if let endRange = filtered.range(of: "</\(tag)>",
-                                                 options: .caseInsensitive,
-                                                 range: startRange.upperBound..<filtered.endIndex) {
-                    filtered.removeSubrange(startRange.lowerBound..<endRange.upperBound)
-                } else {
-                    filtered.removeSubrange(startRange.lowerBound..<filtered.endIndex)
-                    break
-                }
-            }
-        }
-        
-        // Strip pipe-delimited thinking tokens used by some models
-        let pipeTokens = ["<|thinking|>", "<|/thinking|>", "<|thought|>", "<|/thought|>"]
-        for token in pipeTokens {
-            filtered = filtered.replacingOccurrences(of: token, with: "", options: .caseInsensitive)
-        }
-        
-        // --- 2. Strip plaintext preamble headers ---
-        let plaintextHeaders = ["Thinking Process:", "Thought Process:", "Internal Reasoning:", "Chain of Thought:"]
-        for header in plaintextHeaders {
-            while let startRange = filtered.range(of: header, options: .caseInsensitive) {
-                // Same inverted-range crash as the tag loop above, and far easier to hit here:
-                // any reply that says "Response:" before "Thinking Process:" — entirely
-                // ordinary phrasing — produced an inverted range and trapped. Bound the search
-                // to the text after the header so the end can never precede the start.
-                if let endRange = filtered.range(of: "Response:",
-                                                 options: .caseInsensitive,
-                                                 range: startRange.upperBound..<filtered.endIndex) {
-                    filtered.removeSubrange(startRange.lowerBound..<endRange.upperBound)
-                } else {
-                    filtered.removeSubrange(startRange.lowerBound..<filtered.endIndex)
-                    break
-                }
-            }
-        }
-        
-        // --- 3. Strip exact known artifact strings ---
-        let exactArtifacts = [
-            "<|im_start|>", "<|im_end|>", "<|start_of_turn|>", "<|end_of_turn|>"
-        ]
-        for artifact in exactArtifacts {
-            filtered = filtered.replacingOccurrences(of: artifact, with: "", options: .caseInsensitive)
-        }
-
-        // --- 3b. Strip bare (untagged) scaffolding/preamble blocks ---
-        // Some fine-tunes open every reply with meta-commentary about how they plan to
-        // respond — style/tone "checks," headers like "My internal monologue:", decorative
-        // "***" separators, or literal placeholder text like "(Generating response...)" —
-        // with no tag structure at all, and wording that varies message to message. Match
-        // the recurring *shapes* instead of specific wording: a slash-command header, a
-        // decorative "***" line, any bold/italic header ending in a colon, or known
-        // self-referential/stage-direction phrases in other wrappers. These have no
-        // reliable close tag, so the next blank line is treated as the block's end —
-        // scoped to near the start of the message only, so a legitimate bolded header
-        // later in a well-formed answer is never touched.
-        let bareLabelPattern = "(?:^|\\n)\\s*(?:" +
-            "\\*{3,}|" +
-            "/[A-Za-z][A-Za-z ]{2,29}:|" +
-            "\\*{1,2}[A-Za-z][A-Za-z ,]{2,39}:\\*{0,2}|" +
-            "[\\*\"'\\[\\(]{1,2}\\s*(?:self[- _]?correction|self[- _]?review|internal monologue|internal reasoning|response generation|chain of thought|style check|tone check|voice check|persona check|vibe check|character check|generating response|generating\\.\\.\\.)" +
-            ")"
-        if let bareLabelRegex = try? NSRegularExpression(pattern: bareLabelPattern, options: [.caseInsensitive]) {
-            var guardIterations = 0
-            while guardIterations < 20,
-                  let openMatch = bareLabelRegex.firstMatch(in: filtered, range: NSRange(filtered.startIndex..., in: filtered)),
-                  let openRange = Range(openMatch.range, in: filtered),
-                  filtered.distance(from: filtered.startIndex, to: openRange.lowerBound) < 600 {
-                guardIterations += 1
-                if let blankRange = filtered.range(of: "\n\n", range: openRange.upperBound..<filtered.endIndex) {
-                    filtered.removeSubrange(openRange.lowerBound..<blankRange.upperBound)
-                } else {
-                    filtered.removeSubrange(openRange.lowerBound..<filtered.endIndex)
-                    break
-                }
-            }
-        }
-        
-        // --- 4. Strip leading role-echo preamble (model parroting its own role prefix) ---
-        let leadingPreambles = ["assistant:", "response:", "answer:", "a:"]
-        var didTrimLeading = true
-        while didTrimLeading {
-            didTrimLeading = false
-            let trimmedLower = filtered.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            for preamble in leadingPreambles {
-                if trimmedLower.hasPrefix(preamble) {
-                    filtered = String(filtered.trimmingCharacters(in: .whitespacesAndNewlines).dropFirst(preamble.count))
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
-                    didTrimLeading = true
-                    break
-                }
-            }
-        }
-        
-        // --- 5. Strip personality system-prompt leak via regex ---
-        if let regex = try? NSRegularExpression(
-            pattern: "\\(?(?:Critical Instructions?|User Style Matrix|Communication Style Note)[\\s\\S]*?fr\\.?\\)?",
-            options: [.caseInsensitive, .dotMatchesLineSeparators]
-        ) {
-            filtered = regex.stringByReplacingMatches(
-                in: filtered,
-                options: [],
-                range: NSRange(location: 0, length: filtered.utf16.count),
-                withTemplate: ""
-            ).trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        
-        // --- 6. Markdown stripping (mature personality mode only, always preserves fenced code blocks) ---
-        if stripMarkdown {
-            var codeBlocks: [String] = []
-            var protected = filtered
-            if let codeBlockRegex = try? NSRegularExpression(pattern: "```[\\s\\S]*?```", options: []) {
-                let matches = codeBlockRegex.matches(in: protected, range: NSRange(protected.startIndex..., in: protected)).reversed()
-                for match in matches {
-                    if let range = Range(match.range, in: protected) {
-                        let block = String(protected[range])
-                        let placeholder = "CODEBLOCK_\(codeBlocks.count)_PLACEHOLDER"
-                        codeBlocks.append(block)
-                        protected.replaceSubrange(range, with: placeholder)
-                    }
-                }
-            }
-            protected = protected.replacingOccurrences(of: "**", with: "")
-            protected = protected.replacingOccurrences(of: "__", with: "")
-            let mdLines = protected.components(separatedBy: "\n").map { line -> String in
-                var l = line
-                if l.hasPrefix("### ") { l = String(l.dropFirst(4)) }
-                else if l.hasPrefix("## ") { l = String(l.dropFirst(3)) }
-                else if l.hasPrefix("# ") { l = String(l.dropFirst(2)) }
-                return l
-            }
-            protected = mdLines.joined(separator: "\n")
-            for (i, block) in codeBlocks.enumerated() {
-                protected = protected.replacingOccurrences(of: "CODEBLOCK_\(i)_PLACEHOLDER", with: block)
-            }
-            filtered = protected
-        }
-        
-        // --- 7. Strip trailing role-echo stop tokens ---
-        var finalFiltered = filtered.trimmingCharacters(in: .whitespacesAndNewlines)
-        let trailingStops = ["user", "user:", "<|im_end|>", "<start_of_turn>user", "<|user|>", "<|eot_id|>"]
-        var didTrimTrailing = true
-        while didTrimTrailing {
-            didTrimTrailing = false
-            for stop in trailingStops {
-                if finalFiltered.lowercased().hasSuffix(stop) {
-                    finalFiltered.removeLast(stop.count)
-                    finalFiltered = finalFiltered.trimmingCharacters(in: .whitespacesAndNewlines)
-                    didTrimTrailing = true
-                }
-            }
-        }
-        
-        return finalFiltered
+        ModelOutput.filterThoughts(from: text, stripMarkdown: stripMarkdown)
     }
 
     private func messageBubble(for message: ChatMessage) -> some View {
@@ -882,6 +782,9 @@ struct ContentView: View {
                         } label: {
                             Label("Copy", systemImage: "doc.on.doc")
                         }
+                        ShareLink(item: ConversationExport.shareText(for: message)) {
+                            Label("Share", systemImage: "square.and.arrow.up")
+                        }
                     }
             } else if let imgData = message.imageData, let uiImg = UIImage(data: imgData) {
                 // ── AI-Generated Image Bubble ───────────────────────────────
@@ -897,7 +800,7 @@ struct ContentView: View {
                     Image(uiImage: uiImg)
                         .resizable()
                         .scaledToFit()
-                        .frame(maxWidth: 280)
+                        .frame(maxWidth: Layout.chatImageMaxWidth)
                         .clipShape(RoundedRectangle(cornerRadius: 12))
                         .overlay(RoundedRectangle(cornerRadius: 12)
                             .stroke(Color.purple.opacity(0.35), lineWidth: 1))
@@ -1066,6 +969,9 @@ struct ContentView: View {
                             } label: {
                                 Label("Copy", systemImage: "doc.on.doc")
                             }
+                            ShareLink(item: filteredText) {
+                                Label("Share", systemImage: "square.and.arrow.up")
+                            }
                             Divider()
                             Button(role: .destructive) {
                                 reportTarget = message
@@ -1200,6 +1106,10 @@ struct ContentView: View {
             }
         }
         .padding()
+        // Matches the message column so the field lines up with the conversation above it rather
+        // than running the full width of an iPad while the text stops well short of it.
+        .frame(maxWidth: Layout.contentMaxWidth)
+        .frame(maxWidth: .infinity)
         .background(Theme.chrome)
         .overlay(
             Rectangle()
@@ -1208,7 +1118,7 @@ struct ContentView: View {
             alignment: .top
         )
     }
-    
+
     // Left-side Collapsible Sidebar Drawer
     private var sidebarDrawer: some View {
         HStack(spacing: 0) {
@@ -1245,7 +1155,7 @@ struct ContentView: View {
                             .font(.system(size: 14, weight: .bold))
                     }
                 }
-                .padding(.top, 56)
+                .padding(.top, Layout.barTopPadding + 14)
                 .padding(.horizontal)
                 
                 
@@ -1272,6 +1182,22 @@ struct ContentView: View {
                                     .frame(maxWidth: .infinity, alignment: .leading)
                                 }
                                 
+                                // Export conversation. Sits next to Delete on purpose: this is the
+                                // one place a chat can leave the device, and it should be as easy
+                                // to find as the action that destroys it.
+                                Button(action: {
+                                    conversationToExport = conversation
+                                }) {
+                                    Image(systemName: "square.and.arrow.up")
+                                        .foregroundColor(Theme.textMuted)
+                                        .font(.system(size: 12))
+                                        .frame(width: 26, height: 26)
+                                        .contentShape(Rectangle())
+                                }
+                                .accessibilityLabel("Export \(conversation.title)")
+                                .disabled(conversation.messages.isEmpty)
+                                .opacity(conversation.messages.isEmpty ? 0.35 : 1)
+
                                 // Delete conversation
                                 Button(action: {
                                     conversationManager.deleteConversation(id: conversation.id)
@@ -1279,7 +1205,10 @@ struct ContentView: View {
                                     Image(systemName: "trash")
                                         .foregroundColor(Theme.textMuted)
                                         .font(.system(size: 12))
+                                        .frame(width: 26, height: 26)
+                                        .contentShape(Rectangle())
                                 }
+                                .accessibilityLabel("Delete \(conversation.title)")
                             }
                             .padding(10)
                             .background(
@@ -1297,7 +1226,7 @@ struct ContentView: View {
                 
                 Spacer()
             }
-            .frame(width: 270)
+            .frame(width: Layout.drawerWidth)
             .background(Theme.background)
             .overlay(
                 Rectangle()
@@ -1305,8 +1234,8 @@ struct ContentView: View {
                     .foregroundColor(Theme.border),
                 alignment: .trailing
             )
-            .offset(x: showDrawer ? 0 : -270)
-            
+            .offset(x: showDrawer ? 0 : -Layout.drawerWidth)
+
             Spacer()
         }
         .ignoresSafeArea(.container, edges: [.leading, .trailing])
@@ -1649,7 +1578,7 @@ struct ContentView: View {
 
                 var finalSystemPrompt = customInstructions
                 if let activeModel = llmManager.activeModelURL?.lastPathComponent {
-                    let personality = personalityManager.getPersonality(for: activeModel)
+                    let personality = personalityManager.getPersonality()
                     if !personality.isEmpty {
                         let score = personalityManager.maturityScore
                         if score < 0.4 {
@@ -1714,13 +1643,13 @@ struct ContentView: View {
                     // Run personality analysis only after the real response is fully done,
                     // so its occasional background LLM call never delays a chat reply.
                     if enableMemories && !text.isEmpty, let activeModel = llmManager.activeModelURL?.lastPathComponent {
-                        personalityManager.analyzeUserMessage(text, modelName: activeModel, llmManager: llmManager)
+                        personalityManager.analyzeUserMessage(text, llmManager: llmManager)
                     }
                     // Capture the AI's own stated likes/dislikes/favorites from its reply
                     // (e.g. "my favorite car is a Tesla") so it stays consistent if asked
                     // again, rather than borrowing an answer from the user's own memories.
                     if enableMemories, let activeModel = llmManager.activeModelURL?.lastPathComponent {
-                        personalityManager.analyzeAssistantMessage(cleanedText, modelName: activeModel)
+                        personalityManager.analyzeAssistantMessage(cleanedText)
                     }
                 }
             }
@@ -1932,7 +1861,7 @@ struct ContentView: View {
                         conversationManager.saveConversations()
 
                         if enableMemories, let activeModel = llmManager.activeModelURL?.lastPathComponent {
-                            personalityManager.analyzeAssistantMessage(cleanedText, modelName: activeModel)
+                            personalityManager.analyzeAssistantMessage(cleanedText)
                         }
                     }
                 }

@@ -11,6 +11,11 @@ struct DarkAIApp: App {
 
     init() {
         AppFiles.prepare()
+        // Compares the record of what was installed against what is actually on disk. Model files
+        // are excluded from iCloud backup by design, so a restore or device transfer brings the
+        // app's settings back without its weights — this is what turns that from "the update
+        // deleted my model" into a named model with a re-download button. See `ModelInventory`.
+        ModelInventory.shared.reconcile()
         AppAppearance.configure()
         // Must run before anything heavy: it recovers whatever the previous run left behind and
         // arms the handlers for this one, and a crash during model loading is exactly the case

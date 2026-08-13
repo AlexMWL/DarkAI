@@ -361,13 +361,39 @@ class DiffusionManager: ObservableObject {
 
         // Resident size, not file size — an FP8 checkpoint doubles when loaded.
         let sizeGB = effectiveWeightSizeGB(at: url)
-        let safety = checkMemorySafety(modelSizeGB: sizeGB, outputSize: outputSize)
+        var safety = checkMemorySafety(modelSizeGB: sizeGB, outputSize: outputSize)
+
+        // A failing check gets one settle-and-retry before it becomes an error the user sees.
+        //
+        // This is the same problem `MemoryBudget.waitForRelease` was widened for, caught one level
+        // up. This method is reached moments after the chat model was evicted to make room, and
+        // `plannableHeadroomGB()` is computed from `phys_footprint` — which still counts buffers
+        // Metal has freed but not yet handed back. Judging on the first reading meant a checkpoint
+        // the Settings list had just labelled SAFE was refused at the moment of use, with the chat
+        // model already gone: the user was left with nothing loaded and a memory error for a model
+        // that fit. Giving the release a real chance to land first turns that into a load that
+        // simply works.
+        if case .dangerous = safety {
+            LogManager.shared.log("Diffusion pre-flight short on memory, waiting for the release to settle — \(MemoryBudget.describe())")
+            await MainActor.run {
+                self.diffusionLoadState = .loading(progress: 0.15, status: "Waiting for memory…")
+            }
+            await MemoryBudget.waitForRelease(
+                atLeastGB: memoryHeadroomNeededGB(forModelSizeGB: sizeGB, outputSize: outputSize)
+            )
+            safety = checkMemorySafety(modelSizeGB: sizeGB, outputSize: outputSize)
+        }
+
         if case .dangerous(let requiredGB, let availableGB) = safety {
             let req = String(format: "%.1f", requiredGB)
             let avail = String(format: "%.1f", availableGB)
+            // Says what to actually do about it. "Requires more than is available" on its own
+            // leaves the user with a dead end and no idea that output resolution is the lever
+            // with by far the largest effect on this number.
             let error = NSError(domain: "DiffusionManager", code: 10, userInfo: [
-                NSLocalizedDescriptionKey: "Memory Failsafe: Diffusion model requires ~\(req) GB but only \(avail) GB is safely available right now."
+                NSLocalizedDescriptionKey: "Not enough memory right now: this checkpoint needs about \(req) GB at \(outputSize)×\(outputSize) and \(avail) GB is safely available. Lowering Output Resolution in Settings is the biggest single saving; Reset Models frees anything still held."
             ])
+            LogManager.shared.log("Diffusion load refused — \(MemoryBudget.describe())")
             await MainActor.run {
                 self.diffusionLoadState = .failed(error: error.localizedDescription)
                 self.activeDiffusionURL = nil
@@ -401,7 +427,11 @@ class DiffusionManager: ObservableObject {
         }
     }
     
-    func unloadDiffusionModelAsync() async {
+    /// Returns `false` when the teardown was refused because the sampler still owns the context.
+    /// The recovery flow needs that answer — telling the user everything was freed when several
+    /// gigabytes are still resident is exactly the kind of wrong reassurance it exists to replace.
+    @discardableResult
+    func unloadDiffusionModelAsync() async -> Bool {
         let didUnload = await runner.unloadModel()
         await MainActor.run {
             // Only claim the model is gone if it actually is. Reporting `.unloaded` after a
@@ -415,6 +445,7 @@ class DiffusionManager: ObservableObject {
             self.diffusionLoadState = .unloaded
             CrashReporter.noteDiffusionModel(nil)
         }
+        return didUnload
     }
 
     // MARK: Image Generation

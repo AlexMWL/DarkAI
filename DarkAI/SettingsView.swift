@@ -20,6 +20,7 @@ struct SettingsView: View {
 
     @StateObject private var downloads = ModelDownloadManager.shared
     @StateObject private var appearance = AppearanceManager.shared
+    @StateObject private var inventory = ModelInventory.shared
 
     @State private var importedModels: [URL] = []
     @State private var storageUsedGB: Double = 0
@@ -60,7 +61,9 @@ struct SettingsView: View {
                 
                 ScrollView {
                     VStack(spacing: 24) {
-                        
+
+                        missingModelsBanner
+
                         // SECTION 1: Local Model Manager (.gguf)
                         VStack(alignment: .leading, spacing: 14) {
                             HStack {
@@ -406,7 +409,14 @@ struct SettingsView: View {
                                             .fixedSize(horizontal: false, vertical: true)
                                     }
                                 } else {
-                                    Text("Maximum for this device: \(ceiling) tokens.")
+                                    // Naming which bound is binding. "Maximum for this device"
+                                    // was wrong whenever the model, not the hardware, was the
+                                    // limit — and that is the common case, since most models are
+                                    // trained well below what a recent iPhone could allocate.
+                                    Text(llmManager.loadedTrainedContext > 0
+                                         && llmManager.loadedTrainedContext <= ceiling
+                                         ? "Maximum for this model: \(ceiling) tokens — it was trained for \(llmManager.loadedTrainedContext)."
+                                         : "Maximum for this device: \(ceiling) tokens.")
                                         .font(.system(size: 11))
                                         .foregroundColor(Theme.textMuted)
                                 }
@@ -654,7 +664,7 @@ struct SettingsView: View {
                                     .cornerRadius(6)
                             }
                             
-                            Text("\(AppInfo.displayName) gradually adapts its tone to how you write. Everything it learns stays on this device. Resetting erases all learned traits for the currently loaded model.")
+                            Text("\(AppInfo.displayName) gradually adapts its tone to how you write. It builds one profile shared by every model, and everything it learns stays on this device. Resetting erases it completely.")
                                 .font(.system(size: 13))
                                 .foregroundColor(Theme.textSecondary)
                                 .lineSpacing(4)
@@ -664,7 +674,7 @@ struct SettingsView: View {
                             }) {
                                 HStack {
                                     Image(systemName: "trash")
-                                    Text("Reset Current Model's Personality")
+                                    Text("Reset Personality")
                                 }
                                 .font(.system(size: 13, weight: .bold))
                                 .foregroundColor(Theme.textPrimary)
@@ -680,18 +690,31 @@ struct SettingsView: View {
                             .alert("Reset Personality?", isPresented: $showResetPersonalityAlert) {
                                 Button("Cancel", role: .cancel) { }
                                 Button("Reset", role: .destructive) {
-                                    if let currentModel = llmManager.activeModelURL?.lastPathComponent {
-                                        personalityManager.resetPersonality(for: currentModel)
-                                    }
+                                    personalityManager.resetPersonality()
                                 }
                             } message: {
-                                Text("This will erase all learned speech patterns for the currently loaded model. This action cannot be undone.")
+                                Text("This will erase every learned speech pattern, for all models. This action cannot be undone.")
                             }
-                            .disabled(llmManager.activeModelURL == nil)
-                            .opacity(llmManager.activeModelURL == nil ? 0.5 : 1.0)
                         }
                         .glassCard(cornerRadius: 16)
                         
+                        // Recovery. Sits ahead of Diagnostics on purpose: someone scrolling here
+                        // after an out-of-memory error wants the fix before the log of it.
+                        VStack(alignment: .leading, spacing: 14) {
+                            HStack {
+                                Image(systemName: "arrow.clockwise.circle")
+                                    .foregroundColor(Theme.accentCyan)
+                                Text("TROUBLESHOOTING")
+                                    .font(.system(size: 14, weight: .bold))
+                                    .foregroundColor(Theme.textPrimary)
+                                    .kerning(1.2)
+                                Spacer()
+                            }
+
+                            ResetModelsButton(llmManager: llmManager, diffusionManager: diffusionManager)
+                        }
+                        .glassCard(cornerRadius: 16)
+
                         // SECTION 6: Diagnostics
                         VStack(alignment: .leading, spacing: 14) {
                             HStack {
@@ -1087,6 +1110,87 @@ struct SettingsView: View {
     /// This is what keeps the app usable on a fresh install. Before it existed the only way to
     /// get a model in was to find a `.gguf` elsewhere and side-load it through Files — which is
     /// fine for the person who built the app and useless to everyone else, reviewers included.
+    /// Shown when a model the app recorded as installed is no longer on disk.
+    ///
+    /// Without this the same situation renders as an empty model list, which reads as "the update
+    /// wiped my downloads" no matter what actually happened. Naming the file, saying why it can go
+    /// missing while everything else survives, and putting the re-download one tap away is the
+    /// whole fix — the app cannot prevent the loss (excluding multi-gigabyte weights from iCloud
+    /// backup is deliberate) but it can stop it being a mystery.
+    @ViewBuilder
+    private var missingModelsBanner: some View {
+        if !inventory.missing.isEmpty {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(alignment: .top, spacing: 10) {
+                    Image(systemName: "externaldrive.badge.questionmark")
+                        .foregroundColor(.orange)
+                        .font(.system(size: 16))
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(inventory.missing.count == 1 ? "A model is missing" : "\(inventory.missing.count) models are missing")
+                            .font(.system(size: 14, weight: .bold))
+                            .foregroundColor(Theme.textPrimary)
+                        Text("These were installed on this device and are no longer here. App updates don't remove them — but model files are kept out of iCloud backup (they're far too large for it), so restoring from a backup, transferring to a new device, or reinstalling the app leaves them behind.")
+                            .font(.system(size: 11))
+                            .foregroundColor(Theme.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer(minLength: 4)
+                }
+
+                ForEach(inventory.missing) { entry in
+                    HStack(spacing: 10) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(entry.fileName)
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundColor(Theme.textPrimary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Text(entry.catalogModel == nil
+                                 ? "Imported by you — re-import the file to get it back."
+                                 : "\(entry.sizeDescription) · available in the catalog below")
+                                .font(.system(size: 10))
+                                .foregroundColor(Theme.textMuted)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        Spacer(minLength: 4)
+
+                        if let model = entry.catalogModel {
+                            Button {
+                                downloads.download(model)
+                                inventory.dismiss(entry)
+                            } label: {
+                                Text("Download")
+                                    .font(.system(size: 11, weight: .bold))
+                                    .foregroundColor(Theme.onAccent)
+                                    .padding(.horizontal, 12)
+                                    .padding(.vertical, 6)
+                                    .background(RoundedRectangle(cornerRadius: 8).fill(Theme.accent))
+                            }
+                            .disabled(downloads.isDownloading)
+                            .opacity(downloads.isDownloading ? 0.4 : 1)
+                        }
+
+                        Button {
+                            inventory.dismiss(entry)
+                        } label: {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 11, weight: .bold))
+                                .foregroundColor(Theme.textMuted)
+                                .frame(width: 28, height: 28)
+                        }
+                    }
+                    .padding(10)
+                    .background(Theme.cardBackground)
+                    .cornerRadius(10)
+                }
+            }
+            .padding(14)
+            .background(Color.orange.opacity(0.12))
+            .cornerRadius(14)
+            .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color.orange.opacity(0.45), lineWidth: 1))
+        }
+    }
+
     @ViewBuilder
     private func downloadCatalogSection(for kind: ModelKind) -> some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -1099,7 +1203,7 @@ struct SettingsView: View {
             // section owns the active transfer — showing it in both would imply two downloads.
             if let progress = downloads.active, downloads.activeKind == kind {
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("Downloading…")
+                    Text(progress.isResumed ? "Resuming…" : "Downloading…")
                         .font(.system(size: 13, weight: .semibold))
                         .foregroundColor(Theme.textPrimary)
                     ProgressView(value: progress.fractionCompleted)
@@ -1109,10 +1213,17 @@ struct SettingsView: View {
                             .font(.system(size: 11, design: .monospaced))
                             .foregroundColor(Theme.textSecondary)
                         Spacer()
-                        Button("Cancel") { downloads.cancel() }
+                        // Named for what it now does. Stopping keeps the bytes already fetched, so
+                        // calling it "Cancel" would understate it and push people into waiting out
+                        // a transfer they could safely interrupt.
+                        Button("Pause") { downloads.cancel() }
                             .font(.system(size: 12, weight: .semibold))
-                            .foregroundColor(.red.opacity(0.9))
+                            .foregroundColor(.orange)
                     }
+                    Text("You can leave the app — the transfer continues in the background, and an interrupted download picks up where it left off.")
+                        .font(.system(size: 10))
+                        .foregroundColor(Theme.textMuted)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 .padding(12)
                 .background(Theme.cardBackground)
@@ -1146,10 +1257,21 @@ struct SettingsView: View {
     @ViewBuilder
     private func catalogRow(_ model: CatalogModel) -> some View {
         let installed = downloads.isInstalled(model)
-        // Warn before spending a gigabyte of data on something this device can't run. The
-        // check is against total RAM rather than current headroom, since that's the ceiling
-        // that won't change by closing something.
-        let fitsOnDevice = model.approxRuntimeGB < llmManager.systemMemoryGB * 0.75
+        // Warn before spending a gigabyte of data on something this device can't run. Checked
+        // against the ceiling rather than current headroom, since that's the bound that won't
+        // change by closing something.
+        //
+        // That ceiling is `MemoryBudget.entitledGB`, the same figure every other memory decision
+        // in the app is made against, rather than a flat fraction of physical RAM. A fraction
+        // scales the wrong way — iOS reserves a roughly fixed amount for itself — so a flat 75%
+        // was optimistic on exactly the small devices where the warning matters most, promising
+        // a 4 GB iPhone it could run models it cannot. Sharing the figure also means the badge
+        // here and the failsafe at load time can no longer disagree with each other.
+        let fitsOnDevice = model.approxRuntimeGB < MemoryBudget.entitledGB
+        // Physical RAM, not the app's share of it, because that is what the device tag names.
+        // A device at or above the tier runs the model as described; below it, the tag says
+        // which iPhone to expect it on rather than leaving "may not run" as the only signal.
+        let meetsTier = MemoryBudget.physicalGB + 0.6 >= model.minimumRAMGB
 
         VStack(alignment: .leading, spacing: 6) {
             HStack(alignment: .top, spacing: 10) {
@@ -1170,6 +1292,12 @@ struct SettingsView: View {
                             .foregroundColor(Theme.textMuted)
                             .fixedSize(horizontal: false, vertical: true)
                     }
+                    Text(meetsTier
+                         ? "Runs on this iPhone · recommended \(model.minimumDevice)"
+                         : "Recommended for \(model.minimumDevice)")
+                        .font(.system(size: 10, weight: meetsTier ? .regular : .semibold))
+                        .foregroundColor(meetsTier ? Theme.textMuted : .orange)
+                        .fixedSize(horizontal: false, vertical: true)
                     if !fitsOnDevice {
                         Text("May not run on this device — needs about \(String(format: "%.1f", model.approxRuntimeGB)) GB of memory.")
                             .font(.system(size: 10))
@@ -1183,18 +1311,32 @@ struct SettingsView: View {
                         .foregroundColor(.green)
                         .font(.system(size: 18))
                 } else {
+                    let isResumable = downloads.resumableModelIDs.contains(model.id)
                     Button {
                         downloads.download(model)
                     } label: {
-                        Text("Get")
+                        Text(isResumable ? "Resume" : "Get")
                             .font(.system(size: 11, weight: .bold))
                             .foregroundColor(Theme.onAccent)
                             .padding(.horizontal, 14)
                             .padding(.vertical, 6)
-                            .background(RoundedRectangle(cornerRadius: 8).fill(Theme.accent))
+                            .background(RoundedRectangle(cornerRadius: 8).fill(isResumable ? Color.orange : Theme.accent))
                     }
                     .disabled(downloads.isDownloading)
                     .opacity(downloads.isDownloading ? 0.4 : 1)
+                }
+            }
+
+            if !installed, downloads.resumableModelIDs.contains(model.id) {
+                HStack(spacing: 10) {
+                    Text("Partly downloaded — resuming will continue rather than start over.")
+                        .font(.system(size: 10))
+                        .foregroundColor(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 4)
+                    Button("Discard") { downloads.discardPartial(for: model) }
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(Theme.textMuted)
                 }
             }
         }
@@ -1208,7 +1350,7 @@ struct SettingsView: View {
     @ViewBuilder
     private func modelRow(for url: URL) -> some View {
         let sizeGB = llmManager.getModelSizeGB(at: url)
-        let safety = llmManager.checkMemorySafety(modelSizeGB: sizeGB)
+        let safety = llmManager.checkMemorySafety(at: url)
         let isLoaded = isCurrentModel(url: url)
         
         HStack(spacing: 12) {
@@ -1330,7 +1472,14 @@ struct SettingsView: View {
             pendingDiffusionModelToLoad = nil
             failsafeRequiredRAM = requiredGB
             isFailsafeWarningOnly = true
-            failsafeMessage = "'\(url.lastPathComponent)' is large for this device. It should load, but memory will be tight and other apps may be closed in the background to make room."
+            // Two situations share this case: a model that merely leaves memory tight, and one
+            // too large to hold resident, which runs by streaming the layers that don't fit from
+            // storage on every token. The second is a speed trade-off rather than a memory risk,
+            // and saying so is what stops a model that loads fine from just seeming slow.
+            let sizeGB = llmManager.getModelSizeGB(at: url)
+            failsafeMessage = llmManager.willStreamFromStorage(modelSizeGB: sizeGB)
+                ? "'\(url.lastPathComponent)' is larger than this device can hold in memory at once. It will still run — the layers that don't fit are read from storage as they're needed — but expect much slower replies."
+                : "'\(url.lastPathComponent)' is large for this device. It should load, but memory will be tight and other apps may be closed in the background to make room."
             showFailsafePopup = true
         case .dangerous(let requiredGB, _):
             selectedModelToLoad = nil
@@ -1378,6 +1527,9 @@ struct SettingsView: View {
             if FileManager.default.fileExists(atPath: url.path) {
                 try FileManager.default.removeItem(at: url)
             }
+            // Drop the ledger entry too, so a deliberate deletion is never reported back as a
+            // model that went missing on its own.
+            ModelInventory.shared.forget(fileName: url.lastPathComponent, kind: isDiffusion ? .diffusion : .chat)
             if isDiffusion {
                 loadDiffusionModels()
             } else {
@@ -1428,6 +1580,12 @@ struct SettingsView: View {
                 AppFiles.excludeFromBackup(destinationURL)
 
                 await MainActor.run {
+                    ModelInventory.shared.record(
+                        fileName: destinationURL.lastPathComponent,
+                        kind: .chat,
+                        catalogID: ModelCatalog.model(withFileName: destinationURL.lastPathComponent)?.id,
+                        byteSize: Int64(fileSizeGB * 1024 * 1024 * 1024)
+                    )
                     refreshModelList()
                     self.isImporting = false
                 }
@@ -1558,7 +1716,16 @@ struct SettingsView: View {
                     }
                     try FileManager.default.copyItem(at: sourceURL, to: destURL)
                     AppFiles.excludeFromBackup(destURL)
-                    await MainActor.run { isDiffusionImporting = false; loadDiffusionModels() }
+                    await MainActor.run {
+                        ModelInventory.shared.record(
+                            fileName: destURL.lastPathComponent,
+                            kind: .diffusion,
+                            catalogID: ModelCatalog.model(withFileName: destURL.lastPathComponent)?.id,
+                            byteSize: (try? destURL.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init) ?? 0
+                        )
+                        isDiffusionImporting = false
+                        loadDiffusionModels()
+                    }
                 } catch {
                     await MainActor.run {
                         isDiffusionImporting = false
@@ -1745,6 +1912,20 @@ private struct MindscapeDocumentRow: View {
 struct MindscapeView: View {
     @ObservedObject var ragManager: RAGManager
     @State private var showDocImporter = false
+    @State private var showJSONImporter = false
+    @State private var showImportHelp = false
+    /// True while a JSON file is being parsed and screened off the main actor.
+    @State private var isParsingJSON = false
+    /// Result of the last structured import — success summary or refusal, shown inline rather than
+    /// as an alert so the text stays on screen while the user looks at what changed below it.
+    @State private var importNote: ImportNote?
+
+    private struct ImportNote: Identifiable {
+        let id = UUID()
+        let text: String
+        let isError: Bool
+        let icon: String
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1786,7 +1967,7 @@ struct MindscapeView: View {
             ScrollView {
                 VStack(spacing: 12) {
                     if ragManager.documents.isEmpty {
-                        Text("No entries yet. Import a text document below, or generate an image — generated images are added here automatically.")
+                        Text("No entries yet. Import a text document or a JSON study guide / journal below, or generate an image — generated images are added here automatically.")
                             .font(.system(size: 13))
                             .foregroundColor(Theme.textSecondary)
                             .multilineTextAlignment(.center)
@@ -1801,23 +1982,14 @@ struct MindscapeView: View {
                 .padding()
             }
             
-            Button(action: { showDocImporter = true }) {
-                HStack {
-                    Image(systemName: "doc.badge.plus")
-                    Text("Import RAG Document")
-                }
-                .font(.headline)
-                .foregroundColor(Theme.onAccent)
-                .padding()
-                .frame(maxWidth: .infinity)
-                .background(Theme.accentCyan)
-                .cornerRadius(15)
-            }
-            .padding()
+            importControls
         }
         .background(Theme.background.ignoresSafeArea())
         .navigationTitle("Mindscape")
         .navigationBarTitleDisplayMode(.inline)
+        .sheet(isPresented: $showImportHelp) {
+            StructuredImportHelpView()
+        }
         .fileImporter(
             isPresented: $showDocImporter,
             allowedContentTypes: [.plainText],
@@ -1828,20 +2000,174 @@ struct MindscapeView: View {
                 guard let firstUrl = urls.first else { return }
                 ingestRAGDocument(from: firstUrl)
             case .failure(let error):
-                print("Error importing: \(error)")
+                importNote = ImportNote(text: error.localizedDescription, isError: true, icon: "exclamationmark.triangle.fill")
+            }
+        }
+        .fileImporter(
+            isPresented: $showJSONImporter,
+            allowedContentTypes: [.json],
+            allowsMultipleSelection: false
+        ) { result in
+            switch result {
+            case .success(let urls):
+                guard let firstUrl = urls.first else { return }
+                ingestStructuredJSON(from: firstUrl)
+            case .failure(let error):
+                importNote = ImportNote(text: error.localizedDescription, isError: true, icon: "exclamationmark.triangle.fill")
             }
         }
     }
-    
+
+    // MARK: - Import controls
+
+    @ViewBuilder
+    private var importControls: some View {
+        VStack(spacing: 10) {
+            if isParsingJSON {
+                HStack(spacing: 10) {
+                    ProgressView()
+                        .progressViewStyle(CircularProgressViewStyle(tint: Theme.accentCyan))
+                    Text("Reading the file…")
+                        .font(.system(size: 12))
+                        .foregroundColor(Theme.textSecondary)
+                    Spacer()
+                }
+                .padding(12)
+                .background(Theme.cardBackground)
+                .cornerRadius(10)
+            }
+
+            if let importNote {
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: importNote.icon)
+                        .foregroundColor(importNote.isError ? .orange : .green)
+                        .font(.system(size: 13))
+                    Text(importNote.text)
+                        .font(.system(size: 12))
+                        .foregroundColor(Theme.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 4)
+                    Button {
+                        withAnimation { self.importNote = nil }
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 11, weight: .bold))
+                            .foregroundColor(Theme.textMuted)
+                    }
+                }
+                .padding(12)
+                .background((importNote.isError ? Color.orange : Color.green).opacity(0.12))
+                .cornerRadius(10)
+            }
+
+            // Two buttons rather than one picker that accepts both: the JSON path does something
+            // materially different (it reads the file's structure and can create many entries from
+            // one file), and labelling that up front is what makes it discoverable at all.
+            HStack(spacing: 10) {
+                Button(action: { showDocImporter = true }) {
+                    importButtonLabel("Text", icon: "doc.badge.plus", fill: Theme.accentCyan)
+                }
+                Button(action: { showJSONImporter = true }) {
+                    importButtonLabel("JSON", icon: "curlybraces", fill: Theme.accent)
+                }
+                .disabled(isParsingJSON)
+                .opacity(isParsingJSON ? 0.5 : 1)
+            }
+
+            Button {
+                showImportHelp = true
+            } label: {
+                Text("What can I import?")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(Theme.accentCyan)
+            }
+        }
+        .padding()
+    }
+
+    private func importButtonLabel(_ title: String, icon: String, fill: Color) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: icon)
+            Text(title)
+        }
+        .font(.system(size: 15, weight: .bold))
+        .foregroundColor(Theme.onAccent)
+        .padding(.vertical, 14)
+        .frame(maxWidth: .infinity)
+        .background(fill)
+        .cornerRadius(15)
+    }
+
+    // MARK: - Ingest
+
     private func ingestRAGDocument(from sourceURL: URL) {
         let isSecured = sourceURL.startAccessingSecurityScopedResource()
         defer { if isSecured { sourceURL.stopAccessingSecurityScopedResource() } }
-        
+
         do {
             let content = try String(contentsOf: sourceURL, encoding: .utf8)
             ragManager.ingestDocument(name: sourceURL.lastPathComponent, content: content)
+            importNote = ImportNote(
+                text: "Added \(sourceURL.lastPathComponent).",
+                isError: false,
+                icon: "checkmark.circle.fill"
+            )
         } catch {
-            print("Failed ingesting RAG document: \(error)")
+            importNote = ImportNote(text: "Couldn't read that file: \(error.localizedDescription)", isError: true, icon: "exclamationmark.triangle.fill")
+            LogManager.shared.log("Mindscape text import failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// Parses a study guide / journal / transcript JSON file and commits it in one step.
+    ///
+    /// Parsing and ingesting are separate calls (see `StructuredImport.parse`) precisely so a file
+    /// that is too large, unreadable, or refused by the content filter leaves the Mindscape exactly
+    /// as it was — a half-imported journal would be worse than none.
+    private func ingestStructuredJSON(from sourceURL: URL) {
+        let isSecured = sourceURL.startAccessingSecurityScopedResource()
+        let fileName = sourceURL.lastPathComponent
+        let data: Data
+        do {
+            data = try Data(contentsOf: sourceURL)
+        } catch {
+            if isSecured { sourceURL.stopAccessingSecurityScopedResource() }
+            importNote = ImportNote(text: "Couldn't read that file: \(error.localizedDescription)", isError: true, icon: "exclamationmark.triangle.fill")
+            return
+        }
+        if isSecured { sourceURL.stopAccessingSecurityScopedResource() }
+
+        isParsingJSON = true
+        importNote = nil
+
+        Task {
+            // Parsed off the main actor. Both halves of the work scale with file size — decoding
+            // several megabytes of JSON, and then screening every extracted character through
+            // `ContentSafety`, which walks its term lists across the whole string. On the largest
+            // file the caps allow, doing that inline would visibly freeze the app mid-tap.
+            let outcome = await Task.detached(priority: .userInitiated) {
+                Result { try StructuredImport.parse(data: data, fileName: fileName) }
+            }.value
+
+            isParsingJSON = false
+            switch outcome {
+            case .success(let result):
+                for document in result.documents {
+                    ragManager.ingestDocument(name: document.name, content: document.content)
+                }
+                withAnimation {
+                    importNote = ImportNote(text: result.summary, isError: false, icon: result.kind.icon)
+                }
+                LogManager.shared.log("Mindscape JSON import: \(result.summary)")
+            case .failure(let error):
+                withAnimation {
+                    importNote = ImportNote(
+                        text: error.localizedDescription,
+                        isError: true,
+                        icon: "exclamationmark.triangle.fill"
+                    )
+                }
+                LogManager.shared.log("Mindscape JSON import failed: \(error.localizedDescription)")
+            }
         }
     }
 }

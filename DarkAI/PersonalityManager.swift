@@ -95,6 +95,31 @@ struct StyleMetrics: Codable {
         return lines
     }
 
+    /// Sums several sets of measurements into one.
+    ///
+    /// Every counter here is a tally over the user's own messages, and there is only ever one
+    /// user — so measurements gathered while different models were loaded describe the same
+    /// person and add together cleanly. Used once, to fold the old per-model records into the
+    /// single shared profile.
+    static func merged(_ all: [StyleMetrics]) -> StyleMetrics {
+        var out = StyleMetrics()
+        for m in all {
+            out.messageCount += m.messageCount
+            out.totalWords += m.totalWords
+            out.lowercaseStarts += m.lowercaseStarts
+            out.missingTerminalPunctuation += m.missingTerminalPunctuation
+            out.questions += m.questions
+            out.exclamations += m.exclamations
+            out.emojiMessages += m.emojiMessages
+            out.contractions += m.contractions
+            out.slangHits += m.slangHits
+            out.profanityHits += m.profanityHits
+            out.multiSentence += m.multiSentence
+            out.totalWordLength += m.totalWordLength
+        }
+        return out
+    }
+
     /// Folds one message into the running totals.
     mutating func record(_ message: String) {
         let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -145,27 +170,63 @@ struct StyleMetrics: Codable {
 }
 
 class PersonalityManager: ObservableObject {
-    @Published var modelPersonalities: [String: String] = [:]
+    /// The one personality, shared by every model.
+    ///
+    /// This was keyed by model, which meant switching models started the adaptation over and the
+    /// same user was learned several times in parallel. There is only one user, so there is one
+    /// profile: whatever the app has worked out about how they write applies whichever model is
+    /// answering.
+    @Published var personality: String = ""
     @Published var maturityScore: Double = 0.0
     @Published var isMature: Bool = false
     
-    private let storageKey = "DarkAI_ModelPersonalities"
+    private let storageKey = "DarkAI_Personality"
     private let maturityKey = "DarkAI_MaturityScore"
-    private let metricsKey = "DarkAI_StyleMetrics"
+    private let metricsKey = "DarkAI_StyleMetricsUnified"
+    /// Pre-unification keys, read once at launch and then deleted.
+    private let legacyProfilesKey = "DarkAI_ModelPersonalities"
+    private let legacyMetricsKey = "DarkAI_StyleMetrics"
     private var messageBatch: [String] = []
 
     /// Per-model style measurements. Keyed by model so switching models doesn't inherit a voice
     /// learned against a different one.
-    @Published private(set) var styleMetrics: [String: StyleMetrics] = [:]
+    @Published private(set) var styleMetrics = StyleMetrics()
 
     init() {
         loadPersonalities()
         loadMetrics()
+        migrateLegacyPerModelData()
+    }
+
+    /// Folds the old per-model records into the single shared profile, once.
+    ///
+    /// Rather than discarding what the app had already learned about the user. The measurements
+    /// are summed — they are counts of that one user's messages, so they add. The prose profiles
+    /// cannot be merged that way without producing a contradictory blob, so the longest is kept
+    /// as the most developed. The old keys are removed afterwards so this never runs twice.
+    private func migrateLegacyPerModelData() {
+        let defaults = UserDefaults.standard
+        if personality.isEmpty,
+           let data = defaults.data(forKey: legacyProfilesKey),
+           let old = try? JSONDecoder().decode([String: String].self, from: data),
+           let longest = old.values.max(by: { $0.count < $1.count }) {
+            personality = longest
+            savePersonalities()
+        }
+        if styleMetrics.messageCount == 0,
+           let data = defaults.data(forKey: legacyMetricsKey),
+           let old = try? JSONDecoder().decode([String: StyleMetrics].self, from: data),
+           !old.isEmpty {
+            styleMetrics = StyleMetrics.merged(Array(old.values))
+            saveMetrics()
+        }
+        defaults.removeObject(forKey: legacyProfilesKey)
+        defaults.removeObject(forKey: legacyMetricsKey)
     }
 
     private func loadMetrics() {
         guard let data = UserDefaults.standard.data(forKey: metricsKey),
-              let decoded = try? JSONDecoder().decode([String: StyleMetrics].self, from: data) else { return }
+              let decoded = try? JSONDecoder().decode(StyleMetrics.self, from: data) else { return }
         styleMetrics = decoded
     }
 
@@ -175,33 +236,29 @@ class PersonalityManager: ObservableObject {
     }
 
     /// Messages observed for a model — drives the maturity readout in Settings.
-    func observedMessageCount(for modelName: String) -> Int {
-        styleMetrics[modelName]?.messageCount ?? 0
-    }
+    var observedMessageCount: Int { styleMetrics.messageCount }
     
     private func loadPersonalities() {
-        if let data = UserDefaults.standard.data(forKey: storageKey),
-           let decoded = try? JSONDecoder().decode([String: String].self, from: data) {
-            self.modelPersonalities = decoded
-        }
-        
-        let savedMaturity = UserDefaults.standard.double(forKey: maturityKey)
-        self.maturityScore = savedMaturity
-        self.isMature = savedMaturity >= 0.7
+        personality = UserDefaults.standard.string(forKey: storageKey) ?? ""
+        maturityScore = UserDefaults.standard.double(forKey: maturityKey)
+        isMature = maturityScore >= 0.7
     }
     
     private func savePersonalities() {
-        if let encoded = try? JSONEncoder().encode(modelPersonalities) {
-            UserDefaults.standard.set(encoded, forKey: storageKey)
-        }
+        UserDefaults.standard.set(personality, forKey: storageKey)
         UserDefaults.standard.set(maturityScore, forKey: maturityKey)
     }
     
+    /// Bytes held by the shared profile: the prose and the measurements together.
+    func databaseSizeBytes() -> Int {
+        let prose = personality.utf8.count
+        let metrics = (try? JSONEncoder().encode(styleMetrics))?.count ?? 0
+        return prose == 0 && styleMetrics.messageCount == 0 ? 0 : prose + metrics
+    }
+
+    /// Size of what the reset button clears — which is now everything, so it reaches 0 B.
     var databaseSizeString: String {
-        guard let data = UserDefaults.standard.data(forKey: storageKey) else {
-            return "0 B"
-        }
-        let bytes = Double(data.count)
+        let bytes = Double(databaseSizeBytes())
         if bytes < 1024 {
             return "\(Int(bytes)) B"
         } else if bytes < 1024 * 1024 {
@@ -212,17 +269,20 @@ class PersonalityManager: ObservableObject {
             return String(format: "%.2f GB", bytes / (1024 * 1024 * 1024))
         }
     }
-    
-    func resetPersonality(for modelName: String) {
-        modelPersonalities.removeValue(forKey: modelName)
+
+    /// Erases the profile and the measurements behind it.
+    func resetPersonality() {
+        personality = ""
+        styleMetrics = StyleMetrics()
         maturityScore = 0.0
         isMature = false
         savePersonalities()
+        saveMetrics()
     }
     
-    func getPersonality(for modelName: String) -> String {
-        let profile = modelPersonalities[modelName] ?? ""
-        let styleDirectives = (styleMetrics[modelName] ?? StyleMetrics()).directives()
+    func getPersonality() -> String {
+        let profile = personality
+        let styleDirectives = (styleMetrics).directives()
 
         // Measured style stands on its own. It's available after a handful of messages, well
         // before the LLM-written prose profile has anything in it, so the assistant starts
@@ -264,19 +324,18 @@ class PersonalityManager: ObservableObject {
         """
     }
     
-    func analyzeUserMessage(_ message: String, modelName: String, llmManager: LLMManager?) {
-        guard !modelName.isEmpty else { return }
+    func analyzeUserMessage(_ message: String, llmManager: LLMManager?) {
 
         // --- 1. Style measurement (every message, no keyword required) ---
         // This runs unconditionally rather than only when a listed slang word appears, which is
         // what makes the profile sharpen from ordinary messages instead of stalling on users
         // whose voice is distinctive but doesn't happen to use the vocabulary in a fixed list.
-        var metrics = styleMetrics[modelName] ?? StyleMetrics()
+        var metrics = styleMetrics
         metrics.record(message)
-        styleMetrics[modelName] = metrics
+        styleMetrics = metrics
         saveMetrics()
 
-        var currentProfile = modelPersonalities[modelName] ?? ""
+        var currentProfile = personality
         var newTraits: [String] = []
         
         let sentences = message.components(separatedBy: CharacterSet(charactersIn: ".!?\n"))
@@ -303,7 +362,7 @@ class PersonalityManager: ObservableObject {
             } else {
                 currentProfile += "\n" + newTraits.joined(separator: "\n")
             }
-            modelPersonalities[modelName] = currentProfile
+            personality = currentProfile
             
             maturityScore = min(1.0, maturityScore + (Double(newTraits.count) * 0.08))
             isMature = maturityScore >= 0.7
@@ -352,7 +411,7 @@ class PersonalityManager: ObservableObject {
                     analysis = cleanedLines.joined(separator: "\n")
                     
                     await MainActor.run {
-                        var updatedProfile = self.modelPersonalities[modelName] ?? ""
+                        var updatedProfile = self.personality
                         if !analysis.isEmpty && !updatedProfile.contains(analysis) {
                             updatedProfile += "\n\n[STYLE ANALYSIS]\n" + analysis
                             
@@ -362,7 +421,7 @@ class PersonalityManager: ObservableObject {
                                 updatedProfile = ([lines[0]] + lines.suffix(99)).joined(separator: "\n")
                             }
                             
-                            self.modelPersonalities[modelName] = updatedProfile
+                            self.personality = updatedProfile
                             
                             self.maturityScore = min(1.0, self.maturityScore + 0.15)
                             self.isMature = self.maturityScore >= 0.7
@@ -380,12 +439,11 @@ class PersonalityManager: ObservableObject {
     // "I love jazz" or "my favorite car is a Tesla" — so it can stay consistent when asked
     // again later, instead of forming a fresh (or worse, borrowing the user's) answer every
     // time. Purely local string matching, no LLM call, safe to run after every response.
-    func analyzeAssistantMessage(_ message: String, modelName: String) {
-        guard !modelName.isEmpty else { return }
+    func analyzeAssistantMessage(_ message: String) {
         let text = message.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
 
-        var currentProfile = modelPersonalities[modelName] ?? ""
+        var currentProfile = personality
         var newTraits: [String] = []
 
         func addFact(_ fact: String) {
@@ -451,7 +509,7 @@ class PersonalityManager: ObservableObject {
         if lines.count > 100 {
             currentProfile = ([lines[0]] + lines.suffix(99)).joined(separator: "\n")
         }
-        modelPersonalities[modelName] = currentProfile
+        personality = currentProfile
 
         maturityScore = min(1.0, maturityScore + (Double(newTraits.count) * 0.08))
         isMature = maturityScore >= 0.7

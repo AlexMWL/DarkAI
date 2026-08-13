@@ -28,9 +28,15 @@ enum MemorySafetyStatus: Equatable {
 actor LlamaRunner {
 
 
+    /// Smallest context a streaming load is allowed to settle for before being refused outright.
+    /// Below this the model cannot hold a system prompt and a question together, so "loaded" is
+    /// a worse outcome than a clear failure.
+    private static let minimumUsableContextTokens = 2048
+
     private var model: OpaquePointer? = nil
     private var context: OpaquePointer? = nil
     private var nCtxTokens: Int = 2048  // actual context window in tokens
+    private var trainedCtxTokens: Int = 0
     private var isCancelled = false
     /// Actual tokenized prompt length (post-truncation) from the most recent generation —
     /// the real figure, as opposed to the char-count estimate used for UI budgeting.
@@ -40,6 +46,9 @@ actor LlamaRunner {
     /// The context window actually applied to the loaded model, which can differ from the
     /// user's requested setting once `safeContextTokens` clamps it to available RAM.
     func getContextWindowTokens() -> Int { nCtxTokens }
+    /// The context the model was actually trained for, which is a property of the weights and
+    /// entirely separate from what this device could afford to allocate.
+    func getTrainedContextTokens() -> Int { trainedCtxTokens }
     func getLastPromptTokenCount() -> Int { lastPromptTokenCount }
 
     init() {
@@ -69,60 +78,435 @@ actor LlamaRunner {
                           userInfo: [NSLocalizedDescriptionKey: "Model file not found at \(path). It may have been moved or the app reinstalled — try reselecting it in Settings."])
         }
 
-        // Cheap vocab-only probe to pick a GPU-offload strategy before the real load. Very
-        // large vocabularies (Gemma's 256K-token vocab, in particular) have been observed to
-        // produce zeroed Metal compute buffers when the output projection layer — which scales
-        // with vocab size — is fully GPU-offloaded on this device; capping GPU layers works
-        // around it. Queried from the model itself (not matched against the file name) so this
-        // correctly protects any large-vocab model — e.g. Llama 3's 128K vocab stays comfortably
-        // under the threshold and gets full offload, without needing a per-model name allowlist.
-        var nGpuLayers: Int32 = 99
-        var probeParams = llama_model_default_params()
-        probeParams.vocab_only = true
-        if let probeModel = llama_model_load_from_file(path, probeParams) {
-            let probeVocab = llama_model_get_vocab(probeModel)
-            if llama_vocab_n_tokens(probeVocab) >= 150_000 {
-                nGpuLayers = 15
-            }
-            llama_model_free(probeModel)
-        }
+        let footprintBeforeLoadGB = MemoryBudget.footprintGB()
+
+        let plan = planOffload(path: path,
+                               modelSizeGB: modelSizeGB,
+                               availableMemoryGB: availableMemoryGB,
+                               contextLimit: contextLimit)
 
         var modelParams = llama_model_default_params()
-        modelParams.n_gpu_layers = nGpuLayers
+        modelParams.n_gpu_layers = plan.nGpuLayers
         modelParams.use_mmap = true
         modelParams.use_mlock = false
 
-        guard let mdl = llama_model_load_from_file(path, modelParams) else {
+        // Per-block regexes matched against tensor names during load, pinning those blocks'
+        // routed experts to the CPU buffer type. Because mmap is on, a CPU-owned weight buffer
+        // is created directly over the mapped file rather than copied into fresh memory, which
+        // is what makes this a memory saving and not just a change of which backend runs the
+        // matmul.
+        //
+        let loaded = llama_model_load_from_file(path, modelParams)
+
+        guard let mdl = loaded else {
             throw NSError(domain: "LlamaRunner", code: 1,
                           userInfo: [NSLocalizedDescriptionKey: "Failed to load GGUF. Check the file is a valid model and fits in RAM."])
         }
         self.model = mdl
 
         let trainedCtx = Int(llama_model_n_ctx_train(mdl))
-        let nCtx = Int32(safeContextTokens(model: mdl,
-                                           availableMemoryGB: availableMemoryGB,
-                                           modelSizeGB: modelSizeGB,
-                                           requestedLimit: contextLimit,
-                                           trainedCtx: trainedCtx))
+        self.trainedCtxTokens = trainedCtx
+        // Read during the probe; the loaded model reports the same values.
+        let geometry = plan.geometry
 
-        var ctxParams = llama_context_default_params()
-        ctxParams.n_ctx   = UInt32(nCtx)
-        ctxParams.n_batch = UInt32(min(nCtx, 512))
-        
         // Optimized for Apple Silicon: Using all cores (including E-cores) degrades performance.
         let optimalThreads = Int32(max(2, min(4, ProcessInfo.processInfo.activeProcessorCount / 2)))
-        ctxParams.n_threads       = optimalThreads
-        ctxParams.n_threads_batch = optimalThreads
-        ctxParams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED
 
-        guard let ctx = llama_init_from_model(mdl, ctxParams) else {
-            llama_model_free(mdl)
-            self.model = nil
-            throw NSError(domain: "LlamaRunner", code: 2,
-                          userInfo: [NSLocalizedDescriptionKey: "Failed to create inference context. The model may require more RAM."])
+        // Prefer the quantised cache, but keep f16 as a fallback rather than failing the load.
+        // Quantised K/V depends on backend support for this specific architecture's head
+        // geometry, and that is only knowable by trying: a rejected combination surfaces as a
+        // null context, not as a diagnosable error. Falling back re-derives the context window
+        // first, because f16 doubles the per-token cost and the Q8_0-sized window would no
+        // longer fit the same budget.
+        var formats: [KVCacheFormat] = []
+        if geometry?.supportsQuantizedCache ?? false { formats.append(.q8_0) }
+        formats.append(.f16)
+
+        // A streaming load that can only afford a few hundred tokens is not a working model, it
+        // is a model that will accept one message and then fail on it. `llama_init_from_model`
+        // builds that context quite happily — the memory it could not spare gets spent later, in
+        // prefill, and the failure there is a dead Metal backend and a corrupted UI rather than a
+        // clean refusal. Better to refuse now, while there is still something useful to say.
+        //
+        // Checked against the *first* format, which is the best case: Q8_0 where the geometry
+        // allows it, always yielding the largest window for a given budget. If that can't reach a
+        // usable size, the f16 fallback certainly won't.
+        //
+        // Only streaming loads are held to this. A fully-resident model scraping the floor on a
+        // small device is long-standing behaviour that works, and is not this problem.
+        if plan.streamsFromStorage, let best = formats.first {
+            let bestCtx = safeContextTokens(geometry: geometry,
+                                            kvFormat: best,
+                                            plan: plan,
+                                            availableMemoryGB: availableMemoryGB,
+                                            modelSizeGB: modelSizeGB,
+                                            requestedLimit: contextLimit,
+                                            trainedCtx: trainedCtx)
+            if bestCtx < Self.minimumUsableContextTokens {
+                llama_model_free(mdl)
+                self.model = nil
+                throw NSError(domain: "LlamaRunner", code: 4, userInfo: [NSLocalizedDescriptionKey:
+                    "This model is too large for this device. It would load with only a \(bestCtx)-token context — too small to hold a conversation, and it would run out of GPU memory on the first message. Try a smaller or more compressed model."])
+            }
         }
-        self.context = ctx
-        self.nCtxTokens = Int(nCtx)
+
+        for format in formats {
+            let nCtx = Int32(safeContextTokens(geometry: geometry,
+                                               kvFormat: format,
+                                               plan: plan,
+                                               availableMemoryGB: availableMemoryGB,
+                                               modelSizeGB: modelSizeGB,
+                                               requestedLimit: contextLimit,
+                                               trainedCtx: trainedCtx))
+
+            var ctxParams = llama_context_default_params()
+            ctxParams.n_ctx   = UInt32(nCtx)
+            ctxParams.n_batch = UInt32(min(nCtx, 512))
+            ctxParams.n_threads       = optimalThreads
+            ctxParams.n_threads_batch = optimalThreads
+            // Quantised K/V requires flash attention, which is why this is set unconditionally
+            // rather than left on AUTO.
+            ctxParams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED
+            ctxParams.type_k = format.ggmlType
+            ctxParams.type_v = format.ggmlType
+
+            if plan.streamsFromStorage {
+                // Anything left off the GPU has to stay off it. Op offloading copies host-side
+                // weights to the GPU to run large-batch matmuls there, which is a good trade
+                // normally and a catastrophic one here: those weights were left behind precisely
+                // because they don't fit, and prefill runs at `n_batch` = 512, so the scheduler
+                // stages layer after layer across in bulk and reintroduces — transiently, all at
+                // once — the entire allocation the plan just avoided.
+                //
+                // This condition used to cover only pinned experts, and a dense 12B model with
+                // ~20 layers on the CPU side was the result: it loaded cleanly, then died in
+                // prefill with `kIOGPUCommandBufferCallbackErrorOutOfMemory` on the first
+                // message, taking the shared Metal device down with it and corrupting the app's
+                // own rendering. Dense streaming needs this more than expert streaming does, not
+                // less — its CPU-side layers are touched by every single token.
+                //
+                // Costs prompt-ingestion speed. The header's warning about this setting applies
+                // only when `n_seq_max > 1`, which is not the case for a single conversation.
+                ctxParams.op_offload = false
+            }
+
+            if let ctx = llama_init_from_model(mdl, ctxParams) {
+                // What the plan predicted would stay resident, against what actually did.
+                //
+                // Every budget in this file rests on a claim about which bytes iOS will charge
+                // to this process — offloaded weights yes, mmap'd weights no, pinned experts
+                // only in part. Those claims are estimates about another system's behaviour, and
+                // when one is wrong it is wrong by gigabytes: the load appears to succeed, the
+                // footprint quietly sits far above plan, and the app is killed shortly after by
+                // a jetsam the user experiences as a crash with no explanation.
+                //
+                // Measuring here turns that into a refused load with a reason. The threshold is
+                // deliberately loose — this is a backstop for a broken assumption, not a check
+                // on the accuracy of the estimate.
+                let actualGB = MemoryBudget.footprintGB() - footprintBeforeLoadGB
+                let kvBytesPerToken = (geometry?.elementsPerToken ?? 0) * format.bytesPerElement
+                let predictedGB = plan.residentWeightGB
+                    + Double(nCtx) * kvBytesPerToken / (1024 * 1024 * 1024)
+                if actualGB > predictedGB * 1.5 + 1.0 {
+                    LogManager.shared.log(String(
+                        format: "Load aborted: footprint grew %.2f GB against a predicted %.2f GB — the offload plan is not describing what this model actually does in memory.",
+                        actualGB, predictedGB))
+                    llama_free(ctx)
+                    llama_model_free(mdl)
+                    self.model = nil
+                    throw NSError(domain: "LlamaRunner", code: 5, userInfo: [NSLocalizedDescriptionKey: String(
+                        format: "This model used %.1f GB of memory when %.1f GB was expected, so it was unloaded before it could crash the app. It isn't usable on this device.",
+                        actualGB, predictedGB)])
+                }
+
+                self.context = ctx
+                self.nCtxTokens = Int(nCtx)
+                LogManager.shared.log(
+                    "Loaded with \(format.name) KV cache, \(nCtx) tokens — \(plan.note)"
+                )
+                return
+            }
+
+            LogManager.shared.log("Context creation failed with \(format.name) KV cache at \(nCtx) tokens")
+        }
+
+        llama_model_free(mdl)
+        self.model = nil
+        throw NSError(domain: "LlamaRunner", code: 2,
+                      userInfo: [NSLocalizedDescriptionKey: "Failed to create inference context. The model may require more RAM."])
+    }
+
+    // MARK: - Offload planning
+
+    /// How a model's layers get divided between Metal and CPU/mmap for one particular load.
+    ///
+    /// This division is the app's memory dial. Layers offloaded to Metal are wired into GPU
+    /// buffers and cost full price against the process's dirty-memory allowance; layers left
+    /// behind stay as clean, file-backed mmap pages, which iOS can evict and re-read on demand
+    /// and which do not count against that allowance. Full offload is fastest, and partial
+    /// offload is what lets a model larger than the memory budget run at all — slower, because
+    /// the CPU-side layers are re-read from storage as they are touched, but running rather
+    /// than refused.
+    /// For a mixture-of-experts model there is a second, much cheaper dial. A dense layer left
+    /// off the GPU is re-read in full on every token, so dense streaming is bounded by storage
+    /// bandwidth. A routed expert is read only by the tokens that route to it, and a token
+    /// touches a small fraction of the experts in each block — so pinning expert stacks to
+    /// CPU/mmap gives up a fraction of the bandwidth that pinning whole layers would, while
+    /// freeing the majority of the file. That is what makes a sparse model far larger than the
+    /// device's memory a reasonable thing to run, where a dense one of the same size is not.
+    private struct OffloadPlan {
+        let nGpuLayers: Int32
+
+        /// Weight bytes expected to stay charged against the process's dirty-memory allowance.
+        ///
+        /// Computed here rather than in `safeContextTokens` because this is where the placement
+        /// decisions are actually known — the context budget only needs the total.
+        let residentWeightGB: Double
+
+        /// Attention shape, read during the probe and carried forward so the real load doesn't
+        /// have to read it again.
+        let geometry: KVGeometry?
+
+        /// Any weight at all is being left off the GPU to be read from storage instead.
+        ///
+        /// Deliberately not derived from `nGpuLayers`: dense layer
+        /// streaming leaves the expert list empty while keeping most of the model off the GPU,
+        /// and the large-vocab correctness cap holds layers back for a reason that has nothing
+        /// to do with memory but has exactly the same consequence for op offloading. Every path
+        /// states its own answer so none of those cases can be missed by inference.
+        let streamsFromStorage: Bool
+
+        let note: String
+    }
+
+    /// Decides where each part of the model goes, from a single metadata-only read of the file.
+    ///
+    /// `ModelProfiler` parses the GGUF header — hyperparameters, vocabulary size and the tensor
+    /// directory — without touching tensor data. It replaces a `vocab_only` model load that was
+    /// used here originally and could not do this job: that mode populates only the vocabulary,
+    /// so every hyperparameter came back as zero and the `nLayer > 0` guard below rejected every
+    /// model that has ever been loaded, silently sending all of them down the full-offload path
+    /// no matter how large. Asking it for attention geometry was worse still — it aborted the
+    /// process. Both failures are invisible from here, which is why this now reads the file.
+    private func planOffload(path: String,
+                             modelSizeGB: Double,
+                             availableMemoryGB: Double,
+                             contextLimit: Int) -> OffloadPlan {
+        let profile = ModelProfiler.profile(path: path)
+
+        let nLayer = profile?.nLayer ?? 0
+        let vocabSize = profile?.vocabSize ?? 0
+        let trainedCtx = profile?.trainedContext ?? 0
+        let geometry: KVGeometry? = (profile?.hasUsableGeometry ?? false)
+            ? KVGeometry(nLayer: profile!.nLayer,
+                         nHeadKV: profile!.nHeadKV,
+                         headDimK: profile!.headDimK,
+                         headDimV: profile!.headDimV)
+            : nil
+
+        // Very large vocabularies (Gemma's 256K-token vocab, in particular) have been observed
+        // to produce zeroed Metal compute buffers when the output projection layer — which
+        // scales with vocab size — is fully GPU-offloaded on this device; capping GPU layers
+        // works around it. Queried from the model itself (not matched against the file name) so
+        // this correctly protects any large-vocab model — e.g. Llama 3's 128K vocab stays
+        // comfortably under the threshold and gets full offload, without needing a per-model
+        // name allowlist.
+        //
+        // This is a correctness cap, not a memory one, which is why hitting it does not put the
+        // load into the memory-constrained regime below.
+        let correctnessCap: Int32 = vocabSize >= 150_000 ? 15 : 99
+
+        // Coarse reserve: `safeContextTokens` sizes the KV cache precisely once the model is
+        // open, so this only has to stop the layer budget from eating the memory that call will
+        // go on to need. Deliberately small — a dense model asking for a large context should
+        // get a smaller context, not start streaming layers to pay for one.
+        let safetyMarginGB = MemoryBudget.safetyMarginGB(for: availableMemoryGB)
+        let kvAndComputeReserveGB = min(1.25, availableMemoryGB * 0.20)
+        // Bounded by what the GPU will hold as well as by what iOS will let the app dirty. These
+        // are different numbers — 8.59 GB against 11.4 GB of RAM on an iPhone 17 Pro — and the
+        // smaller one is the one that decides whether a fully-offloaded model survives its first
+        // command buffer.
+        let gpuBudgetGB = MemoryBudget.gpuResidentBudgetGB(processHeadroomGB: availableMemoryGB)
+            - safetyMarginGB - kvAndComputeReserveGB
+
+        guard nLayer > 0, modelSizeGB > 0 else {
+            // Unreadable header. Without a layer count there is no way to hold back *some* of the
+            // model, so the choice is all on the GPU or none of it — and "all" is precisely the
+            // arrangement that put a 6.8 GB model onto an 8.59 GB GPU and killed it on the first
+            // message. Small models still offload as before; anything that doesn't clearly fit
+            // stays on mmap, which is slow but cannot fail this way.
+            let fits = modelSizeGB <= gpuBudgetGB
+            let note = fits
+                ? "geometry unavailable, model fits — offloading up to \(correctnessCap) layers"
+                : "geometry unavailable and model exceeds the GPU budget — keeping all weights on CPU/mmap"
+            LogManager.shared.log("Offload plan — \(note)")
+            return OffloadPlan(nGpuLayers: fits ? correctnessCap : 0,
+                               residentWeightGB: fits ? modelSizeGB * 0.8 : modelSizeGB * 0.45,
+                               geometry: geometry,
+                               streamsFromStorage: !fits,
+                               note: note)
+        }
+
+        // Blocks plus the token-embedding and output tensors, which together are what the file
+        // size covers. Treating those two as roughly one layer each keeps this a slight
+        // over-estimate of per-layer cost for large-vocab models, which errs toward offloading
+        // fewer layers — the safe direction.
+        let perLayerGB = modelSizeGB / Double(nLayer + 2)
+
+        // Everything fits on the GPU. Keep the sentinel rather than an exact layer count so the
+        // output tensor is offloaded too, and keep the previously tuned flat 0.8 residency
+        // figure, so no model that already loaded sees its context window move.
+        if modelSizeGB <= gpuBudgetGB {
+            // The large-vocab cap still leaves layers on the CPU even though memory was never
+            // the reason, and for op offloading the reason does not matter — only the fact.
+            let allLayersOnGPU = Int(correctnessCap) >= nLayer
+            let note = "fully offloaded: n_gpu_layers \(correctnessCap) of \(nLayer) layers"
+            LogManager.shared.log("Offload plan — \(note)")
+            return OffloadPlan(nGpuLayers: correctnessCap,
+                               residentWeightGB: modelSizeGB * 0.8,
+                               geometry: geometry,
+                               streamsFromStorage: !allLayersOnGPU,
+                               note: note)
+        }
+
+        // Expert pinning used to live here, and it does not work on Metal. The idea was sound
+        // and the accounting was right: pin every routed expert stack to CPU/mmap, leave
+        // attention on the GPU, and a 20B model needs under 2 GB resident. What defeats it is
+        // how llama.cpp maps a model file. With mmap on, each device gets *one* buffer spanning
+        // from its first tensor to its last, and a MoE model interleaves expert and attention
+        // tensors throughout the file — so putting any attention tensor on the GPU forces the
+        // Metal mapping to cover every expert lying between them too.
+        //
+        // Measured on an iPhone 17 Pro loading GPT-OSS-20B, which is how this was found:
+        //
+        //     load_tensors:  CPU_Mapped model buffer size = 10949.33 MiB
+        //     load_tensors: MTL0_Mapped model buffer size = 11536.18 MiB
+        //     ggml_metal_log_allocated_size: warning: current allocated size is greater
+        //                                    than the recommended max working set size
+        //
+        // Both devices mapped essentially the whole 11.27 GiB file. Metal wired 12.5 GB against
+        // an 8.19 GB working set and the first command buffer died. llama.cpp says as much
+        // during the load — "tensor overrides to CPU are used with mmap enabled" — and the only
+        // way to get exact per-device buffers is `use_mmap = false`, which on iOS means copying
+        // 9.5 GB of experts into dirty memory: the same failure by a different route.
+        //
+        // Dense layer streaming below is not affected, and the reason is worth keeping in mind
+        // if this is ever revisited: it splits the model at a *layer boundary*, so each device's
+        // tensors occupy one contiguous run of the file and the two mappings barely overlap.
+        // Any future attempt at this has to preserve that property to be worth trying.
+
+        // Dense streaming: hold layers back from the GPU until the resident share fits.
+        let affordableLayers = gpuBudgetGB > 0 ? min(nLayer, Int(gpuBudgetGB / perLayerGB)) : 0
+        let nGpuLayers = min(correctnessCap, Int32(max(0, affordableLayers)))
+        let gpuGB = Double(min(Int(nGpuLayers), nLayer)) * perLayerGB
+        let cpuGB = max(0, modelSizeGB - gpuGB)
+
+        let note = String(format: "streaming: %d of %d layers on GPU (%.2f GB budget, %.3f GB/layer)",
+                          Int(nGpuLayers), nLayer, gpuBudgetGB, perLayerGB)
+        LogManager.shared.log("Offload plan — \(note)")
+
+        return OffloadPlan(nGpuLayers: nGpuLayers,
+                           // Layers left off the GPU are clean file-backed pages that iOS can
+                           // evict, but they are re-read on every forward pass, so they are
+                           // charged at better than half rather than discounted to nothing.
+                           residentWeightGB: gpuGB * 0.8 + cpuGB * 0.45,
+                           geometry: geometry,
+                           streamsFromStorage: true,
+                           note: note)
+    }
+
+    /// Context window the budget is allowed to aim for, before memory is considered.
+    ///
+    /// Shared by `planOffload` and `safeContextTokens` so the two cannot disagree about what
+    /// they are budgeting for — a mismatch here is invisible until a model quietly ends up with
+    /// a 512-token window.
+    private func contextClamp(requestedLimit: Int, trainedCtx: Int, modelSizeGB: Double) -> Int {
+        let trainedClamp = max(512, trainedCtx > 0 ? trainedCtx : requestedLimit)
+        let requestedClamp = max(512, min(requestedLimit, trainedClamp))
+        // Backstop independent of the detailed formula — never aim past this for a model of this
+        // size, in case a given architecture's real memory behaviour (e.g. Gemma's mixed
+        // local/global attention layers) doesn't match the generic per-layer estimate.
+        let hardCeiling = modelSizeGB > 4.0 ? 16384 : (modelSizeGB > 2.0 ? 32768 : 65536)
+        return min(requestedClamp, hardCeiling)
+    }
+
+    /// Compute and activation buffers — attention scratch space and batch buffers.
+    ///
+    /// This was `max(0.5, tokens / 8192 * 0.75)`, i.e. linear in the *requested* context, and it
+    /// was reserving memory that is never allocated. Measured on an iPhone 17 Pro at a 16,384
+    /// context with `n_batch` 512:
+    ///
+    ///     sched_reserve: MTL0 compute buffer size = 398.38 MiB
+    ///     sched_reserve:  CPU compute buffer size = 124.46 MiB
+    ///
+    /// 523 MiB in total, where the old formula reserved 1.5 GB — and 6 GB had the slider been at
+    /// 65,536. These buffers hold one batch of activations, so they scale with `n_batch`, which
+    /// is capped at 512, not with the size of the cache. Reserving against the context made the
+    /// budget self-defeating: the larger the window asked for, the more was withheld from the
+    /// cache that would have provided it, which is how a 1.9 GB model on a 12 GB phone ended up
+    /// with 512 tokens.
+    ///
+    /// Now essentially flat, with a slight context term for the bookkeeping that genuinely does
+    /// grow, and still roughly double the measured figure.
+    private func computeOverheadGB(forContext tokens: Int) -> Double {
+        0.75 + Double(tokens) / 65536.0 * 0.5
+    }
+
+    // MARK: - KV cache sizing
+
+    /// The data type the K/V cache is stored in, and what one cached element costs.
+    ///
+    /// Q8_0 packs 32 quantised values plus a single f16 scale into 34 bytes — 1.0625 bytes per
+    /// element against f16's 2.0 — so the same memory budget buys nearly twice the context
+    /// window, at a quality cost that is very hard to detect in practice. It requires flash
+    /// attention (enabled unconditionally at load) and head dimensions that divide evenly into
+    /// the 32-element block.
+    private enum KVCacheFormat {
+        case q8_0
+        case f16
+
+        var ggmlType: ggml_type {
+            switch self {
+            case .q8_0: return GGML_TYPE_Q8_0
+            case .f16:  return GGML_TYPE_F16
+            }
+        }
+
+        /// Bytes per cached element. Q8_0 is 34 bytes per 32-element block, scale included.
+        var bytesPerElement: Double {
+            switch self {
+            case .q8_0: return 34.0 / 32.0
+            case .f16:  return 2.0
+            }
+        }
+
+        var name: String {
+            switch self {
+            case .q8_0: return "Q8_0"
+            case .f16:  return "F16"
+            }
+        }
+    }
+
+    /// KV-cache geometry read from the model's own GGUF metadata, rather than guessed from file
+    /// size, so the per-token cost below tracks *this* model's real attention shape.
+    private struct KVGeometry {
+        let nLayer: Int
+        let nHeadKV: Int
+        let headDimK: Int
+        let headDimV: Int
+
+        /// K and V elements cached per token across every layer.
+        var elementsPerToken: Double {
+            Double(nLayer * nHeadKV) * Double(headDimK + headDimV)
+        }
+
+        /// A quantised cache needs each head dimension to divide evenly into the 32-element
+        /// block. Nearly every current architecture uses a multiple of 64, but the ones that
+        /// don't must stay on f16 rather than fail the load.
+        var supportsQuantizedCache: Bool {
+            headDimK % 32 == 0 && headDimV % 32 == 0
+        }
     }
 
     /// Computes a safe context window using the model's actual KV-cache geometry
@@ -133,50 +517,25 @@ actor LlamaRunner {
     /// This budgets deliberately conservatively. A previous, looser version of this formula
     /// (larger usable-memory fraction, flat compute overhead, lower weight-residency
     /// estimate) allowed large-vocab models like Gemma — which run most layers on CPU
-    /// because of the GPU-offload restriction above — to request a context window that
+    /// because of the correctness cap in `planOffload` — to request a context window that
     /// looked safe on paper but wasn't in practice, causing an out-of-memory failure severe
     /// enough to reboot the device rather than just being killed by iOS. Every margin below
     /// is intentionally wide; a smaller-than-necessary context window is a minor inconvenience,
     /// a device reboot is not an acceptable failure mode.
-    private func safeContextTokens(model: OpaquePointer,
+    private func safeContextTokens(geometry: KVGeometry?,
+                                   kvFormat: KVCacheFormat,
+                                   plan: OffloadPlan,
                                    availableMemoryGB: Double,
                                    modelSizeGB: Double,
                                    requestedLimit: Int,
                                    trainedCtx: Int) -> Int {
-        let trainedClamp = max(512, trainedCtx > 0 ? trainedCtx : requestedLimit)
-        let requestedClamp = max(512, min(requestedLimit, trainedClamp))
-        // Backstop applied to every return path below, independent of whether the detailed
-        // formula even runs — never request more than this for a model of this size, in case
-        // a given architecture's real memory behavior (e.g. Gemma's mixed local/global
-        // attention layers) doesn't match this generic per-layer estimate.
-        // Raised now that the budget below is derived from real, itemised deductions rather than
-        // a blanket halving — the memory maths is what protects the load, and this only guards
-        // against a given architecture's per-layer cost differing from the generic estimate.
-        let hardCeiling = modelSizeGB > 4.0 ? 16384 : (modelSizeGB > 2.0 ? 32768 : 65536)
-        let safeRequestedClamp = min(requestedClamp, hardCeiling)
+        let safeRequestedClamp = contextClamp(requestedLimit: requestedLimit,
+                                              trainedCtx: trainedCtx,
+                                              modelSizeGB: modelSizeGB)
 
-        let nLayer = Int(llama_model_n_layer(model))
-        let nHeadKV = Int(llama_model_n_head_kv(model))
-        guard nLayer > 0, nHeadKV > 0 else { return safeRequestedClamp }
+        guard let geometry else { return safeRequestedClamp }
 
-        func metaString(_ key: String) -> String? {
-            var buf = [CChar](repeating: 0, count: 128)
-            let n = llama_model_meta_val_str(model, key, &buf, buf.count)
-            guard n > 0 else { return nil }
-            return String(cString: buf)
-        }
-
-        let arch = metaString("general.architecture") ?? ""
-        let nHead = Int(llama_model_n_head(model))
-        let nEmbd = Int(llama_model_n_embd(model))
-        let fallbackHeadDim = nHead > 0 ? nEmbd / nHead : 128
-
-        let headDimK = (arch.isEmpty ? nil : metaString("\(arch).attention.key_length").flatMap { Int($0) }) ?? fallbackHeadDim
-        let headDimV = (arch.isEmpty ? nil : metaString("\(arch).attention.value_length").flatMap { Int($0) }) ?? headDimK
-        guard headDimK > 0, headDimV > 0 else { return safeRequestedClamp }
-
-        // Default KV cache dtype is f16 (2 bytes/element) unless explicitly overridden elsewhere.
-        let bytesPerTokenAllLayers = Double(nLayer * nHeadKV) * Double(headDimK + headDimV) * 2.0
+        let bytesPerTokenAllLayers = geometry.elementsPerToken * kvFormat.bytesPerElement
         guard bytesPerTokenAllLayers > 0 else { return safeRequestedClamp }
 
         // Budget against the process's real memory *allowance*, with named deductions.
@@ -194,20 +553,31 @@ actor LlamaRunner {
         //
         // Reserve for the OS and for transient spikes during the load itself (mmap page-in, KV
         // allocation, compute buffer setup), which can briefly exceed steady state.
-        let safetyMarginGB = max(1.0, availableMemoryGB * 0.10)
+        let safetyMarginGB = MemoryBudget.safetyMarginGB(for: availableMemoryGB)
 
-        // Weights are mmap'd (evictable) but with GPU offload restricted on large-vocab models
-        // (see the vocab probe above), most layers run on CPU and stay actively resident across
-        // every forward pass — budget close to the model's full file size, not a token discount.
-        // This is measured before the load, so the weights are not yet in `availableMemoryGB`.
-        let residentWeightGB = modelSizeGB * 0.8
+        // Weights are mmap'd, but only the tensors left off the GPU actually stay that way.
+        // Anything offloaded to Metal gets wired into GPU buffers and costs full price against
+        // the process's dirty-memory allowance; the rest are clean file-backed pages that iOS
+        // can evict and re-read. `planOffload` is where the placement is decided, so it is also
+        // where this is worked out — see `OffloadPlan.residentWeightGB` for how each regime is
+        // charged. Measured before the load, so none of it is yet reflected in
+        // `availableMemoryGB`.
+        let residentWeightGB = plan.residentWeightGB
 
-        // Compute/activation buffers (attention scratch space, batch buffers) scale with
-        // context size, not a flat constant — a large requested context needs meaningfully
-        // more scratch space than a small one.
-        let computeOverheadGB = max(0.5, Double(safeRequestedClamp) / 8192.0 * 0.75)
+        let computeOverheadGB = computeOverheadGB(forContext: safeRequestedClamp)
 
-        let availableForKVGB = availableMemoryGB - safetyMarginGB - residentWeightGB - computeOverheadGB
+        var availableForKVGB = availableMemoryGB - safetyMarginGB - residentWeightGB - computeOverheadGB
+
+        // The cache for GPU-resident layers lives in Metal buffers, so it competes with the
+        // weights for the working set — a second ceiling the process allowance knows nothing
+        // about. Leaving it out is the same oversight that let a fully-offloaded model clear the
+        // memory budget and then die on its first command buffer; here it would simply do so
+        // with a larger cache.
+        let metalGB = MemoryBudget.metalWorkingSetGB
+        if metalGB > 0 {
+            availableForKVGB = min(availableForKVGB,
+                                   metalGB - plan.residentWeightGB - computeOverheadGB - 0.25)
+        }
         guard availableForKVGB > 0.05 else { return 512 }
 
         let availableForKVBytes = availableForKVGB * 1024.0 * 1024.0 * 1024.0
@@ -215,11 +585,40 @@ actor LlamaRunner {
 
         let resolved = max(512, min(safeRequestedClamp, maxCtxByMemory))
         LogManager.shared.log(String(
-            format: "Context budget: %.2f GB free − %.2f margin − %.2f weights − %.2f compute = %.2f GB KV → %d tokens (requested %d, trained %d, applied %d)",
-            availableMemoryGB, safetyMarginGB, residentWeightGB, computeOverheadGB,
+            format: "Context budget (%@ KV): %.2f GB free − %.2f margin − %.2f weights − %.2f compute = %.2f GB KV → %d tokens (requested %d, trained %d, applied %d)",
+            kvFormat.name, availableMemoryGB, safetyMarginGB, residentWeightGB, computeOverheadGB,
             availableForKVGB, maxCtxByMemory, requestedLimit, trainedCtx, resolved
         ))
         return resolved
+    }
+
+    /// Set when a decode failed and the model was torn down as a result. `LLMManager` reads and
+    /// clears this after a generation so it can move the UI out of the "loaded" state.
+    private var decodeFaulted = false
+
+    func consumeDecodeFault() -> Bool {
+        defer { decodeFaulted = false }
+        return decodeFaulted
+    }
+
+    /// Tears the model down after `llama_decode` fails.
+    ///
+    /// A decode failure on Metal is not a recoverable per-call error. When a command buffer
+    /// fails — `kIOGPUCommandBufferCallbackErrorOutOfMemory` being the case that matters here —
+    /// the backend latches into an error state and llama.cpp says so explicitly: *recreate the
+    /// backend to recover*. Every subsequent decode then fails the same way, which is what
+    /// "the model loaded but never answers" actually is from the user's side.
+    ///
+    /// Worse, the Metal device is shared with the rest of the app (and with
+    /// stable-diffusion.cpp, hence the note in `unloadModelOnly`). A process sitting on an
+    /// exhausted GPU allocator corrupts SwiftUI's own rendering — the visual glitching that
+    /// accompanies this failure is not a separate bug, it is the same one. So the only correct
+    /// response is to give the memory back immediately rather than hold a context that can
+    /// never produce another token.
+    private func handleDecodeFailure(stage: String) {
+        LogManager.shared.log("Decode failed during \(stage) — unloading model to release the GPU allocator")
+        decodeFaulted = true
+        unloadModelOnly()
     }
 
     /// Unloads only the model+context, leaving the backend alive for the next load.
@@ -388,7 +787,8 @@ actor LlamaRunner {
             batch.n_tokens = Int32(chunkLen)
             
             if llama_decode(ctx, batch) != 0 {
-                continuation.yield("[Error: prefill decode failed]")
+                handleDecodeFailure(stage: "prefill")
+                continuation.yield("\n\n[The model ran out of GPU memory and had to be unloaded. Reload it, or pick a smaller one — this device can't run it at this context size.]")
                 continuation.finish()
                 return
             }
@@ -411,6 +811,9 @@ actor LlamaRunner {
         defer { llama_batch_free(singleBatch) }
 
         var accumulatedOutput = ""
+        /// Characters of `accumulatedOutput` already handed to the UI. Trails the accumulated
+        /// text whenever the tail might be the opening of a turn marker.
+        var yieldedCharCount = 0
 
         // MARK: Thinking-Block Suppression
         // Gemma and similar models emit internal reasoning inside thinking tags
@@ -481,6 +884,74 @@ actor LlamaRunner {
 
             // Copy logits to a Swift array for manipulation
             var logits = Array(UnsafeBufferPointer(start: logitsPtr, count: nVocab))
+
+            // Reject a distribution that carries no information before sampling from it.
+            //
+            // The NaN/inf guard further down catches a compute buffer full of garbage. It does
+            // not catch the other shape this failure takes: a buffer that came back *zeroed*, or
+            // otherwise constant. Every value is finite, so nothing downstream objects — but a
+            // flat distribution over a 128K vocabulary means top-p keeps essentially the whole
+            // vocabulary and sampling returns uniformly random tokens. The output is fluent-
+            // looking token salad, URL fragments and stray words, and it looks like the model
+            // being bad rather than the backend being broken.
+            //
+            // A healthy language model is sharply peaked; the gap between its best and worst
+            // logit is tens of units, never a rounding error. Measured on the raw values, before
+            // the repeat penalty and temperature below reshape them.
+            var minRaw = Float.greatestFiniteMagnitude
+            var maxRaw = -Float.greatestFiniteMagnitude
+            for value in logits where value.isFinite {
+                minRaw = min(minRaw, value)
+                maxRaw = max(maxRaw, value)
+            }
+            let rawSpread = maxRaw - minRaw
+
+            if generatedCount == 0 {
+                // One line per generation, at the first token: enough to tell a broken backend
+                // from a bad model in a diagnostic log, without flooding it.
+                //
+                // The spread alone doesn't separate the two failures that matter. A backend
+                // producing garbage and a model that is simply incoherent can both yield a
+                // healthy-looking range; what distinguishes them is the *shape* at the top. A
+                // working model concentrates most of its mass in a handful of tokens, so the
+                // top few probabilities and what they actually decode to answer the question
+                // outright: a confident, sensible top token means the engine is fine and the
+                // weights are to blame, while a top token holding a fraction of a percent means
+                // the distribution is flat and the tokens coming out are close to uniform noise
+                // no matter how sane the sampler is.
+                let peak = logits.enumerated()
+                    .filter { $0.element.isFinite }
+                    .sorted { $0.element > $1.element }
+                    .prefix(5)
+                let shifted = peak.map { expf($0.element - maxRaw) }
+                // Normalised against the whole vocabulary, not just these five, so the figures
+                // are true probabilities rather than a ratio among the leaders.
+                var total: Float = 0
+                for value in logits where value.isFinite { total += expf(value - maxRaw) }
+                let summary = zip(peak, shifted).map { entry, weight -> String in
+                    var buf = [CChar](repeating: 0, count: 128)
+                    let count = llama_token_to_piece(vocab, llama_token(entry.offset), &buf, 128, 0, true)
+                    let piece = count > 0
+                        ? String(decoding: buf[0..<Int(count)].map { UInt8(bitPattern: $0) }, as: UTF8.self)
+                        : "?"
+                    let percent = total > 0 ? weight / total * 100 : 0
+                    return String(format: "%@ %.2f%%", piece.debugDescription, percent)
+                }.joined(separator: ", ")
+
+                Task { @MainActor in
+                    LogManager.shared.log(String(format: "Sampler health: logit range %.3f … %.3f (spread %.3f) over %d tokens",
+                                                 minRaw, maxRaw, rawSpread, nVocab))
+                    LogManager.shared.log("Sampler health: top tokens — \(summary)")
+                }
+            }
+
+            if !rawSpread.isFinite || rawSpread < 0.01 {
+                Task { @MainActor in
+                    LogManager.shared.log(String(format: "LlamaRunner: degenerate logits (spread %.6f) — compute buffer is not producing real output; stopping.", rawSpread))
+                }
+                continuation.yield("\n\n[Generation stopped — the model's compute output came back empty, which means the GPU/CPU split isn't producing real results rather than the model writing badly. Try reloading it, or a smaller model.]")
+                break
+            }
 
             // Apply repeat penalty
             for tok in recentTokens {
@@ -643,13 +1114,73 @@ actor LlamaRunner {
                         // ChatML (<|im_end|>), Gemma (<start_of_turn>user), Llama 3
                         // (<|eot_id|>, <|start_header_id|>user), and a couple of generic forms.
                         let lower = accumulatedOutput.lowercased()
-                        if lower.hasSuffix("[inst]") || lower.hasSuffix("user:") || lower.hasSuffix("<|im_end|>") ||
-                            lower.hasSuffix("<start_of_turn>user") || lower.hasSuffix("<|user|>") ||
-                            lower.hasSuffix("<|eot_id|>") || lower.hasSuffix("<|start_header_id|>user") {
+
+                        // Angle-bracket turn markers, matched anywhere rather than only at the
+                        // very end. Two reasons the suffix-only form wasn't enough:
+                        //
+                        // `<|assistant|>` was missing from the list entirely, which is what let
+                        // OLMoE finish its answer, open a fresh turn and then write *both* sides
+                        // of the conversation — it emits that marker as ordinary text because
+                        // it isn't a single special token in this vocabulary, so
+                        // `llama_vocab_is_eog` above never sees it.
+                        //
+                        // And a marker only lands exactly at the end if the final piece stops
+                        // there. Here it arrived as `<|assistant|>\n`, so the suffix test failed
+                        // even for the markers that were listed. Searching the text instead, and
+                        // cutting at the marker, catches it wherever the tokeniser puts the
+                        // boundary.
+                        //
+                        // These forms never occur in ordinary prose, so a substring match is
+                        // safe. `[inst]` and `user:` do occur, so they stay suffix-only below.
+                        let turnMarkers = ["<|assistant|>", "<|user|>", "<|system|>",
+                                           "<|im_start|>", "<|im_end|>", "<|endoftext|>",
+                                           "<|eot_id|>", "<|start_header_id|>", "<|end|>",
+                                           "<|return|>", "<|call|>", "<start_of_turn>"]
+                        if let cut = turnMarkers.compactMap({ lower.range(of: $0)?.lowerBound }).min() {
+                            // Everything before the marker is real content, and some of it may
+                            // still be held back (see below), so flush that before stopping and
+                            // drop the marker and everything after it.
+                            let held = accumulatedOutput.index(accumulatedOutput.startIndex,
+                                                               offsetBy: yieldedCharCount)
+                            if cut > held {
+                                continuation.yield(String(accumulatedOutput[held..<cut]))
+                                yieldedRealToken = true
+                            }
+                            accumulatedOutput = String(accumulatedOutput[..<cut])
                             break
                         }
-                        continuation.yield(piece)
-                        yieldedRealToken = true
+
+                        if lower.hasSuffix("[inst]") || lower.hasSuffix("user:") {
+                            break
+                        }
+
+                        // Hold back any tail that could still turn into a marker.
+                        //
+                        // A tokeniser rarely hands over `<|assistant|>` in one piece — it comes
+                        // as `<`, `|`, `assistant`, `|`, `>`. Yielding each piece the moment it
+                        // arrives means the first four are already on screen by the time the
+                        // fifth completes the match, so the marker gets cut from the transcript
+                        // but its opening still shows. Emitting only up to the last position
+                        // that cannot begin a marker defers those characters until they're
+                        // proven to be ordinary text.
+                        let pendingPrefix = turnMarkers.reduce(0) { longest, marker in
+                            var length = min(marker.count - 1, lower.count)
+                            while length > longest {
+                                if lower.hasSuffix(marker.prefix(length)) { return length }
+                                length -= 1
+                            }
+                            return longest
+                        }
+                        let safeCount = accumulatedOutput.count - pendingPrefix
+                        if safeCount > yieldedCharCount {
+                            let from = accumulatedOutput.index(accumulatedOutput.startIndex,
+                                                               offsetBy: yieldedCharCount)
+                            let to = accumulatedOutput.index(accumulatedOutput.startIndex,
+                                                             offsetBy: safeCount)
+                            continuation.yield(String(accumulatedOutput[from..<to]))
+                            yieldedCharCount = safeCount
+                            yieldedRealToken = true
+                        }
                     }
                     // Thinking-block tokens: silently consumed — no UI yield, no budget decrement.
                     // Still reported via onThinkingProgress so the UI can show live movement
@@ -717,7 +1248,11 @@ actor LlamaRunner {
             singleBatch.logits[0] = 1
             singleBatch.n_tokens  = 1
 
-            if llama_decode(ctx, singleBatch) != 0 { break }
+            if llama_decode(ctx, singleBatch) != 0 {
+                handleDecodeFailure(stage: "generation")
+                continuation.yield("\n\n[The model ran out of GPU memory and had to be unloaded. Reload it, or pick a smaller one — this device can't run it at this context size.]")
+                break
+            }
 
             nPos += 1
             // Only increment the response budget counter for real (non-thinking) tokens
@@ -747,6 +1282,14 @@ class LLMManager: ObservableObject {
     /// Context window actually applied to the loaded model (post safeContextTokens clamp),
     /// distinct from `contextTokenLimit` which is just the user's requested setting.
     @Published var loadedContextWindow: Int = 0
+
+    /// Context the loaded model was trained for, 0 when nothing is loaded.
+    ///
+    /// A hard property of the weights: asking for more than this doesn't extend the model's
+    /// reach, it just allocates cache the model cannot use. Kept separate from
+    /// `loadedContextWindow` (what was actually applied) so the ceiling can explain *why* it is
+    /// where it is.
+    @Published var loadedTrainedContext: Int = 0
     /// Prompt tokens + tokens generated so far in the current/most recent turn — the live
     /// "how full is the context window right now" figure shown in the status bar.
     @Published var contextTokensUsed: Int = 0
@@ -851,7 +1394,14 @@ class LLMManager: ObservableObject {
     /// own memory profile once one exists.
     var effectiveContextCeiling: Int {
         if case .loaded = loadState {
-            return min(deviceContextCeiling, safeContextLimit)
+            // Three independent bounds, all of which have to hold: what the hardware can carry,
+            // what this model's memory profile leaves room for, and what the model was trained
+            // for. The last was missing, so the slider would offer 65,536 tokens against an
+            // 8,192-token model, the load would quietly apply 8,192, and Settings would go on
+            // reporting a number the user could never actually get.
+            var ceiling = min(deviceContextCeiling, safeContextLimit)
+            if loadedTrainedContext > 0 { ceiling = min(ceiling, loadedTrainedContext) }
+            return ceiling
         }
         return deviceContextCeiling
     }
@@ -888,7 +1438,16 @@ class LLMManager: ObservableObject {
     /// had actually granted this process and warned far too early on a large-memory device.
     var safeContextLimit: Int {
         let availableGB = MemoryBudget.plannableHeadroomGB()
-        let safetyMarginGB = max(1.0, availableGB * 0.10)
+        let safetyMarginGB = MemoryBudget.safetyMarginGB(for: availableGB)
+
+        // The per-token figures below were calibrated against an f16 KV cache. The runner now
+        // applies a Q8_0 cache wherever the architecture allows it (see `KVCacheFormat`), at
+        // 1.0625 bytes per element instead of 2.0, so leaving them unscaled would warn at
+        // roughly half the context the load will really grant. A model whose head geometry
+        // forces the f16 fallback makes this advisory number optimistic, which is harmless:
+        // `safeContextTokens` still clamps at load time and `applyContextCeiling` re-clamps
+        // afterwards, so the slider corrects itself rather than over-committing the device.
+        let kvQuantFactor = (34.0 / 32.0) / 2.0
 
         switch loadState {
         case .loaded(_, let sizeGB):
@@ -896,13 +1455,13 @@ class LLMManager: ObservableObject {
             // compute buffers still need reserving on top of the margin.
             let availableForKV = availableGB - safetyMarginGB - 0.75
             if availableForKV <= 0 { return 2048 }
-            let gbPer1kTokens = max(0.04, sizeGB * 0.02)
+            let gbPer1kTokens = max(0.04, sizeGB * 0.02) * kvQuantFactor
             return max(2048, min(65536, Int((availableForKV / gbPer1kTokens) * 1000)))
         default:
             // Nothing loaded yet: leave room for a typical model plus its compute buffers.
             let availableForKV = availableGB - safetyMarginGB - 2.5
             if availableForKV <= 0 { return 4096 }
-            let gbPer1kTokens = 0.08
+            let gbPer1kTokens = 0.08 * kvQuantFactor
             return max(2048, min(65536, Int((availableForKV / gbPer1kTokens) * 1000)))
         }
     }
@@ -973,7 +1532,58 @@ class LLMManager: ObservableObject {
     /// after unloading a multi-gigabyte diffusion checkpoint was routinely too short, and the
     /// reload then failed its own safety check over memory that was about to come back.
     func memoryHeadroomNeededGB(forModelSizeGB modelSizeGB: Double) -> Double {
-        (modelSizeGB * 1.15 + 2.0) / 0.85
+        // Clamped to what this device can actually reach. For a model that is going to stream
+        // its weights, the fully-resident figure is unreachable by definition, and waiting on it
+        // would spend the whole `waitForRelease` timeout before every single load.
+        let fullyResident = (modelSizeGB * 1.15 + MemoryBudget.fixedOverheadGB(for: MemoryBudget.plannableHeadroomGB())) / 0.85
+        return min(fullyResident, MemoryBudget.ceilingGB() * 0.85)
+    }
+
+    /// Largest model this device will attempt at all, streaming included.
+    ///
+    /// Partial offload takes memory out of the role of hard limit — whatever doesn't fit stays
+    /// as evictable mmap pages, so a model well beyond the memory budget still loads. What it
+    /// does not remove is the cost of reading those pages back, and past some size the result is
+    /// too slow to be worth offering. This cap is what keeps "it loads" from quietly becoming
+    /// "it loads and emits a token a minute".
+    ///
+    /// Where that size falls depends entirely on how much of the file a single token touches. A
+    /// dense model re-reads every streamed byte per token, so the ceiling has to sit close to
+    /// what the device can nearly hold. A sparse one reads a few experts per block, so a much
+    /// larger file stays responsive and the ceiling can be far more generous. Both multipliers
+    /// are judgement calls that want measuring on real hardware.
+    /// Sparse models used to get a far larger ceiling here, on the grounds that pinning experts
+    /// meant only a fraction of the file had to be resident. Expert pinning is gone (see
+    /// `planOffload`), so a mixture-of-experts model now costs exactly what a dense one of the
+    /// same size costs and is judged on the same terms.
+    var streamableSizeCeilingGB: Double { systemMemoryGB * 1.5 }
+
+    /// Resident cost of a load that streams most of its weights: KV cache, compute buffers and
+    /// the app itself. The weights are excluded because the ones being streamed are file-backed
+    /// and evictable, and so are not charged against the process's dirty-memory allowance.
+    private var streamingFloorGB: Double {
+        MemoryBudget.fixedOverheadGB(for: MemoryBudget.plannableHeadroomGB())
+    }
+
+    /// Whether a model of this size will have to stream part of itself from storage rather than
+    /// sit entirely in memory. Lets the UI explain the cost before the load rather than after.
+    func willStreamFromStorage(modelSizeGB: Double) -> Bool {
+        let headroom = MemoryBudget.plannableHeadroomGB()
+        return modelSizeGB * 1.15 + MemoryBudget.fixedOverheadGB(for: headroom) > headroom * 0.85
+    }
+
+
+
+    /// Convenience for callers holding a file rather than a bare size — profiles it so a sparse
+    /// model is judged against the sparse ceiling.
+    ///
+    /// The profile is only taken when it can change the answer, i.e. when the model is too large
+    /// to hold resident. Reading a GGUF header means parsing its full metadata block, tokenizer
+    /// vocabulary included, which is milliseconds but not free; the model picker calls this once
+    /// per row while building a list on the main thread, and models that comfortably fit — which
+    /// is most of them — have no reason to pay for it.
+    func checkMemorySafety(at url: URL) -> MemorySafetyStatus {
+        checkMemorySafety(modelSizeGB: getModelSizeGB(at: url))
     }
 
     func checkMemorySafety(modelSizeGB: Double) -> MemorySafetyStatus {
@@ -984,7 +1594,7 @@ class LLMManager: ObservableObject {
         // loaded, so it can't size those precisely the way safeContextTokens does downstream —
         // budget generously here since this is the only check standing between "load" and a
         // process-limit failure) let modelSizeGB scale it (larger models load larger buffers).
-        let required = modelSizeGB * 1.15 + 2.0
+        let required = modelSizeGB * 1.15 + MemoryBudget.fixedOverheadGB(for: availableNowGB)
 
         // Real-time check: how much headroom does THIS process actually have right now,
         // before hitting its dirty-memory limit? Total device RAM is a constant and can't
@@ -994,7 +1604,22 @@ class LLMManager: ObservableObject {
         // launch to fail with an out-of-memory error even though the identical load succeeds
         // seconds later via Settings, once that startup churn has settled.
         if required > availableNowGB * 0.85 {
-            return .dangerous(requiredGB: required, availableGB: availableNowGB)
+            // Not enough room to hold the whole model resident. That used to end the matter, and
+            // it is what kept a 7B Q4 off an 8 GB device entirely: the check weighed the whole
+            // file against the memory budget, even though only the layers actually offloaded to
+            // Metal are charged against it.
+            //
+            // `LlamaRunner.planOffload` now sizes the GPU share to fit the budget and leaves the
+            // remaining layers mmap'd. So the real question here is narrower — does the
+            // *streaming floor* fit (the KV cache and compute buffers, which are unavoidably
+            // resident), and is the model small enough to stream at a tolerable speed? If both
+            // hold, this is a warning about speed rather than a refusal, and `handleModelSelection`
+            // puts the decision to the user.
+            guard modelSizeGB <= streamableSizeCeilingGB,
+                  streamingFloorGB < availableNowGB * 0.85 else {
+                return .dangerous(requiredGB: required, availableGB: availableNowGB)
+            }
+            return .warning(requiredGB: required, availableGB: availableNowGB)
         }
 
         // If the required memory takes up more than 90% of total device RAM, it's a no-go
@@ -1102,12 +1727,14 @@ class LLMManager: ObservableObject {
 
                 let hasVision = await runner.supportsVision()
                 let appliedContextWindow = await runner.getContextWindowTokens()
+                let trainedContextWindow = await runner.getTrainedContextTokens()
 
                 await MainActor.run {
                     self.loadState = .loaded(modelName: url.lastPathComponent, sizeGB: sizeGB)
                     self.modelSupportsVision = hasVision
                     self.lastUsedModelPath = url.path
                     self.loadedContextWindow = appliedContextWindow
+                    self.loadedTrainedContext = trainedContextWindow
                     self.contextTokensUsed = 0
                     self.currentResponseTokenCount = 0
                     // Now that a model is resident, the ceiling is model-aware and usually
@@ -1321,8 +1948,22 @@ class LLMManager: ObservableObject {
                 }
             }
 
+            // A decode failure tears the model down inside the actor (see
+            // `handleDecodeFailure`). Without this the app would keep showing a loaded model
+            // that can never answer again — which is exactly how this surfaced: "the model
+            // loaded but does not respond".
+            let faulted = await runner.consumeDecodeFault()
+
             await MainActor.run {
                 isGenerating = false
+                if faulted {
+                    self.loadState = .failed(error: "The model ran out of GPU memory while generating and was unloaded. Try a smaller model, or lower the context size in Settings.")
+                    self.activeModelURL = nil
+                    self.modelSupportsVision = false
+                    self.loadedContextWindow = 0
+                    self.loadedTrainedContext = 0
+                    self.contextTokensUsed = 0
+                }
                 onComplete(accumulated)
             }
         }
@@ -1410,9 +2051,11 @@ class LLMManager: ObservableObject {
             Task {
                 await runner.generateStream(
                     messages: [systemMsg, userMsg],
-                    // Short and cheap by design — this delays the start of image generation,
-                    // so it should read as "a beat of extra thinking," not a second wait.
-                    maxTokens: 120,
+                    // Raised from 120. A reasoning model spends its whole budget inside a
+                    // `<think>` block before writing a single word of the actual prompt, so a
+                    // tight cap meant the reply was *entirely* deliberation and there was nothing
+                    // left to use. Still short enough to read as a beat, not a second wait.
+                    maxTokens: 220,
                     temperature: 0.6,
                     continuation: continuation
                 )
@@ -1420,13 +2063,106 @@ class LLMManager: ObservableObject {
         }
         for await piece in stream { accumulated += piece }
 
-        let cleaned = accumulated
+        return Self.usableImagePrompt(from: accumulated, matching: userRequest)
+    }
+
+    /// Extracts a usable Stable Diffusion prompt from raw model output, or `nil` if what came back
+    /// can't be trusted to describe what the user asked for.
+    ///
+    /// This is the fix for images that had nothing to do with the request. The old version trimmed
+    /// whitespace and quotes, checked the length, and handed the result to the text encoder — so
+    /// three separate kinds of non-prompt sailed through and became the image:
+    ///
+    /// * **Reasoning blocks.** `<think>Okay, the user wants a barn…</think>` is what a reasoning
+    ///   model emits first, and at the old token budget it was frequently the entire response.
+    ///   CLIP was handed the model's private deliberation verbatim.
+    /// * **Conversational preamble.** "Sure! Here's a prompt for you:" is longer than three
+    ///   characters, so it passed, and it describes nothing.
+    /// * **Refusals and meta-commentary.** "I can't help with that" likewise.
+    ///
+    /// Filtering handles the first two. The subject check handles what filtering cannot: a model
+    /// that ignored the instruction and answered a different question entirely. Requiring one
+    /// content word from the request to survive into the expansion is deliberately loose — a good
+    /// expansion elaborates on the subject rather than replacing it, so this rejects drift without
+    /// punishing the paraphrasing the expansion exists to do.
+    ///
+    /// `internal` and `static` so it can be exercised directly; nothing about it needs the actor.
+    nonisolated static func usableImagePrompt(from raw: String, matching userRequest: String) -> String? {
+        // The same cleanup the chat bubble applies, which is what removes `<think>` blocks,
+        // channel markers, bare scaffolding headers, and role echoes.
+        var cleaned = ModelOutput.filterThoughts(from: raw)
             .trimmingCharacters(in: .whitespacesAndNewlines)
-            .trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
-        // Sanity-guard the output — a degenerate/empty/runaway result is worse than just
-        // falling back to the caller's own rule-based prompt.
+            .trimmingCharacters(in: CharacterSet(charactersIn: "\"'`"))
+
+        // A leading label survives `filterThoughts` because "Prompt:" is a legitimate thing for a
+        // reply to contain — it only reads as scaffolding here, where the whole output is supposed
+        // to *be* the prompt.
+        for label in ["prompt:", "image prompt:", "sd prompt:", "here is the prompt:",
+                      "here's the prompt:", "output:", "final prompt:"] {
+            if cleaned.lowercased().hasPrefix(label) {
+                cleaned = String(cleaned.dropFirst(label.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+
+        // One line. Models that add a trailing "Let me know if you'd like…" put it on its own
+        // line, and the first line is the prompt in every well-formed case.
+        if let firstLine = cleaned.split(separator: "\n").first(where: {
+            !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }) {
+            cleaned = String(firstLine).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        cleaned = cleaned.trimmingCharacters(in: CharacterSet(charactersIn: "\"'`*"))
+
         guard cleaned.count > 3, cleaned.count < 500 else { return nil }
+
+        // Reject the shapes that are unmistakably the model talking *about* the task rather than
+        // performing it. Checked as a prefix so a prompt that legitimately contains "sorry" (a
+        // sorrowful scene) isn't caught by the word appearing anywhere.
+        let lower = cleaned.lowercased()
+        let refusalOpeners = ["i can't", "i cannot", "i'm sorry", "i am sorry", "sorry,",
+                              "as an ai", "i'm unable", "i am unable", "sure!", "sure,",
+                              "certainly", "of course", "here is", "here's", "okay, ", "ok, ",
+                              "the user "]
+        if refusalOpeners.contains(where: { lower.hasPrefix($0) }) { return nil }
+
+        // Subject check. If the request had nothing concrete in it ("draw something nice"), there
+        // is nothing to verify against and the expansion is accepted as-is.
+        let requestWords = contentWords(in: userRequest)
+        guard !requestWords.isEmpty else { return cleaned }
+        let promptWords = contentWords(in: cleaned)
+        let survived = requestWords.contains { word in
+            promptWords.contains(word) || promptWords.contains { $0.hasPrefix(word) || word.hasPrefix($0) }
+        }
+        guard survived else {
+            LogManager.shared.log("Image prompt expansion discarded — it dropped the subject of the request")
+            return nil
+        }
+
         return cleaned
+    }
+
+    /// Lowercased words worth matching on: long enough to be a subject rather than grammar, and
+    /// not one of the words every image request contains regardless of what it depicts.
+    ///
+    /// The vague-adjective entries at the end matter as much as the verbs. Without them, "draw
+    /// something nice" yielded the content words {something, nice} and then rejected every
+    /// expansion that didn't literally repeat them — throwing away a perfectly good prompt because
+    /// the request had named nothing for it to keep. A request made only of filler should leave
+    /// nothing to check against, which is exactly what the caller treats as "accept as-is".
+    private nonisolated static func contentWords(in text: String) -> Set<String> {
+        let ignored: Set<String> = [
+            "image", "picture", "photo", "photograph", "draw", "drawing", "paint", "painting",
+            "generate", "create", "make", "render", "show", "illustration", "illustrate",
+            "please", "with", "that", "this", "some", "very", "into", "from", "your", "have",
+            "want", "would", "could", "about", "like", "give", "using", "style", "quality",
+            "something", "anything", "everything", "someone", "somebody", "stuff", "thing",
+            "things", "nice", "cool", "good", "great", "pretty", "beautiful", "awesome",
+            "amazing", "interesting", "random", "please", "maybe", "really"
+        ]
+        let words = text.lowercased()
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { $0.count > 3 && !ignored.contains($0) }
+        return Set(words)
     }
 
 }

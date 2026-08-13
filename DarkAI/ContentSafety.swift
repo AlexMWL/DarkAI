@@ -15,7 +15,14 @@ import Foundation
 /// reporting flow in `ContentReportManager` exists precisely because no lexical filter is
 /// complete. Thresholds below are tuned to favour false positives on child-safety terms and
 /// false negatives everywhere else, which is the correct asymmetry.
-enum ContentSafety {
+///
+/// Explicitly `nonisolated`, for the same reason as `AppFiles` and `LogManager`: this module
+/// builds with `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`, and screening is not UI work. The
+/// type holds nothing but immutable `static let` term lists and pure functions over its
+/// arguments, so it is safe from any thread — and it has to be, because the file-import path
+/// screens up to several hundred kilobytes at once (see `StructuredImport.parse`) and that is
+/// emphatically not something to run on the main thread.
+nonisolated enum ContentSafety {
 
     // MARK: - Types
 

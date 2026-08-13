@@ -41,13 +41,32 @@ struct GlitchBackgroundView: View {
             )
             .ignoresSafeArea()
 
-            // Abstract grid or tech lines
-            VStack(spacing: 40) {
-                ForEach(0..<20) { i in
-                    Rectangle()
-                        .fill(Theme.textMuted.opacity(colorScheme == .dark ? 0.05 : 0.09))
-                        .frame(height: 1)
+            // Abstract grid or tech lines.
+            //
+            // Drawn through a `GeometryReader` rather than as a fixed stack of 20 rows, and that is
+            // a layout fix rather than a cosmetic one. Twenty rows at 40 pt spacing have an
+            // intrinsic height of 780 pt, and because this whole view is a `ZStack` whose other
+            // children are flexible, that 780 pt became the backdrop's reported size. On every
+            // screen shorter than that — iPhone SE and iPhone 8, both 667 pt — any container using
+            // this view as a *sibling* inherited the oversized frame and pushed its own content off
+            // the bottom of the display: it is why onboarding's "Continue" button was sliced in half
+            // by the screen edge on an SE while looking perfectly placed on a 15 Pro.
+            //
+            // A `GeometryReader` accepts whatever size it is offered instead of demanding one, so
+            // the backdrop can no longer inflate its parent, and the row count now follows the
+            // available height — which also means the grid reaches the bottom of a tall screen
+            // rather than stopping 70 pt short of it.
+            GeometryReader { geometry in
+                let spacing: CGFloat = 40
+                let rowCount = max(1, Int(geometry.size.height / spacing) + 1)
+                VStack(spacing: spacing - 1) {
+                    ForEach(0..<rowCount, id: \.self) { _ in
+                        Rectangle()
+                            .fill(Theme.textMuted.opacity(colorScheme == .dark ? 0.05 : 0.09))
+                            .frame(height: 1)
+                    }
                 }
+                .frame(width: geometry.size.width, alignment: .top)
             }
 
             // The three brain layers all dim with `.opacity` rather than a tint colour.

@@ -1,7 +1,10 @@
 import Foundation
 import Combine
 
-struct ChatMessage: Identifiable, Codable, Equatable {
+/// `nonisolated` because these are pure value types that have to be readable away from the UI:
+/// `ConversationExport` encodes a whole transcript — potentially with embedded image data — off
+/// the main actor precisely so a long chat doesn't block it. Nothing here is mutable shared state.
+nonisolated struct ChatMessage: Identifiable, Codable, Equatable {
     var id: UUID = UUID()
     var isUser: Bool
     var text: String
@@ -18,7 +21,7 @@ struct ChatMessage: Identifiable, Codable, Equatable {
     var isImageMessage: Bool { imageData != nil }
 }
 
-struct Conversation: Identifiable, Codable, Equatable {
+nonisolated struct Conversation: Identifiable, Codable, Equatable {
     var id: UUID = UUID()
     var title: String
     var messages: [ChatMessage]

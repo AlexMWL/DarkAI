@@ -88,12 +88,27 @@ struct PromptClassifier {
             if lower.hasPrefix(exclusion) { return .text }
         }
 
-        // 2. Strong triggers (highest confidence)
-        for trigger in strongTriggers {
-            if lower.hasPrefix(trigger) || lower.contains(trigger) {
-                let refined = stripTrigger(trigger, from: trimmed)
-                return .imageGeneration(refinedPrompt: refined.isEmpty ? trimmed : refined)
-            }
+        // 2. Strong triggers (highest confidence).
+        //
+        // Two passes, and the split matters for what the diffusion model ends up being asked for.
+        //
+        // Leading triggers are stripped, because "generate an image of a red barn" is a request
+        // wrapped around a subject and only the subject should reach the sampler. Longest match
+        // first: the list has both "generate " and "generate an image", and checking in
+        // declaration order meant the short one won and left "an image of a red barn" — two
+        // wasted CLIP tokens of instruction that describe nothing.
+        //
+        // A trigger found *mid-sentence* is left alone entirely. It is part of a description
+        // there, not a wrapper around one, and the old code cut it out wherever it appeared:
+        // "a mural that could illustrate a children's book" came out as "a mural that could a
+        // children's book". Classifying the message as an image request is still right; butchering
+        // it on the way to the sampler is not.
+        for trigger in strongTriggersLongestFirst where lower.hasPrefix(trigger) {
+            let refined = stripLeadingTrigger(trigger, from: trimmed)
+            return .imageGeneration(refinedPrompt: refined.isEmpty ? trimmed : refined)
+        }
+        for trigger in strongTriggersLongestFirst where lower.contains(trigger) {
+            return .imageGeneration(refinedPrompt: trimmed)
         }
 
         // 3. Pattern triggers (medium confidence)
@@ -115,32 +130,61 @@ struct PromptClassifier {
         return .text
     }
 
+    /// `strongTriggers` ordered longest-first, so the most specific phrasing in a message is the
+    /// one that gets matched and stripped. Computed once.
+    private static let strongTriggersLongestFirst: [String] =
+        strongTriggers.sorted { $0.count > $1.count }
+
+    /// Leftover framing to peel off after the trigger itself is gone. "generate an image of a
+    /// dragon" leaves "an image of a dragon"; the subject is "a dragon", and the rest is
+    /// instruction that would otherwise be encoded as if it were part of the picture.
+    private static let residualFraming: [String] = [
+        "me an image of ", "me a picture of ", "me a photo of ", "me an ", "me a ", "me ",
+        "an image of ", "a image of ", "image of ",
+        "a picture of ", "picture of ",
+        "a photo of ", "photo of ", "a photograph of ", "photograph of ",
+        "an illustration of ", "illustration of ",
+        "a drawing of ", "drawing of ",
+        "a painting of ", "painting of ",
+        "for me ", "of "
+    ]
+
     // MARK: Prompt Refinement
 
-    /// Strips the triggering verb/prefix from the prompt so the diffusion model
-    /// receives a clean subject description.
+    /// Strips a leading trigger, plus any framing left behind, so the diffusion model receives a
+    /// subject description rather than the instruction that wrapped it.
     ///
-    /// e.g. "generate a sunset over the ocean" → "sunset over the ocean"
-    ///      "draw me a dragon" → "a dragon"
-    private static func stripTrigger(_ trigger: String, from original: String) -> String {
-        // Searched case-insensitively on `original` rather than on a lowercased copy, so the
-        // range belongs to the string it's used on.
-        //
-        // The previous version took the range from `original.lowercased()` and applied it to
-        // `original`. Swift string indices carry UTF-8 offsets, and lowercasing can change the
-        // byte length — "İ" (U+0130, 2 bytes) lowercases to "i̇" (3 bytes) — so a few of those
-        // ahead of the trigger pushed the range past the end of `original` and the removal
-        // trapped with "String index range is out of bounds". That is an uncatchable crash on
-        // a path that runs on every message the user sends.
-        guard let range = original.range(of: trigger, options: [.caseInsensitive]) else {
-            return original.trimmingCharacters(in: .whitespacesAndNewlines)
+    /// e.g. "generate a sunset over the ocean" → "a sunset over the ocean"
+    ///      "generate an image of a dragon"    → "a dragon"
+    ///      "draw me a dragon"                 → "a dragon"
+    ///
+    /// Only ever called with a trigger that is genuinely a prefix — see `classify`.
+    private static func stripLeadingTrigger(_ trigger: String, from original: String) -> String {
+        // Removal by prefix length on `original` itself, never via a range taken from a lowercased
+        // copy. Swift string indices carry UTF-8 offsets and lowercasing can change byte length —
+        // "İ" (U+0130, 2 bytes) lowercases to "i̇" (3 bytes) — so a range derived from the
+        // lowercased string could run past the end of `original` and trap with "String index range
+        // is out of bounds", an uncatchable crash on a path that runs on every message sent.
+        // Counting characters off the front is immune to that.
+        var cleaned = String(original.dropFirst(trigger.count))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // Peel repeatedly: "draw me an image of a dragon" needs two passes.
+        var didStrip = true
+        while didStrip {
+            didStrip = false
+            if cleaned.hasPrefix(":") {
+                cleaned = String(cleaned.dropFirst()).trimmingCharacters(in: .whitespaces)
+                didStrip = true
+            }
+            let lower = cleaned.lowercased()
+            for framing in residualFraming where lower.hasPrefix(framing) {
+                cleaned = String(cleaned.dropFirst(framing.count))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                didStrip = true
+                break
+            }
         }
-        var cleaned = original
-        cleaned.removeSubrange(range)
-        cleaned = cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
-        // Remove leftover "of" or ":" artefacts
-        if cleaned.lowercased().hasPrefix("of ") { cleaned = String(cleaned.dropFirst(3)) }
-        if cleaned.hasPrefix(":") { cleaned = String(cleaned.dropFirst(1)).trimmingCharacters(in: .whitespaces) }
         return cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
