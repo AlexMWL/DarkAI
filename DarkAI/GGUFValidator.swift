@@ -54,14 +54,12 @@ enum GGUFValidator {
         }
         defer { handle.closeFile() }
 
-        // — Magic bytes ———————————————————————————————————————————————————
         let magicData = handle.readData(ofLength: 4)
         guard magicData.count == 4,
               String(data: magicData, encoding: .ascii) == "GGUF" else {
             throw error("\(url.lastPathComponent) is not a valid GGUF file (bad magic bytes).")
         }
 
-        // — Version ———————————————————————————————————————————————————————
         let versionData = handle.readData(ofLength: 4)
         guard versionData.count == 4 else { throw error("Truncated GGUF header (version).") }
         let version = versionData.withUnsafeBytes { $0.load(as: UInt32.self).littleEndian }
@@ -69,15 +67,12 @@ enum GGUFValidator {
             throw error("Unsupported GGUF version \(version). Expected 2 or 3.")
         }
 
-        // — tensor_count (skip) ————————————————————————————————————————————
         let _ = handle.readData(ofLength: 8)   // UInt64 tensor_count
 
-        // — kv_count ——————————————————————————————————————————————————————
         let kvCountData = handle.readData(ofLength: 8)
         guard kvCountData.count == 8 else { throw error("Truncated GGUF header (kv_count).") }
         let kvCount = kvCountData.withUnsafeBytes { $0.load(as: UInt64.self).littleEndian }
 
-        // — KV pairs ——————————————————————————————————————————————————————
         // Iterate just enough KV pairs to find general.architecture.
         var foundArch: String? = nil
 

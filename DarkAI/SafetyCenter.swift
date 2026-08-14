@@ -554,7 +554,6 @@ struct SafetyLegalView: View {
             ScrollView {
                 VStack(spacing: 20) {
 
-                    // Always-on filter explainer
                     VStack(alignment: .leading, spacing: 10) {
                         HStack(spacing: 8) {
                             Image(systemName: "checkmark.shield.fill")
@@ -572,7 +571,6 @@ struct SafetyLegalView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .glassCard(cornerRadius: 16)
 
-                    // Policies
                     VStack(spacing: 0) {
                         policyLink("Acceptable Use Policy", icon: "hand.raised.fill", text: LegalText.acceptableUse)
                         Divider().background(Theme.border)
@@ -586,7 +584,6 @@ struct SafetyLegalView: View {
                     }
                     .glassCard(cornerRadius: 16)
 
-                    // Reports
                     VStack(alignment: .leading, spacing: 12) {
                         HStack {
                             Image(systemName: "flag.fill")
@@ -628,7 +625,6 @@ struct SafetyLegalView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .glassCard(cornerRadius: 16)
 
-                    // Crash reporting
                     VStack(alignment: .leading, spacing: 12) {
                         HStack {
                             Image(systemName: "ladybug.fill")
@@ -683,7 +679,6 @@ struct SafetyLegalView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .glassCard(cornerRadius: 16)
 
-                    // Contact
                     VStack(alignment: .leading, spacing: 10) {
                         Text("SUPPORT")
                             .font(.system(size: 13, weight: .bold))

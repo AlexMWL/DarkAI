@@ -193,7 +193,6 @@ extension Color {
     }
 }
 
-// Custom Glassmorphic Card Modifier
 struct GlassCard: ViewModifier {
     var glow: Bool = false
     var cornerRadius: CGFloat = 16
@@ -264,7 +263,6 @@ struct ReadablePanel: ViewModifier {
     }
 }
 
-// Subtle Neon Glow Modifier
 struct NeonGlow: ViewModifier {
     var color: Color
     var radius: CGFloat = 8

@@ -18,11 +18,9 @@ struct PromptClassifier {
 
     /// High-confidence prefixes / phrases — model is almost certainly asking for an image.
     private static let strongTriggers: [String] = [
-        // Slash commands
         "/imagine", "/image", "/img", "/gen", "/draw",
         // "generate" prefix — catches any "generate X" request
         "generate ",
-        // Explicit image-creation verbs
         "generate an image", "generate a image", "generate image of",
         "create an image", "create a image", "create an illustration",
         "make an image", "make a image", "make a picture of",
@@ -66,7 +64,6 @@ struct PromptClassifier {
         "what's the difference", "compare", "why does", "why is",
         "write a", "write an", "summarize", "summarise",
         "translate", "fix", "debug", "help me",
-        // Text-generation guards (intercept "generate X" where X is text-like)
         "generate code", "generate text", "generate a list",
         "generate a story", "generate an essay", "generate a report",
         "generate a script", "generate a poem", "generate a song",

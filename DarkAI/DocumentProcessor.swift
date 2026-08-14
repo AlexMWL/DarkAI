@@ -68,22 +68,18 @@ class DocumentProcessor {
         return try await withCheckedThrowingContinuation { continuation in
             let requestHandler = VNImageRequestHandler(cgImage: cgImage, options: [:])
             
-            // 1. Text Recognition
             let textRequest = VNRecognizeTextRequest()
             textRequest.recognitionLevel = .accurate
             textRequest.usesLanguageCorrection = true
-            
-            // 2. Image Classification
+
             let classifyRequest = VNClassifyImageRequest()
-            
+
             do {
                 try requestHandler.perform([textRequest, classifyRequest])
-                
+
                 var result = ""
-                
-                // Process Classification
+
                 if let classObservations = classifyRequest.results {
-                    // Get top 5 high-confidence labels
                     let topLabels = classObservations
                         .filter { $0.confidence > 0.6 }
                         .prefix(5)
@@ -94,7 +90,6 @@ class DocumentProcessor {
                     }
                 }
                 
-                // Process Text
                 if let textObservations = textRequest.results {
                     let extracted = textObservations.compactMap { $0.topCandidates(1).first?.string }.joined(separator: "\n")
                     if !extracted.isEmpty {

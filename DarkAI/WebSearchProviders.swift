@@ -78,7 +78,8 @@ struct OpenMeteoProvider: WebSearchProvider {
             URLQueryItem(name: "temperature_unit", value: "fahrenheit"),
             URLQueryItem(name: "wind_speed_unit", value: "mph")
         ]
-        let (forecastData, _) = try await URLSession.shared.data(from: forecastComponents.url!)
+        guard let forecastURL = forecastComponents.url else { throw WebSearchProviderError.invalidResponse }
+        let (forecastData, _) = try await URLSession.shared.data(from: forecastURL)
         let forecast = try JSONDecoder().decode(ForecastResponse.self, from: forecastData)
         guard let current = forecast.current else {
             throw WebSearchProviderError.invalidResponse
@@ -128,7 +129,8 @@ struct OpenMeteoProvider: WebSearchProvider {
             URLQueryItem(name: "name", value: name),
             URLQueryItem(name: "count", value: "5")
         ]
-        let (data, _) = try await URLSession.shared.data(from: components.url!)
+        guard let url = components.url else { throw WebSearchProviderError.invalidResponse }
+        let (data, _) = try await URLSession.shared.data(from: url)
         let decoded = try JSONDecoder().decode(GeocodeResponse.self, from: data)
         guard let results = decoded.results, !results.isEmpty else {
             throw WebSearchProviderError.noResults
@@ -197,7 +199,8 @@ struct DuckDuckGoInstantAnswerProvider: WebSearchProvider {
             URLQueryItem(name: "no_html", value: "1"),
             URLQueryItem(name: "skip_disambig", value: "1")
         ]
-        let (data, _) = try await URLSession.shared.data(from: components.url!)
+        guard let url = components.url else { throw WebSearchProviderError.invalidResponse }
+        let (data, _) = try await URLSession.shared.data(from: url)
         let decoded = try JSONDecoder().decode(Response.self, from: data)
 
         if let abstract = decoded.AbstractText, !abstract.isEmpty {
@@ -304,7 +307,8 @@ nonisolated struct GoogleNewsProvider: WebSearchProvider {
             URLQueryItem(name: "ceid", value: "US:en")
         ])
 
-        let (data, _) = try await URLSession.shared.data(from: components.url!)
+        guard let url = components.url else { throw WebSearchProviderError.invalidResponse }
+        let (data, _) = try await URLSession.shared.data(from: url)
 
         let parserDelegate = FeedParser()
         let parser = XMLParser(data: data)
@@ -376,7 +380,8 @@ struct WikipediaProvider: WebSearchProvider {
             URLQueryItem(name: "redirects", value: "1"),
             URLQueryItem(name: "format", value: "json")
         ]
-        var request = URLRequest(url: components.url!)
+        guard let url = components.url else { throw WebSearchProviderError.invalidResponse }
+        var request = URLRequest(url: url)
         // Wikimedia's API etiquette policy requires a descriptive User-Agent; requests with a
         // generic one are liable to be throttled or refused.
         request.setValue("\(AppInfo.displayName)/\(AppInfo.version) (on-device iOS app)",
@@ -444,7 +449,8 @@ struct BraveSearchProvider: WebSearchProvider {
             URLQueryItem(name: "q", value: query),
             URLQueryItem(name: "count", value: "5")
         ]
-        var request = URLRequest(url: components.url!)
+        guard let url = components.url else { throw WebSearchProviderError.invalidResponse }
+        var request = URLRequest(url: url)
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue(apiKey, forHTTPHeaderField: "X-Subscription-Token")
 

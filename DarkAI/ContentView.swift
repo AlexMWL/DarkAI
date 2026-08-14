@@ -24,7 +24,6 @@ struct ContentView: View {
     @State private var showSettings = false
     @State private var showDrawer = false
 
-    // Image generation state
     @State private var showDiffusionNotLoadedBanner = false
     @State private var diffusionBannerTask: Task<Void, Never>? = nil
 
@@ -37,7 +36,6 @@ struct ContentView: View {
     /// generation is still streaming into the live one behind it.
     @State private var conversationToExport: Conversation? = nil
 
-    // Crash recovered from the previous run, offered once on launch
     /// Crash recovered from the previous run, shown as a dismissible banner.
     @State private var recoveredCrash: CrashReporter.Report? = nil
     /// Set only when the user taps through from that banner.
@@ -49,24 +47,17 @@ struct ContentView: View {
         let message: String
     }
 
-    // Pulse animation state
     @State private var pulseActive = false
-    
+
     var body: some View {
         ZStack {
-            // MAIN VIEW
             VStack(spacing: 0) {
-                
-                // Custom Premium Navigation Header
                 customHeaderView
 
-                // Recovered-crash notice, if the previous run ended badly
                 crashRecoveryBanner
 
-                // Active status banner
                 modelBanner
 
-                // Messages board
                 if let activeConv = conversationManager.activeConversation, !activeConv.messages.isEmpty {
                     ScrollViewReader { proxy in
                         ScrollView {
@@ -106,17 +97,14 @@ struct ContentView: View {
                     emptyStateView
                 }
                 
-                // Active parameter indicators
                 activeParametersIndicator
-                
-                // Chat input area
+
                 inputArea
             }
             .background(GlitchBackgroundView().ignoresSafeArea())
             .blur(radius: showDrawer ? 4 : 0)
             .disabled(showDrawer)
             
-            // DRAWER DIMMER OVERLAY
             if showDrawer {
                 Color.black.opacity(0.6)
                     .ignoresSafeArea()
@@ -128,10 +116,8 @@ struct ContentView: View {
                     .transition(.opacity)
             }
             
-            // CONVERSATIONS SIDEBAR DRAWER
             sidebarDrawer
 
-            // DIFFUSION NOT-LOADED WARNING BANNER
             if showDiffusionNotLoadedBanner {
                 VStack {
                     HStack(spacing: 10) {
@@ -348,7 +334,6 @@ struct ContentView: View {
                 )
                 .accessibilityLabel(isModelActive ? "Model ready" : "No model loaded")
 
-                // Settings button
                 Button(action: { showSettings = true }) {
                     Image(systemName: "gearshape.fill")
                         .foregroundColor(Theme.textPrimary)
@@ -472,7 +457,6 @@ struct ContentView: View {
         return nil
     }
 
-    // Model detail banner
     @ViewBuilder
     private var modelBanner: some View {
         HStack {
@@ -561,7 +545,6 @@ struct ContentView: View {
         )
     }
     
-    // Welcome / empty conversation view
     @ViewBuilder
     private var emptyStateView: some View {
         // Scrollable, and that is a keyboard fix rather than a scrolling feature.
@@ -763,6 +746,30 @@ struct ContentView: View {
         ModelOutput.filterThoughts(from: text, stripMarkdown: stripMarkdown)
     }
 
+    /// Layers the personality matrix and measured writing style onto a base system prompt.
+    ///
+    /// Shared by every path that calls `llmManager.generateResponse` — the ordinary chat turn and
+    /// the file-upload auto-description — so an attached file doesn't reset the assistant's voice
+    /// to a bare, unadapted default for that one reply.
+    private func systemPromptWithPersonality(base: String) -> String {
+        guard llmManager.activeModelURL != nil else { return base }
+        let personality = personalityManager.getPersonality()
+        guard !personality.isEmpty else { return base }
+
+        let score = personalityManager.maturityScore
+        if score < 0.4 {
+            return base + "\n\n[Communication Style Note — adapt naturally to user's style]:\n" + personality
+        } else if score < 0.7 {
+            return base + "\n\n" + personality
+        } else {
+            let identityAnchor = base
+                .components(separatedBy: CharacterSet(charactersIn: ".!?\n"))
+                .first?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return identityAnchor.isEmpty ? personality : identityAnchor + ".\n\n" + personality
+        }
+    }
+
     private func messageBubble(for message: ChatMessage) -> some View {
         HStack(alignment: .top, spacing: 12) {
             if message.isUser {
@@ -787,7 +794,7 @@ struct ContentView: View {
                         }
                     }
             } else if let imgData = message.imageData, let uiImg = UIImage(data: imgData) {
-                // ── AI-Generated Image Bubble ───────────────────────────────
+                // AI-generated image bubble
                 Image(systemName: "sparkles")
                     .foregroundColor(Color.purple)
                     .font(.system(size: 12))
@@ -825,7 +832,6 @@ struct ContentView: View {
 
                     // Always-visible action row
                     HStack(spacing: 10) {
-                        // Save button
                         Button {
                             saveToPhotos(uiImg)
                         } label: {
@@ -840,7 +846,6 @@ struct ContentView: View {
                                 )
                         }
 
-                        // Copy button
                         Button {
                             UIPasteboard.general.image = uiImg
                         } label: {
@@ -882,9 +887,8 @@ struct ContentView: View {
                     }
                 }
                 Spacer()
-                // ───────────────────────────────────────────────────────────
             } else if message.imageData == nil && !message.isUser && diffusionManager.isGenerating && conversationManager.activeConversation?.messages.last?.id == message.id {
-                // ── In-progress image generation spinner ───────────────────
+                // In-progress image generation spinner
                 Image(systemName: "sparkles")
                     .foregroundColor(Color.purple)
                     .font(.system(size: 12))
@@ -932,9 +936,8 @@ struct ContentView: View {
                 .overlay(RoundedRectangle(cornerRadius: 14)
                     .stroke(Color.purple.opacity(0.3), lineWidth: 1))
                 Spacer()
-                // ───────────────────────────────────────────────────────────
             } else {
-                // ── Standard text bubble ────────────────────────────────────
+                // Standard text bubble
                 Image(systemName: "terminal.fill")
                     .foregroundColor(Theme.accentCyan)
                     .font(.system(size: 12))
@@ -980,7 +983,7 @@ struct ContentView: View {
                             }
                         }
 
-                    // ── Web search offer buttons ────────────────────────────
+                    // Web search offer buttons.
                     // Only ever set on an assistant message asking whether to search — see
                     // `respondToSearchOffer`. Cleared the moment either button is tapped, so
                     // this never lingers once the user has answered.
@@ -1010,17 +1013,14 @@ struct ContentView: View {
                     }
                 }
                 Spacer()
-                // ───────────────────────────────────────────────────────────
             }
         }
     }
-    
-    // Input Area View
+
     @ViewBuilder
     private var inputArea: some View {
         VStack(alignment: .leading, spacing: 8) {
-            
-            // Pending Attachment Pill
+
             if let attName = pendingAttachmentName {
                 HStack {
                     Image(systemName: "doc.text.image")
@@ -1075,7 +1075,6 @@ struct ContentView: View {
             }
             .accessibilityLabel(conversationManager.privateMode ? "Private chat on" : "Private chat off")
             
-            // Text Entry
             TextField(isModelActive ? "Execute prompt..." : "Model unloaded...", text: $inputText, axis: .vertical)
                 .lineLimit(1...8)
                 .font(.system(size: 14))
@@ -1090,7 +1089,6 @@ struct ContentView: View {
                 )
                 .disabled(!isModelActive)
             
-            // Send / Stop button
             Button(action: sendMessage) {
                 Image(systemName: llmManager.isGenerating ? "stop.fill" : "arrow.up")
                     .foregroundColor(isModelActive ? Theme.onAccent : Theme.textSecondary)
@@ -1119,12 +1117,10 @@ struct ContentView: View {
         )
     }
 
-    // Left-side Collapsible Sidebar Drawer
     private var sidebarDrawer: some View {
         HStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 20) {
-                
-                // Drawer Header
+
                 HStack {
                     Text("CHATS")
                         .font(.system(size: 13, weight: .black))
@@ -1133,7 +1129,6 @@ struct ContentView: View {
                     
                     Spacer()
 
-                    // New chat compact plus button
                     Button(action: {
                         conversationManager.createConversation()
                         withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
@@ -1157,14 +1152,11 @@ struct ContentView: View {
                 }
                 .padding(.top, Layout.barTopPadding + 14)
                 .padding(.horizontal)
-                
-                
-                // Scrollable Chat log list
+
                 ScrollView {
                     VStack(spacing: 12) {
                         ForEach(conversationManager.conversations) { conversation in
                             HStack {
-                                // Conversation Switcher Button
                                 Button(action: {
                                     conversationManager.selectConversation(id: conversation.id)
                                     withAnimation(.spring()) {
@@ -1198,7 +1190,6 @@ struct ContentView: View {
                                 .disabled(conversation.messages.isEmpty)
                                 .opacity(conversation.messages.isEmpty ? 0.35 : 1)
 
-                                // Delete conversation
                                 Button(action: {
                                     conversationManager.deleteConversation(id: conversation.id)
                                 }) {
@@ -1255,7 +1246,6 @@ struct ContentView: View {
             return
         }
 
-        // Cancel in-progress text generation
         if llmManager.isGenerating {
             llmManager.cancelGeneration()
             return
@@ -1280,7 +1270,6 @@ struct ContentView: View {
             if inputText == text { inputText = "" }
         }
 
-        // ── Prompt Intent Classification ──────────────────────────────────────
         // Check whether the user is requesting image generation BEFORE attaching
         // files so that file context doesn't accidentally override intent.
         let intent = PromptClassifier.classify(text)
@@ -1289,7 +1278,6 @@ struct ContentView: View {
             return false
         }()
 
-        // ── Content policy ────────────────────────────────────────────────────
         // Runs before the prompt reaches any model, and before the message is even added to
         // the conversation, so blocked material is never persisted. The surface matters: an
         // image request is held to the stricter standard, since Guideline 1.1.4 is about what
@@ -1309,12 +1297,9 @@ struct ContentView: View {
         }
 
         if case .imageGeneration(let refinedPrompt) = intent, pendingAttachmentText == nil {
-            // Add the user message bubble
             conversationManager.addMessageToActive(isUser: true, text: text)
 
-            // Guard: a diffusion model must be selected
             guard let diffPath = diffusionManager.lastDiffusionModelPath else {
-                // Show banner and do NOT send to the LLM
                 diffusionBannerTask?.cancel()
                 withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) {
                     showDiffusionNotLoadedBanner = true
@@ -1461,7 +1446,6 @@ struct ContentView: View {
             }
             return
         }
-        // ─────────────────────────────────────────────────────────────────────
 
         // Captured before the attachment merge below clears these — needed to keep the web
         // search offer from firing on a message that's really "analyze this attachment."
@@ -1493,7 +1477,6 @@ struct ContentView: View {
             conversationManager.addMessageToActive(isUser: false, text: LegalText.crisisResources)
         }
 
-        // ── Web search offer ──────────────────────────────────────────────────
         // Gated entirely on the user having turned internet access on in Settings — when it's
         // off, nothing here runs at all, so behavior is byte-for-byte unchanged for anyone who
         // hasn't opted in. Never fires on an attachment turn (that's "analyze this," not "look
@@ -1576,28 +1559,7 @@ struct ContentView: View {
                     conversationManager.addMessageToActive(isUser: false, text: "")
                 }
 
-                var finalSystemPrompt = customInstructions
-                if let activeModel = llmManager.activeModelURL?.lastPathComponent {
-                    let personality = personalityManager.getPersonality()
-                    if !personality.isEmpty {
-                        let score = personalityManager.maturityScore
-                        if score < 0.4 {
-                            finalSystemPrompt += "\n\n[Communication Style Note — adapt naturally to user's style]:\n" + personality
-                        } else if score < 0.7 {
-                            finalSystemPrompt += "\n\n" + personality
-                        } else {
-                            let identityAnchor = customInstructions
-                                .components(separatedBy: CharacterSet(charactersIn: ".!?\n"))
-                                .first?
-                                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                            if identityAnchor.isEmpty {
-                                finalSystemPrompt = personality
-                            } else {
-                                finalSystemPrompt = identityAnchor + ".\n\n" + personality
-                            }
-                        }
-                    }
-                }
+                let finalSystemPrompt = systemPromptWithPersonality(base: customInstructions)
 
                 llmManager.generateResponse(
                     prompt: capturedPromptText,
@@ -1642,13 +1604,13 @@ struct ContentView: View {
 
                     // Run personality analysis only after the real response is fully done,
                     // so its occasional background LLM call never delays a chat reply.
-                    if enableMemories && !text.isEmpty, let activeModel = llmManager.activeModelURL?.lastPathComponent {
+                    if enableMemories && !text.isEmpty, llmManager.activeModelURL != nil {
                         personalityManager.analyzeUserMessage(text, llmManager: llmManager)
                     }
                     // Capture the AI's own stated likes/dislikes/favorites from its reply
                     // (e.g. "my favorite car is a Tesla") so it stays consistent if asked
                     // again, rather than borrowing an answer from the user's own memories.
-                    if enableMemories, let activeModel = llmManager.activeModelURL?.lastPathComponent {
+                    if enableMemories, llmManager.activeModelURL != nil {
                         personalityManager.analyzeAssistantMessage(cleanedText)
                     }
                 }
@@ -1810,13 +1772,14 @@ struct ContentView: View {
                 let isImage = ["jpg", "jpeg", "png", "gif", "heic"].contains(ext)
 
                 await MainActor.run {
-                    // Ingest into RAG
-                    ragManager.ingestDocument(name: fileName, content: extractedText)
+                    let wasTruncated = ragManager.ingestDocument(name: fileName, content: extractedText)
+                    let truncationNote = wasTruncated
+                        ? " (kept the first \(RAGManager.maxDocumentCharacters) — the rest was too large to store)"
+                        : ""
 
-                    // Show upload notification in chat
                     let uploadNote = isImage
-                        ? "[Image uploaded: \(fileName) — \(extractedText.count) characters extracted via OCR]"
-                        : "[Document uploaded: \(fileName) — \(extractedText.count) characters extracted]"
+                        ? "[Image uploaded: \(fileName) — \(extractedText.count) characters extracted via OCR\(truncationNote)]"
+                        : "[Document uploaded: \(fileName) — \(extractedText.count) characters extracted\(truncationNote)]"
                     conversationManager.addMessageToActive(isUser: true, text: uploadNote)
 
                     // Create empty assistant message to stream into
@@ -1839,7 +1802,7 @@ struct ContentView: View {
                     llmManager.generateResponse(
                         prompt: describePrompt,
                         history: history,
-                        systemPrompt: customInstructions,
+                        systemPrompt: systemPromptWithPersonality(base: customInstructions),
                         memoriesContext: memoriesContext,
                         ragContext: ""
                     ) { token in
@@ -1860,7 +1823,7 @@ struct ContentView: View {
                         conversationManager.updateLastMessage(text: cleanedText)
                         conversationManager.saveConversations()
 
-                        if enableMemories, let activeModel = llmManager.activeModelURL?.lastPathComponent {
+                        if enableMemories, llmManager.activeModelURL != nil {
                             personalityManager.analyzeAssistantMessage(cleanedText)
                         }
                     }

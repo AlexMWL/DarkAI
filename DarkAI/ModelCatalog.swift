@@ -163,7 +163,7 @@ enum ModelCatalog {
             url: URL(string: "https://huggingface.co/hugging-quants/Llama-3.2-3B-Instruct-Q4_K_M-GGUF/resolve/main/llama-3.2-3b-instruct-q4_k_m.gguf")!,
             approxRuntimeGB: 3.4,
             minimumRAMGB: 6.0,
-            minimumDevice: "minimum iPhone 12 Pro / 14 or newer"
+            minimumDevice: "minimum iPhone 13 Pro / 14 or newer"
         ),
 
         CatalogModel(
@@ -179,26 +179,35 @@ enum ModelCatalog {
             // 16 blocks, 64 experts each, 8 active per token. Resident cost is the whole file
             // like any other model, so this is sized as such — the earlier 1.6 GB figure assumed
             // an expert-pinning saving that Metal does not permit.
-            summary: "A 7B model that only uses about an eighth of itself for each word, so it answers about as fast as a 1B while knowing more. Needs as much memory as its file size, like any other model here.",
+            summary: "A 7B model that only uses about an eighth of itself for each word, so it answers about as fast as a 1B while knowing more.",
             url: URL(string: "https://huggingface.co/allenai/OLMoE-1B-7B-0924-Instruct-GGUF/resolve/main/olmoe-1b-7b-0924-instruct-q4_k_m.gguf")!,
             approxRuntimeGB: 4.6,
             minimumRAMGB: 8.0,
             minimumDevice: " minimum iPhone 15 Pro / 16 or newer"
         ),
         CatalogModel(
-            id: "meta-llama-3-8b-instruct-q4km",
+            id: "lfm2.5-8b-a1b-instruct-q4km",
             kind: .chat,
-            displayName: "Llama 3 8B Instruct",
-            publisher: "Meta (GGUF build by QuantFactory)",
-            byteSize: 4_920_734_272,
-            parameterCount: "8B",
+            displayName: "LFM2.5 8B-A1B",
+            publisher: "Liquid AI",
+            byteSize: 5_155_564_768,
+            parameterCount: "8.3B total, 1.5B active",
             quantization: "Q4_K_M",
-            license: "Meta Llama 3 Community License",
-            attribution: "Built with Meta Llama 3. Llama 3 is licensed under the Meta Llama 3 Community License, Copyright © Meta Platforms, Inc. All Rights Reserved.",
-            
-            summary: "The most capable model here, and the largest. On 8GB memory iPhones, part of it is read from storage each word, so replies come noticeably slower. Even at full speed expect it to be about half the speed of the 3B. **currently prone to crashing, use with caution**",
-            url: URL(string: "https://huggingface.co/QuantFactory/Meta-Llama-3-8B-Instruct-GGUF/resolve/main/Meta-Llama-3-8B-Instruct.Q4_K_M.gguf")!,
-            approxRuntimeGB: 5.2,
+            license: "LFM Open License v1.0",
+            attribution: "LFM2.5-8B-A1B by Liquid AI, licensed under the LFM Open License v1.0.",
+            // Replaces the old dense Llama 3 8B entry, which a background personality-analysis
+            // call could race for the model — see the fix in LlamaRunner.generateStream — and
+            // which, being dense, offered no way to avoid needing its full weight size resident
+            // in memory. This model routes each token through only 4 of 32 experts per
+            // mixture-of-experts block, so replies are markedly faster than a dense model this
+            // size. That speed does NOT come with a smaller memory footprint, though: per-expert
+            // GPU/CPU splitting was tried for a mixture-of-experts model on this engine and found
+            // to not work reliably on Metal (see the comment on expert pinning in
+            // `LLMManager.planOffload`), so this is still sized as needing its full file size
+            // resident, exactly like every other model here.
+            summary: "A mixture-of-experts model that only routes each word through a fraction of its weights; the power of an 8B model without the memory demand but replies come noticeably slower than other models.",
+            url: URL(string: "https://huggingface.co/LiquidAI/LFM2.5-8B-A1B-GGUF/resolve/main/LFM2.5-8B-A1B-Q4_K_M.gguf")!,
+            approxRuntimeGB: 5.5,
             minimumRAMGB: 12.0,
             minimumDevice: "iPhone 17 Pro or newer"
         )
@@ -252,6 +261,10 @@ enum ModelCatalog {
     static func model(withFileName name: String) -> CatalogModel? {
         all.first { $0.fileName == name }
     }
+
+    static func model(withID id: String) -> CatalogModel? {
+        all.first { $0.id == id }
+    }
 }
 
 // MARK: - Download manager
@@ -284,7 +297,10 @@ final class ModelDownloadManager: NSObject, ObservableObject {
         }
     }
 
-    @Published private(set) var active: Progress?
+    /// Every transfer currently in flight, keyed by catalog model ID — downloads run
+    /// concurrently rather than one at a time, so this replaces what used to be a single
+    /// optional `active` slot.
+    @Published private(set) var activeDownloads: [String: Progress] = [:]
     @Published private(set) var lastError: String?
     /// Set when a download finishes so the UI can advance without polling the filesystem.
     @Published private(set) var lastCompletedModelID: String?
@@ -309,11 +325,14 @@ final class ModelDownloadManager: NSObject, ObservableObject {
     var backgroundCompletionHandler: (() -> Void)?
 
     private var session: URLSession!
-    private var currentTask: URLSessionDownloadTask?
-    private var currentModel: CatalogModel?
-    /// Whether the in-flight task was created from saved resume data. Read by `finish(with:)` to
-    /// tell a stale resume blob apart from an ordinary network failure.
-    private var isResumedTask = false
+    /// The in-flight task for each model currently downloading, keyed by catalog model ID.
+    private var tasksByModelID: [String: URLSessionDownloadTask] = [:]
+    /// The reverse lookup — delegate callbacks only hand back a task, never the model it
+    /// belongs to, so this is how they find out which download they're reporting on.
+    private var modelsByTaskID: [Int: CatalogModel] = [:]
+    /// Task identifiers whose task was created from saved resume data. Read by `finish(_:with:)`
+    /// to tell a stale resume blob apart from an ordinary network failure.
+    private var resumedTaskIDs: Set<Int> = []
 
     private override init() {
         super.init()
@@ -326,11 +345,12 @@ final class ModelDownloadManager: NSObject, ObservableObject {
         resumableModelIDs = Self.savedResumableModelIDs()
     }
 
-    var isDownloading: Bool { active != nil }
+    /// Whether anything at all is downloading — onboarding uses this to gate advancing past the
+    /// model-setup step; it doesn't need to know which or how many.
+    var isDownloading: Bool { !activeDownloads.isEmpty }
 
-    /// Which catalog section owns the in-flight download, so only that section renders the
-    /// progress card.
-    var activeKind: ModelKind? { active?.kind }
+    /// Whether this specific model is one of the in-flight downloads.
+    func isDownloading(_ model: CatalogModel) -> Bool { activeDownloads[model.id] != nil }
 
     /// Chat weights and diffusion checkpoints are both GGUF but are consumed by different
     /// engines and listed by different screens, so they have to land in different directories.
@@ -347,19 +367,26 @@ final class ModelDownloadManager: NSObject, ObservableObject {
     // MARK: Actions
 
     func download(_ model: CatalogModel) {
-        guard active == nil else { return }
+        guard activeDownloads[model.id] == nil else { return }
         lastError = nil
         lastCompletedModelID = nil
 
         // Disk pre-flight. Failing here with a clear number beats failing 900 MB in with
-        // "The operation couldn't be completed."
-        let requiredGB = model.sizeGB + 0.5
+        // "The operation couldn't be completed." Downloads run concurrently now, so this has to
+        // reserve space for what every other in-flight transfer still has left to write, not
+        // just this one — otherwise three simultaneous downloads that each individually fit
+        // could jointly overrun what's actually free.
+        let remainingForOthersGB = activeDownloads.values.reduce(0.0) { partial, progress in
+            partial + Double(max(0, progress.totalBytes - progress.bytesWritten)) / 1_073_741_824.0
+        }
+        let requiredGB = model.sizeGB + 0.5 + remainingForOthersGB
         let availableGB = AppFiles.availableDiskGB()
         guard availableGB > requiredGB else {
-            lastError = String(
-                format: "Not enough storage. %@ needs about %.1f GB free and this device has %.1f GB.",
-                model.displayName, requiredGB, availableGB
-            )
+            lastError = activeDownloads.isEmpty
+                ? String(format: "Not enough storage. %@ needs about %.1f GB free and this device has %.1f GB.",
+                         model.displayName, requiredGB, availableGB)
+                : String(format: "Not enough storage. %@ needs about %.1f GB free (accounting for %d other download%@ in progress) and this device has %.1f GB.",
+                         model.displayName, requiredGB, activeDownloads.count, activeDownloads.count == 1 ? "" : "s", availableGB)
             return
         }
 
@@ -372,13 +399,12 @@ final class ModelDownloadManager: NSObject, ObservableObject {
     /// `resumeData` is opaque and can be rejected by the system — it goes stale if the server no
     /// longer supports the byte range, if the temporary file behind it has been reclaimed, or
     /// simply if too much time has passed. That failure arrives as an ordinary task error rather
-    /// than a throw, so `finish(with:)` handles it by discarding the partial and saying the
+    /// than a throw, so `finish(_:with:)` handles it by discarding the partial and saying the
     /// download restarted, instead of leaving the user stuck retrying a resume that can never work.
     private func start(_ model: CatalogModel, resuming resumeData: Data?) {
         let task: URLSessionDownloadTask
         if let resumeData {
             task = session.downloadTask(withResumeData: resumeData)
-            isResumedTask = true
             LogManager.shared.log("ModelDownload: resuming \(model.displayName)")
         } else {
             var request = URLRequest(url: model.url)
@@ -386,14 +412,14 @@ final class ModelDownloadManager: NSObject, ObservableObject {
             request.allowsExpensiveNetworkAccess = allowsCellularDownload
             request.timeoutInterval = 60
             task = session.downloadTask(with: request)
-            isResumedTask = false
             LogManager.shared.log("ModelDownload: starting \(model.displayName) (\(model.sizeDescription))")
         }
         task.countOfBytesClientExpectsToReceive = model.byteSize
 
-        currentTask = task
-        currentModel = model
-        active = Progress(
+        tasksByModelID[model.id] = task
+        modelsByTaskID[task.taskIdentifier] = model
+        if resumeData != nil { resumedTaskIDs.insert(task.taskIdentifier) }
+        activeDownloads[model.id] = Progress(
             modelID: model.id,
             kind: model.kind,
             fractionCompleted: 0,
@@ -404,10 +430,11 @@ final class ModelDownloadManager: NSObject, ObservableObject {
         task.resume()
     }
 
-    /// Stops the transfer but keeps what has already been fetched, so tapping Get again picks up
-    /// where this left off. Use `discardPartial(for:)` to throw the bytes away instead.
-    func cancel() {
-        guard let task = currentTask, let model = currentModel else { return }
+    /// Stops one transfer but keeps what has already been fetched, so tapping Get again picks up
+    /// where this left off. Other in-flight downloads are untouched. Use `discardPartial(for:)`
+    /// to throw the bytes away instead.
+    func cancel(_ model: CatalogModel) {
+        guard let task = tasksByModelID[model.id] else { return }
         // Goes through the singleton rather than capturing `self`: this callback is delivered on a
         // background queue and outlives the call, and reaching back through `shared` keeps that
         // free of a cross-actor capture instead of relying on one being tolerated.
@@ -423,9 +450,10 @@ final class ModelDownloadManager: NSObject, ObservableObject {
                 }
             }
         }
-        currentTask = nil
-        currentModel = nil
-        active = nil
+        tasksByModelID.removeValue(forKey: model.id)
+        modelsByTaskID.removeValue(forKey: task.taskIdentifier)
+        resumedTaskIDs.remove(task.taskIdentifier)
+        activeDownloads.removeValue(forKey: model.id)
     }
 
     /// Throws away a saved partial transfer. Offered next to the resume affordance so a user who
@@ -518,21 +546,24 @@ extension ModelDownloadManager: URLSessionDownloadDelegate {
                                 didWriteData bytesWritten: Int64,
                                 totalBytesWritten: Int64,
                                 totalBytesExpectedToWrite: Int64) {
+        let taskID = downloadTask.taskIdentifier
         Task { @MainActor in
-            guard var progress = self.active else { return }
+            guard let model = self.modelsByTaskID[taskID],
+                  var progress = self.activeDownloads[model.id] else { return }
             // `totalBytesExpectedToWrite` is -1 when the server omits Content-Length; the
             // catalog's known size is the better denominator in that case.
             let total = totalBytesExpectedToWrite > 0 ? totalBytesExpectedToWrite : progress.totalBytes
             progress.bytesWritten = totalBytesWritten
             progress.totalBytes = total
             progress.fractionCompleted = total > 0 ? min(1.0, Double(totalBytesWritten) / Double(total)) : 0
-            self.active = progress
+            self.activeDownloads[model.id] = progress
         }
     }
 
     nonisolated func urlSession(_ session: URLSession,
                                 downloadTask: URLSessionDownloadTask,
                                 didFinishDownloadingTo location: URL) {
+        let taskID = downloadTask.taskIdentifier
         // This runs on a background queue and `location` is deleted the moment it returns, so
         // the move has to happen synchronously here rather than inside a hop to the main actor.
         let temporaryCopy = FileManager.default.temporaryDirectory
@@ -540,12 +571,15 @@ extension ModelDownloadManager: URLSessionDownloadDelegate {
         do {
             try FileManager.default.moveItem(at: location, to: temporaryCopy)
         } catch {
-            Task { @MainActor in self.finish(with: error) }
+            Task { @MainActor in
+                guard let model = self.modelsByTaskID[taskID] else { return }
+                self.finish(model, with: error)
+            }
             return
         }
 
         Task { @MainActor in
-            guard let model = self.currentModel else {
+            guard let model = self.modelsByTaskID[taskID] else {
                 try? FileManager.default.removeItem(at: temporaryCopy)
                 return
             }
@@ -574,10 +608,10 @@ extension ModelDownloadManager: URLSessionDownloadDelegate {
 
                 LogManager.shared.log("ModelDownload: installed \(model.fileName)")
                 self.lastCompletedModelID = model.id
-                self.finish(with: nil)
+                self.finish(model, with: nil)
             } catch {
                 try? FileManager.default.removeItem(at: temporaryCopy)
-                self.finish(with: error)
+                self.finish(model, with: error)
             }
         }
     }
@@ -595,13 +629,15 @@ extension ModelDownloadManager: URLSessionDownloadDelegate {
         // a dropped connection nine-tenths of the way through a 2 GB checkpoint should cost the
         // remaining tenth, not the whole thing.
         let resumeData = nsError.userInfo[NSURLSessionDownloadTaskResumeData] as? Data
+        let taskID = task.taskIdentifier
 
         Task { @MainActor in
-            if let resumeData, let model = self.currentModel {
+            guard let model = self.modelsByTaskID[taskID] else { return }
+            if let resumeData {
                 Self.saveResumeData(resumeData, for: model)
                 self.resumableModelIDs.insert(model.id)
             }
-            self.finish(with: error, producedResumeData: resumeData != nil)
+            self.finish(model, with: error, producedResumeData: resumeData != nil)
         }
     }
 
@@ -613,22 +649,24 @@ extension ModelDownloadManager: URLSessionDownloadDelegate {
     }
 
     @MainActor
-    private func finish(with error: Error?, producedResumeData: Bool = false) {
-        let model = currentModel
-        let bytesWritten = active?.bytesWritten ?? 0
-        let wasResumed = isResumedTask
+    private func finish(_ model: CatalogModel, with error: Error?, producedResumeData: Bool = false) {
+        let bytesWritten = activeDownloads[model.id]?.bytesWritten ?? 0
+        let taskID = tasksByModelID[model.id]?.taskIdentifier
+        let wasResumed = taskID.map { resumedTaskIDs.contains($0) } ?? false
 
-        active = nil
-        currentTask = nil
-        currentModel = nil
-        isResumedTask = false
+        activeDownloads.removeValue(forKey: model.id)
+        tasksByModelID.removeValue(forKey: model.id)
+        if let taskID {
+            modelsByTaskID.removeValue(forKey: taskID)
+            resumedTaskIDs.remove(taskID)
+        }
 
         guard let error else { return }
 
         // Stale resume state: the task was built from a saved partial, produced nothing, and the
         // system declined to give any back. Retrying would fail identically every time, so drop it
         // and start over once rather than stranding the model behind a permanently broken resume.
-        if wasResumed, !producedResumeData, bytesWritten == 0, let model {
+        if wasResumed, !producedResumeData, bytesWritten == 0 {
             Self.deleteResumeData(for: model)
             resumableModelIDs.remove(model.id)
             LogManager.shared.log("ModelDownload: saved partial for \(model.displayName) was no longer usable — restarting from the beginning")
@@ -645,6 +683,6 @@ extension ModelDownloadManager: URLSessionDownloadDelegate {
         } else {
             lastError = error.localizedDescription
         }
-        LogManager.shared.log("ModelDownload: failed — \(error.localizedDescription)")
+        LogManager.shared.log("ModelDownload: failed — \(model.displayName) — \(error.localizedDescription)")
     }
 }

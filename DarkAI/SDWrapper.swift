@@ -192,7 +192,6 @@ nonisolated class SDWrapper: @unchecked Sendable {
             pCtx.handler?(Double(step) / Double(steps))
         }, unmanagedCtx)
         
-        // Properly manage C strings
         let promptCStr = strdup(boundedPrompt)
         let negPromptCStr = strdup(boundedNegative)
         
@@ -233,7 +232,6 @@ nonisolated class SDWrapper: @unchecked Sendable {
         let heightU32 = imageStruct.height
         let channelU32 = imageStruct.channel
         
-        // Copy pixel data
         let totalBytes = Int(widthU32 * heightU32 * channelU32)
         let pixelData = Data(bytes: imageStruct.data, count: totalBytes)
         
@@ -242,9 +240,6 @@ nonisolated class SDWrapper: @unchecked Sendable {
     
     private func makeJPEG(from rawData: Data, width: Int, height: Int, channels: Int) throws -> Data {
         // SD outputs RGB (3 channels) by default.
-        // We'll use CoreGraphics to create a CGImage
-        
-        
         guard channels == 3 else {
             throw NSError(domain: "SDWrapper", code: 4, userInfo: [NSLocalizedDescriptionKey: "Expected 3 channels (RGB)"])
         }

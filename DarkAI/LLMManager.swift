@@ -42,6 +42,28 @@ actor LlamaRunner {
     /// the real figure, as opposed to the char-count estimate used for UI budgeting.
     private var lastPromptTokenCount: Int = 0
 
+    /// True for the entire duration of an in-flight `generateStream` call.
+    ///
+    /// `LlamaRunner` being an `actor` serializes calls to it *between* suspension points, but
+    /// `generateStream` itself suspends every token (`await Task.yield()`), and actors are
+    /// reentrant across suspension points — a second call queued on this same actor can start
+    /// running while the first is parked mid-stream. Two callers hit this in practice: an
+    /// ordinary chat reply, and `LLMManager`'s periodic background personality-style analysis.
+    /// `LLMManager.isGenerating` stops the background one from starting *during* a visible chat
+    /// reply, but nothing stopped the reverse — a chat message sent while a background analysis
+    /// was still streaming. Both calls share the same `context`, i.e. the same KV cache, and
+    /// letting them interleave corrupts its position bookkeeping: llama.cpp then aborts a later
+    /// decode with "inconsistent sequence positions" (the last position it recorded doesn't
+    /// match where the next batch says it's continuing from), which is what actually sat behind
+    /// reports of the model crashing and unloading after a couple of exchanges — slower models
+    /// widen the window in which a background analysis is still running when the next message
+    /// goes out, which is why it showed up on the largest catalog model first.
+    ///
+    /// Checked and set at the very top of `generateStream`, before its first `await` — the
+    /// synchronous prefix of an actor method can't be preempted, so this check-and-set can't
+    /// itself race.
+    private var isBusyGenerating = false
+
     var isLoaded: Bool { model != nil && context != nil }
     /// The context window actually applied to the loaded model, which can differ from the
     /// user's requested setting once `safeContextTokens` clamps it to available RAM.
@@ -90,12 +112,6 @@ actor LlamaRunner {
         modelParams.use_mmap = true
         modelParams.use_mlock = false
 
-        // Per-block regexes matched against tensor names during load, pinning those blocks'
-        // routed experts to the CPU buffer type. Because mmap is on, a CPU-owned weight buffer
-        // is created directly over the mapped file rather than copied into fresh memory, which
-        // is what makes this a memory saving and not just a change of which backend runs the
-        // matmul.
-        //
         let loaded = llama_model_load_from_file(path, modelParams)
 
         guard let mdl = loaded else {
@@ -296,7 +312,6 @@ actor LlamaRunner {
 
         let nLayer = profile?.nLayer ?? 0
         let vocabSize = profile?.vocabSize ?? 0
-        let trainedCtx = profile?.trainedContext ?? 0
         let geometry: KVGeometry? = (profile?.hasUsableGeometry ?? false)
             ? KVGeometry(nLayer: profile!.nLayer,
                          nHeadKV: profile!.nHeadKV,
@@ -673,7 +688,6 @@ actor LlamaRunner {
     /// Checks whether the loaded model advertises any vision/multimodal capability via its metadata.
     func supportsVision() -> Bool {
         guard let mdl = model else { return false }
-        // Check model metadata key for projector or mmproj type
         let count = llama_model_meta_count(mdl)
         for i in 0..<count {
             var keyBuf = [CChar](repeating: 0, count: 512)
@@ -699,13 +713,27 @@ actor LlamaRunner {
             continuation.finish()
             return
         }
+        guard !isBusyGenerating else {
+            // See `isBusyGenerating`'s doc comment — a second call while one is already
+            // in flight would corrupt the shared KV cache rather than queue politely. Declining
+            // outright is correct for both actual callers: the chat UI already reports an empty
+            // response usably ("[No response content was generated…]"), and a skipped
+            // background analysis pass just waits for the next batch of messages.
+            Task { @MainActor in
+                LogManager.shared.log("LlamaRunner: generateStream called while another generation is already in flight — declining rather than risk corrupting the shared KV cache.")
+            }
+            continuation.finish()
+            return
+        }
+        isBusyGenerating = true
+        defer { isBusyGenerating = false }
 
         isCancelled = false
         let genStartTime = CFAbsoluteTimeGetCurrent()
 
         let vocab = llama_model_get_vocab(mdl)
 
-        // --- Apply Native Chat Template ---
+        // Apply native chat template.
         var chatStructs: [llama_chat_message] = []
         var pointersToFree: [UnsafeMutablePointer<Int8>] = []
 
@@ -785,8 +813,15 @@ actor LlamaRunner {
                 batch.logits[i] = (tokenIdx == promptTokens.count - 1) ? 1 : 0
             }
             batch.n_tokens = Int32(chunkLen)
-            
-            if llama_decode(ctx, batch) != 0 {
+
+            // Metal's backend (ggml-metal.m) is Objective-C and creates autoreleased command
+            // buffers/encoders inside `llama_decode`. Nothing here drains the pool between
+            // calls otherwise — this loop runs entirely between Swift concurrency suspension
+            // points, so those objects would pile up for the whole prefill instead of being
+            // reclaimed chunk by chunk, and a big enough prompt could exhaust the GPU's working
+            // set on transient allocations alone before generation even starts.
+            let prefillResult = autoreleasepool { llama_decode(ctx, batch) }
+            if prefillResult != 0 {
                 handleDecodeFailure(stage: "prefill")
                 continuation.yield("\n\n[The model ran out of GPU memory and had to be unloaded. Reload it, or pick a smaller one — this device can't run it at this context size.]")
                 continuation.finish()
@@ -938,9 +973,14 @@ actor LlamaRunner {
                     return String(format: "%@ %.2f%%", piece.debugDescription, percent)
                 }.joined(separator: ", ")
 
+                // Copied to `let`s rather than capturing `minRaw`/`maxRaw` themselves — those are
+                // `var`s that a `Task { @MainActor in }` closure would otherwise capture by
+                // reference, which Swift 6's strict concurrency checking rejects outright since
+                // nothing here proves they aren't mutated again before the detached task runs.
+                let loggedMinRaw = minRaw, loggedMaxRaw = maxRaw
                 Task { @MainActor in
                     LogManager.shared.log(String(format: "Sampler health: logit range %.3f … %.3f (spread %.3f) over %d tokens",
-                                                 minRaw, maxRaw, rawSpread, nVocab))
+                                                 loggedMinRaw, loggedMaxRaw, rawSpread, nVocab))
                     LogManager.shared.log("Sampler health: top tokens — \(summary)")
                 }
             }
@@ -1248,7 +1288,13 @@ actor LlamaRunner {
             singleBatch.logits[0] = 1
             singleBatch.n_tokens  = 1
 
-            if llama_decode(ctx, singleBatch) != 0 {
+            // Same reasoning as the prefill decode above, and more pressing here: this call
+            // runs once per generated token, so on a long response the pool would otherwise
+            // never drain for the whole stream. Draining it every token is what keeps a
+            // multi-turn conversation from accumulating leftover Metal buffers turn over turn
+            // until a later, unrelated decode fails with an out-of-memory command buffer error.
+            let decodeResult = autoreleasepool { llama_decode(ctx, singleBatch) }
+            if decodeResult != 0 {
                 handleDecodeFailure(stage: "generation")
                 continuation.yield("\n\n[The model ran out of GPU memory and had to be unloaded. Reload it, or pick a smaller one — this device can't run it at this context size.]")
                 break
@@ -1622,7 +1668,6 @@ class LLMManager: ObservableObject {
             return .warning(requiredGB: required, availableGB: availableNowGB)
         }
 
-        // If the required memory takes up more than 90% of total device RAM, it's a no-go
         if required > total * 0.90 {
             return .dangerous(requiredGB: required, availableGB: total)
         } else if required > total * 0.70 {
@@ -1822,7 +1867,15 @@ class LLMManager: ObservableObject {
 
         var swiftMessages: [(role: String, content: String)] = []
 
-        let contextLimit = contextTokenLimit
+        // `loadedContextWindow`, not `contextTokenLimit` — the latter is only what the user
+        // requested (defaults to 8192) and can be well above what the loaded model actually got
+        // clamped to (`safeContextTokens`, e.g. OLMoE's trained context caps it at 4096
+        // regardless of the request). Budgeting history against the requested figure let this
+        // pick more history/system content than would actually fit; `generateStream` then had to
+        // truncate to the real window anyway, and its truncation keeps the *end* of the token
+        // stream — dropping the system block, where Custom Instructions live, silently off the
+        // front instead of trimming the oldest history turns the way this budgeting intends.
+        let contextLimit = loadedContextWindow > 0 ? loadedContextWindow : contextTokenLimit
         let reservedGeneration = min(maxTokens, max(256, contextLimit / 2))
         let systemTokenEstimate = (systemBlock.count / 3) + 64
         let promptTokenEstimate = (prompt.count / 3) + 16

@@ -23,7 +23,7 @@ nonisolated enum ModelOutput {
     static func filterThoughts(from text: String, stripMarkdown: Bool = false) -> String {
         var filtered = text
 
-        // --- 0. Strip format-agnostic reasoning/channel blocks ---
+        // 0. Strip format-agnostic reasoning/channel blocks.
         // Some models (gpt-oss, certain Gemma fine-tunes) use a "channel" convention with
         // no matching close tag at all — e.g. <|channel|>analysis<|message|> ... reasoning ...
         // <|channel|>final<|message|> — where analysis only ends when a new non-reasoning
@@ -60,7 +60,7 @@ nonisolated enum ModelOutput {
             }
         }
 
-        // --- 1. Strip XML-style thinking/correction/reflection tags ---
+        // 1. Strip XML-style thinking/correction/reflection tags.
         // Covers Gemma, Qwen, DeepSeek, Llama, and other instruct model variants
         let xmlTags = [
             "think", "thinking", "thought", "thoughts",
@@ -97,7 +97,7 @@ nonisolated enum ModelOutput {
             filtered = filtered.replacingOccurrences(of: token, with: "", options: .caseInsensitive)
         }
         
-        // --- 2. Strip plaintext preamble headers ---
+        // 2. Strip plaintext preamble headers.
         let plaintextHeaders = ["Thinking Process:", "Thought Process:", "Internal Reasoning:", "Chain of Thought:"]
         for header in plaintextHeaders {
             while let startRange = filtered.range(of: header, options: .caseInsensitive) {
@@ -116,7 +116,7 @@ nonisolated enum ModelOutput {
             }
         }
         
-        // --- 3. Strip exact known artifact strings ---
+        // 3. Strip exact known artifact strings.
         let exactArtifacts = [
             "<|im_start|>", "<|im_end|>", "<|start_of_turn|>", "<|end_of_turn|>"
         ]
@@ -124,7 +124,7 @@ nonisolated enum ModelOutput {
             filtered = filtered.replacingOccurrences(of: artifact, with: "", options: .caseInsensitive)
         }
 
-        // --- 3b. Strip bare (untagged) scaffolding/preamble blocks ---
+        // 3b. Strip bare (untagged) scaffolding/preamble blocks.
         // Some fine-tunes open every reply with meta-commentary about how they plan to
         // respond — style/tone "checks," headers like "My internal monologue:", decorative
         // "***" separators, or literal placeholder text like "(Generating response...)" —
@@ -156,8 +156,37 @@ nonisolated enum ModelOutput {
                 }
             }
         }
-        
-        // --- 4. Strip leading role-echo preamble (model parroting its own role prefix) ---
+
+        // 3c. Strip stray inline status markers, e.g. "[generating...]", "(thinking...)", or
+        // "<|generating a response to the user's question|>".
+        //
+        // Distinct from 3b above: some fine-tunes (observed on OLMoE) narrate their own
+        // progress as a bracketed aside dropped anywhere in an otherwise normal reply — not
+        // just as an opening block — so 3b's start-of-message-only, delete-to-the-next-blank-
+        // line handling neither matches it nor is the right way to remove it even when it does.
+        // This instead matches the marker itself, wherever it falls, and deletes only that
+        // span. The verb list is short and specific (rather than 3b's broader label shapes)
+        // precisely so this is safe to run unanchored — none of these plausibly open a bracketed
+        // aside in ordinary prose the way a bolded header or slash-command line might — but the
+        // *tail* is intentionally permissive (up to 120 characters of anything short of another
+        // bracket or a newline) since these asides range from a bare "[generating...]" to a full
+        // narrated sentence like "[generating a detailed response based on your question]".
+        let statusVerbs = "generating|thinking|processing|analyzing|reasoning|writing|composing|working|" +
+            "responding|preparing|drafting|formulating|crafting|considering|reflecting|continuing"
+        let inlineStatusPattern =
+            "(?:\\[\\s*(?:\(statusVerbs))\\b[^\\[\\]\\n]{0,120}\\]" +
+            "|\\(\\s*(?:\(statusVerbs))\\b[^()\\n]{0,120}\\)" +
+            "|<\\|?\\s*(?:\(statusVerbs))\\b[^<>\\n]{0,120}\\|?>)"
+        if let inlineStatusRegex = try? NSRegularExpression(pattern: inlineStatusPattern, options: [.caseInsensitive]) {
+            filtered = inlineStatusRegex.stringByReplacingMatches(
+                in: filtered,
+                options: [],
+                range: NSRange(filtered.startIndex..., in: filtered),
+                withTemplate: ""
+            )
+        }
+
+        // 4. Strip leading role-echo preamble (model parroting its own role prefix).
         let leadingPreambles = ["assistant:", "response:", "answer:", "a:"]
         var didTrimLeading = true
         while didTrimLeading {
@@ -173,7 +202,7 @@ nonisolated enum ModelOutput {
             }
         }
         
-        // --- 5. Strip personality system-prompt leak via regex ---
+        // 5. Strip personality system-prompt leak via regex.
         if let regex = try? NSRegularExpression(
             pattern: "\\(?(?:Critical Instructions?|User Style Matrix|Communication Style Note)[\\s\\S]*?fr\\.?\\)?",
             options: [.caseInsensitive, .dotMatchesLineSeparators]
@@ -186,7 +215,7 @@ nonisolated enum ModelOutput {
             ).trimmingCharacters(in: .whitespacesAndNewlines)
         }
         
-        // --- 6. Markdown stripping (mature personality mode only, always preserves fenced code blocks) ---
+        // 6. Markdown stripping (mature personality mode only, always preserves fenced code blocks).
         if stripMarkdown {
             var codeBlocks: [String] = []
             var protected = filtered
@@ -217,7 +246,7 @@ nonisolated enum ModelOutput {
             filtered = protected
         }
         
-        // --- 7. Strip trailing role-echo stop tokens ---
+        // 7. Strip trailing role-echo stop tokens.
         var finalFiltered = filtered.trimmingCharacters(in: .whitespacesAndNewlines)
         let trailingStops = ["user", "user:", "<|im_end|>", "<start_of_turn>user", "<|user|>", "<|eot_id|>"]
         var didTrimTrailing = true

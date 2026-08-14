@@ -13,7 +13,7 @@ import LlamaSwift
 /// so the planner needs the split measured rather than guessed. These numbers come from the
 /// GGUF tensor directory, which is exact, instead of from a parameter-count model that would
 /// have to assume a quantisation mix per tensor class.
-struct ModelProfile {
+nonisolated struct ModelProfile {
 
     /// Total file size.
     let totalGB: Double
@@ -81,7 +81,10 @@ struct ModelProfile {
 /// That is still real file I/O, and the model picker asks for one per row as the list scrolls,
 /// hence the cache — keyed by size and modification date so replacing a file at the same path
 /// re-reads it rather than serving a stale answer.
-enum ModelProfiler {
+/// `nonisolated`: this already guards its cache with an explicit `NSLock` specifically so it can
+/// be called from any thread, `LlamaRunner`'s background actor included — it was never meant to
+/// be main-actor-confined, that's just this file predating the project's default actor isolation.
+nonisolated enum ModelProfiler {
 
     private static let lock = NSLock()
     private static var cache: [String: ModelProfile] = [:]
@@ -235,7 +238,7 @@ enum ModelProfiler {
     }
 }
 
-private extension Int {
+private nonisolated extension Int {
     /// `nil` for zero, so a missing-or-zero GGUF key can fall through to a computed default.
     var nonZero: Int? { self == 0 ? nil : self }
 }

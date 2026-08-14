@@ -158,7 +158,10 @@ struct OnboardingView: View {
                 : "\(AppInfo.displayName) needs a model to think with. Pick one to download — this is a one-time step."
         ) {
             VStack(spacing: 14) {
-                if let progress = downloads.active {
+                // Onboarding only ever offers one model at a time, so taking whichever download
+                // happens to be active is equivalent to taking "the" one here — concurrent
+                // downloads are a Settings-only affordance.
+                if let progress = downloads.activeDownloads.values.first {
                     downloadProgressCard(progress)
                 } else {
                     // Chat models only. Onboarding's job is to get the app to a working state
@@ -258,9 +261,11 @@ struct OnboardingView: View {
                 .foregroundColor(Theme.textMuted)
                 .multilineTextAlignment(.center)
 
-            Button("Pause Download") { downloads.cancel() }
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundColor(.orange)
+            if let model = ModelCatalog.model(withID: progress.modelID) {
+                Button("Pause Download") { downloads.cancel(model) }
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(.orange)
+            }
         }
         .padding(16)
         .frame(maxWidth: .infinity)

@@ -80,13 +80,10 @@ struct GlitchBackgroundView: View {
             // bounding box and drew a visible rectangle on screen. Plain `.opacity` dims the real
             // artwork, works regardless of rendering mode, and leaves no box.
 
-            // Glitching element 1 (red shift). Screen blending only makes sense over a dark
-            // page — on a light one it lightens toward white and draws the layer's bounding box
-            // as a grey rectangle, so both glitch layers are dark-mode only.
-            // Both glitch layers now use the alpha-keyed asset, so they work in either
-            // appearance — no screen blending, which was the thing that restricted them to a
-            // dark page (over a light one it lightens toward white and exposes the layer's
-            // bounding box as a grey rectangle).
+            // Glitching element 1 (red shift). Both glitch layers now use the alpha-keyed asset,
+            // so they work in either appearance — no screen blending, which was the thing that
+            // restricted them to a dark page (over a light one it lightens toward white and
+            // exposes the layer's bounding box as a grey rectangle).
             Image("circuit_traces")
                 .renderingMode(.template)
                 .resizable()
@@ -122,7 +119,6 @@ struct GlitchBackgroundView: View {
                 .foregroundColor(colorScheme == .dark ? .white : Theme.textPrimary)
                 .opacity(colorScheme == .dark ? 0.22 : 0.16)
             
-            // Random horizontal glitch bars
             GeometryReader { geo in
                 ForEach(0..<5) { _ in
                     Rectangle()
@@ -142,7 +138,6 @@ struct GlitchBackgroundView: View {
                 .allowsHitTesting(false)
         }
         .onReceive(timer) { _ in
-            // Randomly trigger glitch effect
             if Double.random(in: 0...1) > 0.85 {
                 withAnimation(.linear(duration: 0.05)) {
                     glitchOffset1 = CGFloat.random(in: -15...15)
@@ -150,8 +145,7 @@ struct GlitchBackgroundView: View {
                     glitchOpacity = Double.random(in: 0.3...0.8)
                     glitchColor = Double.random(in: 0...1) > 0.5 ? .red : .purple
                 }
-                
-                // Instantly snap back
+
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                     withAnimation(.linear(duration: 0.05)) {
                         glitchOffset1 = 0

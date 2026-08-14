@@ -19,6 +19,16 @@ class RAGManager: ObservableObject {
     private let storageKey = "DarkAI_RAGDocuments"
     private let chunkSize = 300 // words per chunk
     private let chunkOverlap = 50
+
+    /// Largest content a single document may store.
+    ///
+    /// Documents here are persisted to `UserDefaults` in full on every `saveDocuments()` call — a
+    /// property list decoded into memory whole on every launch, not a database. `StructuredImport`
+    /// already enforces this exact limit on its own (JSON) ingestion path, with the reasoning that
+    /// nothing ingested here should be free to grow without bound. This mirrors that cap at the
+    /// point every route into the Mindscape shares — chat file upload and the plain-text Settings
+    /// importer both called `ingestDocument` directly with no limit of their own before this.
+    static let maxDocumentCharacters = 750_000
     
     init() {
         loadDocuments()
@@ -52,11 +62,21 @@ class RAGManager: ObservableObject {
         }
     }
     
-    func ingestDocument(name: String, content: String, imageFileName: String? = nil) {
-        let chunks = splitIntoChunks(text: content)
-        let doc = RAGDocument(name: name, content: content, chunks: chunks, imageFileName: imageFileName)
+    /// Returns whether `content` had to be truncated to fit `maxDocumentCharacters`, so a caller
+    /// that shows the user a character count can say so rather than silently storing less than
+    /// what was reported as extracted.
+    @discardableResult
+    func ingestDocument(name: String, content: String, imageFileName: String? = nil) -> Bool {
+        let wasTruncated = content.count > Self.maxDocumentCharacters
+        let boundedContent = wasTruncated ? String(content.prefix(Self.maxDocumentCharacters)) : content
+        let chunks = splitIntoChunks(text: boundedContent)
+        let doc = RAGDocument(name: name, content: boundedContent, chunks: chunks, imageFileName: imageFileName)
         documents.append(doc)
         saveDocuments()
+        if wasTruncated {
+            LogManager.shared.log("RAGManager: '\(name)' exceeded \(Self.maxDocumentCharacters) characters — truncated on ingest.")
+        }
+        return wasTruncated
     }
 
     /// Directory where generated-image files backing RAG entries are stored.
@@ -83,11 +103,9 @@ class RAGManager: ObservableObject {
         formatter.timeStyle = .short
         let timestamp = formatter.string(from: Date())
 
-        // Use first ~60 chars of prompt for the document name
         let shortPrompt = String(prompt.prefix(60)).trimmingCharacters(in: .whitespacesAndNewlines)
         let docName = "Generated Image – \(shortPrompt).txt"
-        
-        // Save the image data locally
+
         let imagesDir = AppFiles.generatedImages
         AppFiles.createIfNeeded(imagesDir)
 
@@ -162,14 +180,12 @@ class RAGManager: ObservableObject {
                 let chunkTokens = tokenize(chunk)
                 let overlapCount = queryTokens.filter { chunkTokens.contains($0) }.count
                 if overlapCount > 0 {
-                    // Score is overlap normalized by query length and chunk length log
                     let score = Double(overlapCount) / (log(Double(chunkTokens.count + 1)) + 1.0)
                     scores.append(ChunkScore(documentName: doc.name, text: chunk, score: score))
                 }
             }
         }
-        
-        // Sort descending
+
         let topChunks = scores.sorted(by: { $0.score > $1.score }).prefix(maxResults)
         
         if topChunks.isEmpty {
@@ -190,7 +206,6 @@ class RAGManager: ObservableObject {
         return Set(filtered)
     }
     
-    // Minimal English stopwords list for filtering RAG queries
     private let stopWords: Set<String> = [
         "the", "and", "a", "of", "to", "is", "in", "it", "you", "that", "he", "was", "for", "on", "are", "as", "with",
         "his", "they", "i", "at", "be", "this", "have", "from", "or", "one", "had", "by", "word", "but", "not", "what",

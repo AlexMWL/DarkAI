@@ -64,7 +64,6 @@ struct SettingsView: View {
 
                         missingModelsBanner
 
-                        // SECTION 1: Local Model Manager (.gguf)
                         VStack(alignment: .leading, spacing: 14) {
                             HStack {
                                 Image(systemName: "cpu")
@@ -108,7 +107,13 @@ struct SettingsView: View {
 
                             Divider().background(Theme.border)
 
-                            downloadCatalogSection(for: .chat)
+                            VStack(alignment: .leading, spacing: 10) {
+                                Text("DOWNLOAD A CHAT MODEL")
+                                    .font(.system(size: 11, weight: .bold))
+                                    .foregroundColor(Theme.textSecondary)
+                                    .kerning(1.0)
+                                downloadCatalogButton(for: .chat)
+                            }
 
                             if isImporting {
                                 HStack {
@@ -131,7 +136,6 @@ struct SettingsView: View {
                         }
                         .glassCard(cornerRadius: 16)
 
-                        // SECTION 1b: Diffusion Model Manager
                         VStack(alignment: .leading, spacing: 14) {
                             HStack {
                                 Image(systemName: "photo.badge.plus")
@@ -160,7 +164,6 @@ struct SettingsView: View {
                                 }
                             }
 
-                            // Diffusion model list
                             if importedDiffusionModels.isEmpty {
                                 Text("No diffusion model installed. Download one below, or import a .gguf or .safetensors checkpoint you already have.")
                                     .font(.system(size: 13))
@@ -178,7 +181,13 @@ struct SettingsView: View {
 
                             Divider().background(Theme.border)
 
-                            downloadCatalogSection(for: .diffusion)
+                            VStack(alignment: .leading, spacing: 10) {
+                                Text("DOWNLOAD A DIFFUSION MODEL")
+                                    .font(.system(size: 11, weight: .bold))
+                                    .foregroundColor(Theme.textSecondary)
+                                    .kerning(1.0)
+                                downloadCatalogButton(for: .diffusion)
+                            }
 
                             if isDiffusionImporting {
                                 HStack {
@@ -232,7 +241,6 @@ struct SettingsView: View {
                                     .stroke(Color.orange.opacity(0.45), lineWidth: 1))
                             }
 
-                            // Current diffusion load state
                             switch diffusionManager.diffusionLoadState {
                             case .loading(_, let status):
                                 HStack(spacing: 8) {
@@ -253,13 +261,11 @@ struct SettingsView: View {
 
                             Divider().background(Theme.border)
 
-                            // Generation settings sub-section
                             Text("IMAGE GEN SETTINGS")
                                 .font(.system(size: 11, weight: .bold))
                                 .foregroundColor(Theme.textSecondary)
                                 .kerning(1.0)
 
-                            // Steps
                             VStack(alignment: .leading, spacing: 6) {
                                 HStack {
                                     Text("Inference Steps:")
@@ -279,7 +285,6 @@ struct SettingsView: View {
 
                             Divider().background(Theme.border)
 
-                            // CFG Scale
                             VStack(alignment: .leading, spacing: 6) {
                                 HStack {
                                     Text("CFG Scale (Prompt Strength):")
@@ -296,7 +301,6 @@ struct SettingsView: View {
 
                             Divider().background(Theme.border)
 
-                            // Output resolution
                             VStack(alignment: .leading, spacing: 8) {
                                 Text("Output Resolution:")
                                     .font(.system(size: 13))
@@ -330,7 +334,6 @@ struct SettingsView: View {
                         }
                         .onAppear { loadDiffusionModels() }
 
-                        // SECTION 2: Custom Prompt Instructions
                         VStack(alignment: .leading, spacing: 12) {
                             HStack {
                                 Image(systemName: "slider.horizontal.3")
@@ -355,8 +358,7 @@ struct SettingsView: View {
                                 )
                         }
                         .glassCard(cornerRadius: 16)
-                        
-                        // SECTION: Model Parameters (Token Limit)
+
                         VStack(alignment: .leading, spacing: 14) {
                             HStack {
                                 Image(systemName: "slider.horizontal.below.rectangle")
@@ -481,8 +483,7 @@ struct SettingsView: View {
                             }
                         }
                         .glassCard(cornerRadius: 16)
-                        
-                        // SECTION 3: RAG Document Manager
+
                         VStack(alignment: .leading, spacing: 14) {
                             HStack {
                                 Image(systemName: "doc.text.magnifyingglass")
@@ -516,8 +517,7 @@ struct SettingsView: View {
                             }
                         }
                         .glassCard(cornerRadius: 16)
-                        
-                        // SECTION 4: Long-Term Memories
+
                         VStack(alignment: .leading, spacing: 14) {
                             HStack {
                                 Image(systemName: "brain.head.profile")
@@ -563,7 +563,6 @@ struct SettingsView: View {
                         }
                         .glassCard(cornerRadius: 16)
 
-                        // SECTION 5: Internet Access
                         VStack(alignment: .leading, spacing: 14) {
                             HStack {
                                 Image(systemName: "globe")
@@ -628,7 +627,6 @@ struct SettingsView: View {
                         }
                         .glassCard(cornerRadius: 16)
 
-                        // Personality Reset Section
                         VStack(alignment: .leading, spacing: 12) {
                             HStack {
                                 Image(systemName: "person.text.rectangle")
@@ -715,7 +713,6 @@ struct SettingsView: View {
                         }
                         .glassCard(cornerRadius: 16)
 
-                        // SECTION 6: Diagnostics
                         VStack(alignment: .leading, spacing: 14) {
                             HStack {
                                 Image(systemName: "ladybug")
@@ -747,8 +744,7 @@ struct SettingsView: View {
                             }
                         }
                         .glassCard(cornerRadius: 16)
-                        
-                        // SECTION: Appearance
+
                         VStack(alignment: .leading, spacing: 14) {
                             HStack {
                                 Image(systemName: "paintbrush.fill")
@@ -799,7 +795,6 @@ struct SettingsView: View {
                         }
                         .glassCard(cornerRadius: 16)
 
-                        // SECTION 7: Safety, legal & storage
                         VStack(alignment: .leading, spacing: 14) {
                             HStack {
                                 Image(systemName: "checkmark.shield.fill")
@@ -857,8 +852,7 @@ struct SettingsView: View {
                     }
                     .padding()
                 }
-                
-                // Loading Model Overlay
+
                 if case let .loading(progress, status) = llmManager.loadState {
                     ZStack {
                         Color.black.opacity(0.45)
@@ -903,8 +897,7 @@ struct SettingsView: View {
                         )
                     }
                 }
-                
-                // Memory Failsafe Alert Overlay
+
                 if showFailsafePopup {
                     ZStack {
                         Color.black.opacity(0.5)
@@ -1023,9 +1016,7 @@ struct SettingsView: View {
                     primaryButton: .default(Text("Revert to Safe Limit")) {
                         llmManager.contextTokenLimit = llmManager.safeContextLimit
                     },
-                    secondaryButton: .destructive(Text("Ignore & Keep")) {
-                        // User chooses to keep the limit
-                    }
+                    secondaryButton: .destructive(Text("Ignore & Keep")) {}
                 )
             }
             .alert("Invalid File", isPresented: $showInvalidFileTypeAlert) {
@@ -1050,6 +1041,15 @@ struct SettingsView: View {
 
             .onAppear {
                 refreshModelList()
+            }
+            // Lives at the root rather than on the download screen itself, since that screen is
+            // torn down the moment the user navigates back — a download that finishes while
+            // they're back on the main Settings screen (or with the app backgrounded) still
+            // needs to move from "downloading" to "installed" in the list either way.
+            .onChange(of: downloads.lastCompletedModelID) { _, newValue in
+                guard newValue != nil else { return }
+                refreshModelList()
+                loadDiffusionModels()
             }
         }
     }
@@ -1191,69 +1191,112 @@ struct SettingsView: View {
         }
     }
 
+    /// Compact entry point shown inline in each "LOCAL LLM MODELS" / "DIFFUSION MODEL" card —
+    /// pushes to `modelDownloadScreen`, which holds the catalog list itself. Reflects an
+    /// in-progress download for this `kind` even while collapsed, so leaving the download
+    /// screen doesn't hide the fact that a transfer is still running.
+    @ViewBuilder
+    private func downloadCatalogButton(for kind: ModelKind) -> some View {
+        // Downloads run concurrently, so more than one of this `kind` can be active at once —
+        // the collapsed row aggregates them by bytes rather than trying to name just one.
+        let activeForKind = downloads.activeDownloads.values.filter { $0.kind == kind }
+        let tint: Color = kind == .chat ? Theme.accentCyan : Color.purple
+        let downloadableCount = ModelCatalog.models(for: kind).filter { !downloads.isInstalled($0) }.count
+
+        NavigationLink {
+            // `.id(kind)` matters here, not just style: `NavigationView` (this file predates
+            // `NavigationStack`) identifies a closure-built destination by its view *shape*, and
+            // the chat and diffusion buttons build one from the exact same shape with only
+            // `kind` differing inside a closure. Without an explicit identity tied to `kind`,
+            // tapping either button could push whichever destination `NavigationView` last
+            // resolved for that shape — observed in testing as the chat button opening the
+            // diffusion screen.
+            modelDownloadScreen(for: kind)
+                .id(kind)
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: kind == .chat ? "arrow.down.circle.fill" : "photo.badge.arrow.down.fill")
+                    .foregroundColor(tint)
+                    .font(.system(size: 16))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(activeForKind.isEmpty
+                         ? "Browse \(kind == .chat ? "Chat" : "Diffusion") Models"
+                         : (activeForKind.count == 1 ? "Downloading…" : "Downloading \(activeForKind.count)…"))
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundColor(Theme.textPrimary)
+                    if !activeForKind.isEmpty {
+                        let writtenTotal = activeForKind.reduce(0) { $0 + $1.bytesWritten }
+                        let expectedTotal = activeForKind.reduce(0) { $0 + $1.totalBytes }
+                        let fraction = expectedTotal > 0 ? Double(writtenTotal) / Double(expectedTotal) : 0
+                        Text("\(Int(fraction * 100))% overall · \(ByteCountFormatter.string(fromByteCount: writtenTotal, countStyle: .file)) of \(ByteCountFormatter.string(fromByteCount: expectedTotal, countStyle: .file))")
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundColor(Theme.textSecondary)
+                    } else {
+                        Text(downloadableCount > 0
+                             ? "\(downloadableCount) available to download"
+                             : "All caught up — every catalog model is installed")
+                            .font(.system(size: 10))
+                            .foregroundColor(Theme.textMuted)
+                    }
+                }
+                Spacer()
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(Theme.textMuted)
+            }
+            .padding(12)
+            .background(Theme.background.opacity(0.4))
+            .cornerRadius(10)
+            .overlay(RoundedRectangle(cornerRadius: 10).stroke(Theme.border, lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+    }
+
+    /// The screen `downloadCatalogButton` pushes to — the catalog list itself, moved out of the
+    /// main Settings screen so it isn't rendered (and its rows re-evaluated) until asked for.
+    @ViewBuilder
+    private func modelDownloadScreen(for kind: ModelKind) -> some View {
+        ZStack {
+            Theme.background.ignoresSafeArea()
+            ScrollView {
+                downloadCatalogSection(for: kind)
+                    .padding()
+            }
+        }
+        .navigationTitle(kind == .chat ? "Chat Models" : "Diffusion Models")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
     @ViewBuilder
     private func downloadCatalogSection(for kind: ModelKind) -> some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text(kind == .chat ? "DOWNLOAD A CHAT MODEL" : "DOWNLOAD A DIFFUSION MODEL")
-                .font(.system(size: 11, weight: .bold))
-                .foregroundColor(Theme.textSecondary)
-                .kerning(1.0)
-
-            // A single download runs at a time, so the in-progress card is shown by whichever
-            // section owns the active transfer — showing it in both would imply two downloads.
-            if let progress = downloads.active, downloads.activeKind == kind {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text(progress.isResumed ? "Resuming…" : "Downloading…")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundColor(Theme.textPrimary)
-                    ProgressView(value: progress.fractionCompleted)
-                        .progressViewStyle(LinearProgressViewStyle(tint: Theme.accent))
-                    HStack {
-                        Text("\(progress.writtenDescription) of \(progress.totalDescription)")
-                            .font(.system(size: 11, design: .monospaced))
-                            .foregroundColor(Theme.textSecondary)
-                        Spacer()
-                        // Named for what it now does. Stopping keeps the bytes already fetched, so
-                        // calling it "Cancel" would understate it and push people into waiting out
-                        // a transfer they could safely interrupt.
-                        Button("Pause") { downloads.cancel() }
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundColor(.orange)
-                    }
-                    Text("You can leave the app — the transfer continues in the background, and an interrupted download picks up where it left off.")
-                        .font(.system(size: 10))
-                        .foregroundColor(Theme.textMuted)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                .padding(12)
-                .background(Theme.cardBackground)
-                .cornerRadius(10)
-            } else {
-                ForEach(ModelCatalog.models(for: kind)) { model in
-                    catalogRow(model)
-                }
-
-                if let error = downloads.lastError, downloads.active == nil {
-                    Text(error)
-                        .font(.system(size: 12))
-                        .foregroundColor(.orange)
-                }
-
-                Toggle(isOn: $downloads.allowsCellularDownload) {
-                    Text("Allow downloads over cellular")
-                        .font(.system(size: 12))
-                        .foregroundColor(Theme.textSecondary)
-                }
-                .toggleStyle(SwitchToggleStyle(tint: Theme.accent))
+            // Every catalog model is listed here, installed or not — this is also where anyone
+            // reads a model's details (size, license, memory tier), not only where they download
+            // one, so hiding a row the moment it's installed took that reference away right when
+            // there'd otherwise be a reason to check it again. `catalogRow` shows the install
+            // state, its own Get/Resume button, or its own progress bar, per model.
+            ForEach(ModelCatalog.models(for: kind)) { model in
+                catalogRow(model)
             }
-        }
-        .onChange(of: downloads.lastCompletedModelID) { _, newValue in
-            guard newValue != nil else { return }
-            refreshModelList()
-            loadDiffusionModels()
+
+            if let error = downloads.lastError {
+                Text(error)
+                    .font(.system(size: 12))
+                    .foregroundColor(.orange)
+            }
+
+            Toggle(isOn: $downloads.allowsCellularDownload) {
+                Text("Allow downloads over cellular")
+                    .font(.system(size: 12))
+                    .foregroundColor(Theme.textSecondary)
+            }
+            .toggleStyle(SwitchToggleStyle(tint: Theme.accent))
         }
     }
 
+    /// A row for a catalog model not yet installed — the list this appears in already filters
+    /// Lists every catalog model, whether installed or not, so its details stay readable either
+    /// way — only the trailing control (checkmark / Get / Resume / progress) changes per state.
     @ViewBuilder
     private func catalogRow(_ model: CatalogModel) -> some View {
         let installed = downloads.isInstalled(model)
@@ -1310,7 +1353,10 @@ struct SettingsView: View {
                     Image(systemName: "checkmark.circle.fill")
                         .foregroundColor(.green)
                         .font(.system(size: 18))
-                } else {
+                } else if downloads.activeDownloads[model.id] == nil {
+                    // Downloads run concurrently now, so this button is only ever gated on
+                    // *this* model's own state — starting one no longer disables every other
+                    // row's.
                     let isResumable = downloads.resumableModelIDs.contains(model.id)
                     Button {
                         downloads.download(model)
@@ -1322,12 +1368,27 @@ struct SettingsView: View {
                             .padding(.vertical, 6)
                             .background(RoundedRectangle(cornerRadius: 8).fill(isResumable ? Color.orange : Theme.accent))
                     }
-                    .disabled(downloads.isDownloading)
-                    .opacity(downloads.isDownloading ? 0.4 : 1)
                 }
             }
 
-            if !installed, downloads.resumableModelIDs.contains(model.id) {
+            if !installed, let progress = downloads.activeDownloads[model.id] {
+                VStack(alignment: .leading, spacing: 6) {
+                    ProgressView(value: progress.fractionCompleted)
+                        .progressViewStyle(LinearProgressViewStyle(tint: Theme.accent))
+                    HStack {
+                        Text("\(progress.isResumed ? "Resuming" : "Downloading") — \(progress.writtenDescription) of \(progress.totalDescription)")
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundColor(Theme.textSecondary)
+                        Spacer()
+                        // Named for what it now does. Stopping keeps the bytes already fetched, so
+                        // calling it "Cancel" would understate it and push people into waiting out
+                        // a transfer they could safely interrupt.
+                        Button("Pause") { downloads.cancel(model) }
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundColor(.orange)
+                    }
+                }
+            } else if downloads.resumableModelIDs.contains(model.id) {
                 HStack(spacing: 10) {
                     Text("Partly downloaded — resuming will continue rather than start over.")
                         .font(.system(size: 10))
@@ -1346,7 +1407,6 @@ struct SettingsView: View {
         .overlay(RoundedRectangle(cornerRadius: 10).stroke(Theme.border, lineWidth: 1))
     }
 
-    // Custom View for rows of imported GGUF models
     @ViewBuilder
     private func modelRow(for url: URL) -> some View {
         let sizeGB = llmManager.getModelSizeGB(at: url)
@@ -1364,8 +1424,7 @@ struct SettingsView: View {
                     Text(String(format: "%.2f GB", sizeGB))
                         .font(.system(size: 11, design: .monospaced))
                         .foregroundColor(Theme.textSecondary)
-                    
-                    // Safety Label
+
                     safetyTag(for: safety)
                 }
             }
@@ -1386,7 +1445,6 @@ struct SettingsView: View {
                 }
             
                 if isLoaded {
-                // Unload button when model is currently active
                 Button(action: {
                     llmManager.unloadModel()
                 }) {
@@ -2102,19 +2160,40 @@ struct MindscapeView: View {
 
     private func ingestRAGDocument(from sourceURL: URL) {
         let isSecured = sourceURL.startAccessingSecurityScopedResource()
-        defer { if isSecured { sourceURL.stopAccessingSecurityScopedResource() } }
+        let fileName = sourceURL.lastPathComponent
 
-        do {
-            let content = try String(contentsOf: sourceURL, encoding: .utf8)
-            ragManager.ingestDocument(name: sourceURL.lastPathComponent, content: content)
-            importNote = ImportNote(
-                text: "Added \(sourceURL.lastPathComponent).",
-                isError: false,
-                icon: "checkmark.circle.fill"
-            )
-        } catch {
-            importNote = ImportNote(text: "Couldn't read that file: \(error.localizedDescription)", isError: true, icon: "exclamationmark.triangle.fill")
-            LogManager.shared.log("Mindscape text import failed: \(error.localizedDescription)")
+        // Same size cap `StructuredImport` applies on its own (JSON) ingestion path — a plain-text
+        // file has no structure to sniff, so size is the only guard available before reading it.
+        let sizeBytes = (try? sourceURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        guard sizeBytes <= StructuredImport.maxFileBytes else {
+            if isSecured { sourceURL.stopAccessingSecurityScopedResource() }
+            let cap = ByteCountFormatter.string(fromByteCount: Int64(StructuredImport.maxFileBytes), countStyle: .file)
+            importNote = ImportNote(text: "That file is too large to import (limit \(cap)).", isError: true, icon: "exclamationmark.triangle.fill")
+            return
+        }
+
+        Task {
+            // Reading is backgrounded for the same reason `ingestStructuredJSON` backgrounds its
+            // parsing below: a large text file read synchronously on the main thread — which this
+            // path used to do unconditionally, with no size limit at all — visibly freezes the app
+            // mid-tap.
+            let result = await Task.detached(priority: .userInitiated) {
+                Result { try String(contentsOf: sourceURL, encoding: .utf8) }
+            }.value
+            if isSecured { sourceURL.stopAccessingSecurityScopedResource() }
+
+            switch result {
+            case .success(let content):
+                let wasTruncated = ragManager.ingestDocument(name: fileName, content: content)
+                importNote = ImportNote(
+                    text: wasTruncated ? "Added \(fileName) (large file — only part of it was kept)." : "Added \(fileName).",
+                    isError: false,
+                    icon: "checkmark.circle.fill"
+                )
+            case .failure(let error):
+                importNote = ImportNote(text: "Couldn't read that file: \(error.localizedDescription)", isError: true, icon: "exclamationmark.triangle.fill")
+                LogManager.shared.log("Mindscape text import failed: \(error.localizedDescription)")
+            }
         }
     }
 

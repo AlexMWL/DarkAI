@@ -188,8 +188,6 @@ class PersonalityManager: ObservableObject {
     private let legacyMetricsKey = "DarkAI_StyleMetrics"
     private var messageBatch: [String] = []
 
-    /// Per-model style measurements. Keyed by model so switching models doesn't inherit a voice
-    /// learned against a different one.
     @Published private(set) var styleMetrics = StyleMetrics()
 
     init() {
@@ -326,7 +324,7 @@ class PersonalityManager: ObservableObject {
     
     func analyzeUserMessage(_ message: String, llmManager: LLMManager?) {
 
-        // --- 1. Style measurement (every message, no keyword required) ---
+        // 1. Style measurement (every message, no keyword required).
         // This runs unconditionally rather than only when a listed slang word appears, which is
         // what makes the profile sharpen from ordinary messages instead of stalling on users
         // whose voice is distinctive but doesn't happen to use the vocabulary in a fixed list.
@@ -370,7 +368,7 @@ class PersonalityManager: ObservableObject {
             savePersonalities()
         }
         
-        // --- 2. Batching & Background Style Analysis ---
+        // 2. Batching & background style analysis.
         messageBatch.append(message)
         
         if messageBatch.count >= 2 {

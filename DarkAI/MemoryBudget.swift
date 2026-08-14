@@ -13,7 +13,11 @@ import Metal
 /// 11 GB phone: whatever the app happened to be holding at that instant was treated as the ceiling.
 /// This type plans against the allowance the app can *claim* instead, so the KV cache is sized by
 /// what the device can actually provide rather than by a snapshot taken at the wrong moment.
-enum MemoryBudget {
+/// `nonisolated`: every figure here is a stateless read of system/Mach/Metal APIs, all of which
+/// are safe to call from any thread. It has to be — `LlamaRunner`, the actor that plans model
+/// offload and sizes the KV cache against these numbers, is not the main actor, and none of this
+/// needs the main actor's serialization since there is no shared mutable state to protect.
+nonisolated enum MemoryBudget {
 
     private static let bytesPerGB = 1024.0 * 1024.0 * 1024.0
 

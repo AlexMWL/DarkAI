@@ -158,8 +158,7 @@ class ConversationManager: ObservableObject {
             }
             
             saveConversations()
-            
-            // Trigger manual object update notification
+
             objectWillChange.send()
         }
     }

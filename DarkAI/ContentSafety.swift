@@ -86,7 +86,7 @@ nonisolated enum ContentSafety {
         let hasSexual = matchesAny(sexualTerms, normalized: normalized, compact: compact, useCompact: true)
         let hasExplicitSexual = matchesAny(explicitSexualTerms, normalized: normalized, compact: compact, useCompact: true)
 
-        // ── 1. Child safety — blocked on every surface, unconditionally, no override ───────
+        // 1. Child safety — blocked on every surface, unconditionally, no override.
         // Deliberately the broadest check in the file: any co-occurrence of a minor signal and
         // any sexual signal is refused, and the compacted form is searched too so that "1 3 y r
         // o l d" or "m.i.n.o.r" cannot slip past word boundaries.
@@ -105,13 +105,13 @@ nonisolated enum ContentSafety {
             )
         }
 
-        // ── 2. Self-harm — never blocked, always answered with resources ───────────────────
+        // 2. Self-harm — never blocked, always answered with resources.
         // Suppressing a message from someone in distress is the wrong intervention. Surfacing
         // help alongside the model's reply is both the safer product behaviour and what Apple
         // asks for on this category.
         let selfHarmSignal = matchesAny(selfHarmTerms, normalized: normalized, compact: compact, useCompact: false)
 
-        // ── 3. Sexually explicit material ─────────────────────────────────────────────────
+        // 3. Sexually explicit material.
         // Guideline 1.1.4 bars overtly sexual or pornographic material regardless of medium, so
         // this applies to the chat surface as well as the image surface. The chat threshold is
         // the narrower `explicitSexualTerms` list so that ordinary discussion of sex, sexuality,
