@@ -11,7 +11,20 @@ import CoreGraphics
 nonisolated class SDWrapper: @unchecked Sendable {
     private var sd_ctx: OpaquePointer?
     private var isLoaded: Bool = false
-    
+
+    /// Guards every read/write of `sd_ctx`/`isLoaded`/`isCurrentlyGenerating`.
+    ///
+    /// `DiffusionRunner` (the actor that owns this class) dispatches the actual blocking C++
+    /// calls onto `DispatchQueue.global()` and awaits a continuation — which suspends the actor,
+    /// and a suspended actor is reentrant. That let `unloadModel()` run on the actor, on a
+    /// *different* thread, while `generateImage` was still mid-flight on the dispatch queue: with
+    /// no lock, `unload()`'s `!isCurrentlyGenerating` check could read `false` (not yet set) in
+    /// the gap between `generateImage`'s guard capturing `ctx` and it setting that flag, free the
+    /// context out from under the in-flight call, and hand `generate_image` a dangling pointer.
+    /// The lock is only ever held across the short check/capture/flag steps below, never across
+    /// the slow native calls themselves, so it costs nothing beyond what it protects.
+    private let stateLock = NSLock()
+
     init() {
         sd_set_log_callback({ level, text, user_data in
             guard let text = text, let str = String(cString: text, encoding: .utf8) else { return }
@@ -99,16 +112,19 @@ nonisolated class SDWrapper: @unchecked Sendable {
         ctxParams.flash_attn = false
         ctxParams.diffusion_flash_attn = false
         
-        sd_ctx = new_sd_ctx(&ctxParams)
-        
-        if sd_ctx == nil {
+        let newCtx = new_sd_ctx(&ctxParams)
+
+        guard let newCtx else {
             throw NSError(domain: "SDWrapper", code: 1, userInfo: [NSLocalizedDescriptionKey: "Failed to initialize sd_ctx. The model may be unsupported or the device may be out of memory."])
         }
-        
+
+        stateLock.lock()
+        sd_ctx = newCtx
         isLoaded = true
+        stateLock.unlock()
     }
     private var isCurrentlyGenerating: Bool = false
-    
+
     /// Frees the diffusion context.
     ///
     /// Returns `false` when the request was refused because generation is in flight — freeing
@@ -116,18 +132,30 @@ nonisolated class SDWrapper: @unchecked Sendable {
     /// The return value matters: `DiffusionRunner` used to clear its `loadedPath` unconditionally
     /// after calling this, so a refused unload left the actor believing no model was loaded while
     /// the context was in fact still alive and generating.
+    ///
+    /// The check-and-clear below runs entirely under `stateLock`, so it can't interleave with
+    /// `generateImage`'s own check-and-mark-busy under the same lock — whichever of the two
+    /// actually acquires the lock first is the one that determines the outcome. The native free
+    /// call itself happens after unlocking, on a local copy of the pointer: `sd_ctx` is already
+    /// nil by then, so nothing new can be handed that same pointer, and nothing already past the
+    /// guard in `generateImage` (`isCurrentlyGenerating` already `true`) can reach here at all.
     @discardableResult
     func unload() -> Bool {
+        stateLock.lock()
         guard !isCurrentlyGenerating else {
+            stateLock.unlock()
             return false
         }
-        if let ctx = sd_ctx {
-            autoreleasepool {
-                free_sd_ctx(ctx)
-            }
-            sd_ctx = nil
-        }
+        let ctxToFree = sd_ctx
+        sd_ctx = nil
         isLoaded = false
+        stateLock.unlock()
+
+        if let ctxToFree {
+            autoreleasepool {
+                free_sd_ctx(ctxToFree)
+            }
+        }
         return true
     }
     
@@ -141,17 +169,26 @@ nonisolated class SDWrapper: @unchecked Sendable {
         seed: Int = -1,
         progressHandler: ((Double) -> Void)? = nil
     ) throws -> Data {
+        // Capturing `ctx` and marking generation busy happen together, under the lock, so
+        // `unload()` can never observe "not generating yet" in the gap between them — see the
+        // lock's own doc comment above `stateLock`'s declaration.
+        stateLock.lock()
         guard isLoaded, let ctx = sd_ctx else {
+            stateLock.unlock()
             throw NSError(domain: "SDWrapper", code: 2, userInfo: [NSLocalizedDescriptionKey: "Diffusion model is not loaded."])
         }
-        
+        isCurrentlyGenerating = true
+        stateLock.unlock()
+        defer {
+            stateLock.lock()
+            isCurrentlyGenerating = false
+            stateLock.unlock()
+        }
+
         let trimmedPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedPrompt.isEmpty else {
             throw NSError(domain: "SDWrapper", code: 7, userInfo: [NSLocalizedDescriptionKey: "Empty prompt sent to text encoder."])
         }
-        
-        isCurrentlyGenerating = true
-        defer { isCurrentlyGenerating = false }
 
         // CLIP works in 77-token chunks and every extra chunk is another full text-encoder
         // graph. Keeping both prompts inside roughly two chunks bounds that work and keeps the

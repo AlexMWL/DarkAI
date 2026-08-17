@@ -135,7 +135,14 @@ actor LlamaRunner {
         // first, because f16 doubles the per-token cost and the Q8_0-sized window would no
         // longer fit the same budget.
         var formats: [KVCacheFormat] = []
-        if geometry?.supportsQuantizedCache ?? false { formats.append(.q8_0) }
+        if geometry?.supportsQuantizedCache ?? false {
+            formats.append(.q8_0)
+            // Only added for a load that's already streaming weights from storage — see
+            // `KVCacheFormat.q4_0`. A load that comfortably fits never sees this option at all.
+            if plan.streamsFromStorage {
+                formats.append(.q4_0)
+            }
+        }
         formats.append(.f16)
 
         // A streaming load that can only afford a few hundred tokens is not a working model, it
@@ -144,13 +151,16 @@ actor LlamaRunner {
         // prefill, and the failure there is a dead Metal backend and a corrupted UI rather than a
         // clean refusal. Better to refuse now, while there is still something useful to say.
         //
-        // Checked against the *first* format, which is the best case: Q8_0 where the geometry
-        // allows it, always yielding the largest window for a given budget. If that can't reach a
-        // usable size, the f16 fallback certainly won't.
+        // Checked against the most generous format in the list — the one with the smallest
+        // `bytesPerElement`, which yields the largest window for a given budget — rather than
+        // assuming it's always first: Q4_0 packs tighter than Q8_0 when it's present, so it's the
+        // real best case now, not Q8_0. If that can't reach a usable size, nothing else in the
+        // list, which all cost more per token, will either.
         //
         // Only streaming loads are held to this. A fully-resident model scraping the floor on a
         // small device is long-standing behaviour that works, and is not this problem.
-        if plan.streamsFromStorage, let best = formats.first {
+        if plan.streamsFromStorage,
+           let best = formats.min(by: { $0.bytesPerElement < $1.bytesPerElement }) {
             let bestCtx = safeContextTokens(geometry: geometry,
                                             kvFormat: best,
                                             plan: plan,
@@ -166,7 +176,7 @@ actor LlamaRunner {
             }
         }
 
-        for format in formats {
+        for (formatIndex, format) in formats.enumerated() {
             let nCtx = Int32(safeContextTokens(geometry: geometry,
                                                kvFormat: format,
                                                plan: plan,
@@ -175,9 +185,32 @@ actor LlamaRunner {
                                                requestedLimit: contextLimit,
                                                trainedCtx: trainedCtx))
 
+            // A format later in the list packs tighter than this one — e.g. Q8_0 landing under
+            // the usable floor while Q4_0 is still ahead — so it's worth trying that one instead
+            // of settling for (or worse, technically succeeding at) a context too small to hold a
+            // conversation. The preflight check above already confirmed the most generous format
+            // in the list can clear the floor, so this loop is guaranteed to reach a format that
+            // passes before it runs out.
+            if plan.streamsFromStorage,
+               nCtx < Self.minimumUsableContextTokens,
+               formats[(formatIndex + 1)...].contains(where: { $0.bytesPerElement < format.bytesPerElement }) {
+                LogManager.shared.log("Offload plan — \(format.name) KV cache only reaches \(nCtx) tokens, trying a smaller-footprint format")
+                continue
+            }
+
             var ctxParams = llama_context_default_params()
             ctxParams.n_ctx   = UInt32(nCtx)
             ctxParams.n_batch = UInt32(min(nCtx, 512))
+            // `n_batch` is the logical size a prompt gets chunked into; `n_ubatch` is the physical
+            // size actually pushed through the compute graph at once, and it's what the attention/
+            // activation scratch buffers scale with (`computeOverheadGB`'s 523 MiB measurement was
+            // taken at 512/512). Left equal to `n_batch` by default. For a streaming load, where
+            // every spare hundred MB is a meaningful share of the budget in `safeContextTokens`,
+            // halving it trades some prefill throughput — the prompt gets chunked into more, smaller
+            // passes — for a smaller real compute buffer, at no risk to correctness.
+            ctxParams.n_ubatch = plan.streamsFromStorage
+                ? min(ctxParams.n_batch, 256)
+                : ctxParams.n_batch
             ctxParams.n_threads       = optimalThreads
             ctxParams.n_threads_batch = optimalThreads
             // Quantised K/V requires flash attention, which is why this is set unconditionally
@@ -411,9 +444,38 @@ actor LlamaRunner {
         // Any future attempt at this has to preserve that property to be worth trying.
 
         // Dense streaming: hold layers back from the GPU until the resident share fits.
-        let affordableLayers = gpuBudgetGB > 0 ? min(nLayer, Int(gpuBudgetGB / perLayerGB)) : 0
-        let nGpuLayers = min(correctnessCap, Int32(max(0, affordableLayers)))
-        let gpuGB = Double(min(Int(nGpuLayers), nLayer)) * perLayerGB
+        //
+        // llama.cpp offloads a contiguous run of the *last* n_gpu_layers blocks — the ones
+        // nearest the output — when n_gpu_layers < nLayer, so the layers that matter for this
+        // budget are the trailing ones, walked from the end backward, not an arbitrary count of
+        // average-sized ones.
+        //
+        // Real per-block byte counts (`ModelProfile.blockGBByLayer`) replace the flat `perLayerGB`
+        // average whenever the tensor directory named every block — this is what actually catches
+        // uneven layer sizes, which the average blurs together regardless of which layers happen
+        // to be the ones offloaded. Falls back to the average when the directory is incomplete,
+        // which was always this estimate's only source before.
+        let realBlockGB = profile?.blockGBByLayer
+        let hasCompleteBlockSizes = (realBlockGB?.count ?? 0) == nLayer
+
+        // Cumulative GB of the trailing N blocks, index 0 meaning zero blocks offloaded.
+        var cumulativeGB: [Double] = [0]
+        for layer in stride(from: nLayer - 1, through: 0, by: -1) {
+            let layerGB = hasCompleteBlockSizes ? (realBlockGB?[layer] ?? perLayerGB) : perLayerGB
+            cumulativeGB.append(cumulativeGB[cumulativeGB.count - 1] + layerGB)
+        }
+
+        // The token-embedding and output tensors aren't part of any block, so they never show up
+        // in `cumulativeGB` — reserved here the same way the flat estimate always folded them in,
+        // as two layers' worth up front, so a model with real per-layer data doesn't get a more
+        // permissive reserve than one without it.
+        let reservedForEmbeddingAndOutputGB = 2.0 * perLayerGB
+        let layerBudgetGB = max(0, gpuBudgetGB - reservedForEmbeddingAndOutputGB)
+
+        // Largest trailing-block count whose real cumulative size still fits the budget.
+        let affordableLayers = cumulativeGB.lastIndex(where: { $0 <= layerBudgetGB }) ?? 0
+        let nGpuLayers = min(correctnessCap, Int32(affordableLayers))
+        let gpuGB = cumulativeGB[Int(nGpuLayers)]
         let cpuGB = max(0, modelSizeGB - gpuGB)
 
         let note = String(format: "streaming: %d of %d layers on GPU (%.2f GB budget, %.3f GB/layer)",
@@ -478,19 +540,29 @@ actor LlamaRunner {
     /// the 32-element block.
     private enum KVCacheFormat {
         case q8_0
+        /// Q4_0 packs 32 4-bit values plus one f16 scale into 18 bytes — 0.5625 bytes per element,
+        /// against Q8_0's 1.0625 — buying nearly double Q8_0's own context window for the same
+        /// memory. Unlike Q8_0, the quality cost here is real rather than "hard to detect," so
+        /// this is only ever offered as a rescue for a load that's already streaming weights from
+        /// storage and would otherwise be refused for too small a context — never a default
+        /// preference over Q8_0. Same 32-element block alignment requirement as Q8_0.
+        case q4_0
         case f16
 
         var ggmlType: ggml_type {
             switch self {
             case .q8_0: return GGML_TYPE_Q8_0
+            case .q4_0: return GGML_TYPE_Q4_0
             case .f16:  return GGML_TYPE_F16
             }
         }
 
-        /// Bytes per cached element. Q8_0 is 34 bytes per 32-element block, scale included.
+        /// Bytes per cached element. Q8_0 is 34 bytes per 32-element block, Q4_0 is 18, both scale
+        /// included.
         var bytesPerElement: Double {
             switch self {
             case .q8_0: return 34.0 / 32.0
+            case .q4_0: return 18.0 / 32.0
             case .f16:  return 2.0
             }
         }
@@ -498,6 +570,7 @@ actor LlamaRunner {
         var name: String {
             switch self {
             case .q8_0: return "Q8_0"
+            case .q4_0: return "Q4_0"
             case .f16:  return "F16"
             }
         }
@@ -1336,6 +1409,12 @@ class LLMManager: ObservableObject {
     /// `loadedContextWindow` (what was actually applied) so the ceiling can explain *why* it is
     /// where it is.
     @Published var loadedTrainedContext: Int = 0
+    /// Only meaningful when `activeBackend == .coreML`. True for a real sliding-window cache
+    /// (Llama 3.2 1B, via `ChunkedPipelineCoreMLEngine`) that keeps generating past
+    /// `loadedContextWindow` by forgetting the earliest turns; false for a hard-stop fixed window
+    /// (OpenELM, via `SingleWindowCoreMLEngine`) that refuses once it's reached. See
+    /// `CoreMLRunner.isSlidingWindow`.
+    @Published var coreMLContextIsSliding: Bool = false
     /// Prompt tokens + tokens generated so far in the current/most recent turn — the live
     /// "how full is the context window right now" figure shown in the status bar.
     @Published var contextTokensUsed: Int = 0
@@ -1351,6 +1430,15 @@ class LLMManager: ObservableObject {
     /// rather than ever hard-stopping generation.
     @Published var isContextTruncating: Bool = false
     @Published var modelSupportsVision: Bool = false
+    /// Which engine `activeModelURL` is currently running on. Only meaningful while
+    /// `isModelLoaded`/`loadState == .loading` — reset to `.llamaCpp` on unload.
+    @Published var activeBackend: LLMBackendKind = .llamaCpp
+
+    /// Bumped at the start of every `loadModel`/`loadCoreMLModel` call and on explicit unload.
+    /// Each load `Task` captures its own value at launch and checks it against the current one
+    /// before applying state after any `await` — two quick taps (or a load racing an unload)
+    /// no longer risk a stale, slower call clobbering a newer one's final `loadState`.
+    private var loadGeneration: Int = 0
 
     var isModelLoaded: Bool {
         if case .loaded = loadState { return true }
@@ -1388,22 +1476,36 @@ class LLMManager: ObservableObject {
         }
     }
 
+    /// `lastUsedModelFileName` is shared by both chat backends (set from both `loadModel`'s GGUF
+    /// success path and `loadCoreMLModel`'s), but this used to resolve it only against
+    /// `AppFiles.models` — the GGUF directory. A Core ML model's saved filename was never found
+    /// there (it installs under `AppFiles.coreMLModels`, as either a `.mlpackage` or a plain-named
+    /// directory), so `lastUsedModelPath` silently resolved to `nil` for anyone whose last session
+    /// ended on one, and the "load previous model?" prompt never appeared for them at all — no
+    /// error, the feature just quietly didn't apply. Checking both install directories is what
+    /// actually covers both backends this property is shared between.
     private static func resolveLastUsedModelPath() -> String? {
-        let modelsDir = AppFiles.models
+        func resolved(fileName: String) -> String? {
+            for directory in [AppFiles.models, AppFiles.coreMLModels] {
+                let url = directory.appendingPathComponent(fileName)
+                if FileManager.default.fileExists(atPath: url.path) {
+                    return url.path
+                }
+            }
+            return nil
+        }
 
         if let fileName = UserDefaults.standard.string(forKey: "lastUsedModelFileName") {
-            let url = modelsDir.appendingPathComponent(fileName)
-            return FileManager.default.fileExists(atPath: url.path) ? url.path : nil
+            return resolved(fileName: fileName)
         }
 
         // One-time migration from the old absolute-path storage format.
         if let oldPath = UserDefaults.standard.string(forKey: "lastUsedModelPath") {
             let fileName = URL(fileURLWithPath: oldPath).lastPathComponent
-            let url = modelsDir.appendingPathComponent(fileName)
-            if FileManager.default.fileExists(atPath: url.path) {
+            if let path = resolved(fileName: fileName) {
                 UserDefaults.standard.set(fileName, forKey: "lastUsedModelFileName")
                 UserDefaults.standard.removeObject(forKey: "lastUsedModelPath")
-                return url.path
+                return path
             }
         }
 
@@ -1513,6 +1615,7 @@ class LLMManager: ObservableObject {
     }
 
     private let runner = LlamaRunner()
+    private let coreMLRunner = CoreMLRunner()
 
     init() {
         self.systemMemoryGB = getPhysicalMemory()
@@ -1531,7 +1634,10 @@ class LLMManager: ObservableObject {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            Task { await self?.runner.unload() }
+            Task {
+                await self?.runner.unload()
+                await self?.coreMLRunner.unload()
+            }
         }
         NotificationCenter.default.addObserver(
             forName: UIApplication.didReceiveMemoryWarningNotification,
@@ -1540,8 +1646,14 @@ class LLMManager: ObservableObject {
         ) { [weak self] _ in
             guard let self else { return }
             Task {
-                await self.runner.requestCancel()
-                await self.runner.unloadModelOnly()
+                switch await MainActor.run(body: { self.activeBackend }) {
+                case .llamaCpp:
+                    await self.runner.requestCancel()
+                    await self.runner.unloadModelOnly()
+                case .coreML:
+                    await self.coreMLRunner.requestCancel()
+                    await self.coreMLRunner.unload()
+                }
                 await MainActor.run {
                     self.loadState = .failed(error: "System memory pressure — model unloaded safely. Reload when ready.")
                     self.activeModelURL = nil
@@ -1676,9 +1788,53 @@ class LLMManager: ObservableObject {
         return .safe
     }
 
+    /// Memory pre-flight for a Core ML model, run before `loadCoreMLModel` the same way
+    /// `checkMemorySafety` gates the GGUF path — that path had no equivalent check at all, which
+    /// was a reasonable gap while the catalog's only Core ML model was a ~1 GB fixed-size demo,
+    /// and stopped being one once it also gained a 3+ GB / 6 GB-minimum-RAM entry.
+    ///
+    /// Deliberately not a call to `checkMemorySafety`: that function's "streamable" escape hatch
+    /// (a GGUF model too big to fit resident can still load, slower, since llama.cpp can mmap the
+    /// excess and only pull in what a given token actually touches) doesn't apply here — every
+    /// compiled `MLModel` a Core ML load touches has to be fully resident, chunked pipeline or
+    /// not, so there's no slower-but-working fallback for something that doesn't fit the way
+    /// there is for GGUF.
+    func checkCoreMLMemorySafety(modelSizeGB: Double) -> MemorySafetyStatus {
+        let total = systemMemoryGB
+        let availableNowGB = MemoryBudget.plannableHeadroomGB()
+        let required = modelSizeGB * 1.15 + MemoryBudget.fixedOverheadGB(for: availableNowGB)
+
+        if required > availableNowGB * 0.85 {
+            return .dangerous(requiredGB: required, availableGB: availableNowGB)
+        }
+        if required > total * 0.90 {
+            return .dangerous(requiredGB: required, availableGB: total)
+        } else if required > total * 0.70 {
+            return .warning(requiredGB: required, availableGB: total)
+        }
+        return .safe
+    }
+
     // MARK: - Model Loading
 
     func loadModel(at url: URL, forceLoad: Bool = false) {
+        // Bumped before either branch below, so a GGUF load, a CoreML load, and an explicit
+        // unload all invalidate each other consistently through the one counter.
+        loadGeneration += 1
+        let generation = loadGeneration
+
+        // A `.mlpackage` extension only ever identified `SingleWindowCoreMLEngine`'s own single-
+        // file model (OpenELM) — a chunked pipeline model (Llama) installs as a plain-named
+        // directory of `.mlmodelc` bundles with no `.mlpackage` anywhere in it, so that check
+        // silently routed it into the GGUF/llama.cpp branch below instead. Every Core ML model,
+        // whatever its internal shape, installs directly under `AppFiles.coreMLModels` — checking
+        // the parent directory instead of the extension is what actually identifies "this is a
+        // Core ML model" regardless of which engine ends up running it.
+        guard url.deletingLastPathComponent().path != AppFiles.coreMLModels.path else {
+            loadCoreMLModel(at: url, forceLoad: forceLoad, generation: generation)
+            return
+        }
+        activeBackend = .llamaCpp
         let sizeGB = getModelSizeGB(at: url)
 
         // Whether we're replacing a resident model. `LlamaRunner.load` does unload the old one
@@ -1707,9 +1863,14 @@ class LLMManager: ObservableObject {
         // than attempting and repeatedly retrying a risky allocation.
         Task {
             if needsEviction {
-                await self.unloadModelAsync()
+                await self.unloadModelAsync(invalidatesInFlightLoad: false)
                 // `unloadModelAsync` clears these, so restore the incoming model's state before
-                // the load continues — otherwise the bar reads "No model loaded" mid-swap.
+                // the load continues — otherwise the bar reads "No model loaded" mid-swap. Guard
+                // against a genuinely newer `loadModel`/explicit-unload call having started while
+                // this one awaited — this eviction step itself doesn't bump the generation (it'd
+                // invalidate its own token), but an unrelated one racing in during the wait still
+                // should win.
+                guard await MainActor.run(body: { self.loadGeneration == generation }) else { return }
                 await MainActor.run {
                     self.activeModelURL = url
                     self.loadState = .loading(progress: 0.15, status: "Freeing previous model…")
@@ -1717,6 +1878,7 @@ class LLMManager: ObservableObject {
                 await MemoryBudget.waitForRelease(
                     atLeastGB: self.memoryHeadroomNeededGB(forModelSizeGB: sizeGB)
                 )
+                guard await MainActor.run(body: { self.loadGeneration == generation }) else { return }
                 await MainActor.run {
                     self.loadState = .loading(progress: 0.25, status: "Initialising llama.cpp backend…")
                 }
@@ -1740,11 +1902,14 @@ class LLMManager: ObservableObject {
                     let req = String(format: "%.1f", requiredGB)
                     let avail = String(format: "%.1f", availableGB)
                     await MainActor.run {
+                        guard self.loadGeneration == generation else { return }
                         self.loadState = .failed(error: "Memory Failsafe: Model requires \(req) GB but only \(avail) GB is safely available right now.")
                     }
                     return
                 }
             }
+
+            guard await MainActor.run(body: { self.loadGeneration == generation }) else { return }
 
             do {
                 await MainActor.run {
@@ -1774,6 +1939,13 @@ class LLMManager: ObservableObject {
                 let appliedContextWindow = await runner.getContextWindowTokens()
                 let trainedContextWindow = await runner.getTrainedContextTokens()
 
+                // The single most important check in this function: without it, a slower load
+                // that lost the race would still overwrite a newer load's (or an explicit
+                // unload's) already-committed state with its own — potentially stale — result,
+                // even though the model it just finished loading is no longer the one the runner
+                // actor is about to serve for a fresher, still-in-flight call.
+                guard await MainActor.run(body: { self.loadGeneration == generation }) else { return }
+
                 await MainActor.run {
                     self.loadState = .loaded(modelName: url.lastPathComponent, sizeGB: sizeGB)
                     self.modelSupportsVision = hasVision
@@ -1789,6 +1961,113 @@ class LLMManager: ObservableObject {
                 }
             } catch {
                 await MainActor.run {
+                    guard self.loadGeneration == generation else { return }
+                    self.loadState = .failed(error: error.localizedDescription)
+                    self.modelSupportsVision = false
+                }
+            }
+        }
+    }
+
+    /// Load path for an installed Core ML model — deliberately not spliced into `loadModel`
+    /// above. That path's context-ceiling math and multi-format KV-cache selection are sized for
+    /// GGUF weights streamed through llama.cpp and don't apply here; Core ML models (from the
+    /// ~1 GB fixed-window OpenELM package up through the ~3 GB chunked Llama pipeline) must be
+    /// fully resident, so there's no "streamable" escape hatch the way `loadModel`'s check has.
+    /// Memory pre-flight runs before eviction of any currently-loaded model, using
+    /// `checkCoreMLMemorySafety` — mirroring `loadModel`'s `.dangerous` hard-block, but with no
+    /// `.warning` confirmation tier: a warning simply proceeds, since a wrong guess here just
+    /// costs a load-and-fail rather than risking a mid-generation OOM.
+    private func loadCoreMLModel(at url: URL, forceLoad: Bool = false, generation: Int) {
+        let needsEviction = isModelLoaded
+        activeModelURL = url
+        activeBackend = .coreML
+        loadState = .loading(
+            progress: 0.1,
+            status: needsEviction ? "Unloading previous model…" : "Compiling Core ML model…"
+        )
+
+        Task {
+            // Size is known before the model is loaded — either from the install ledger's
+            // recorded total, or (for a package the ledger doesn't know about) a live directory
+            // scan. Computed up front so the memory pre-flight can run before any eviction of a
+            // currently-loaded model, mirroring the GGUF path's check-before-committing order.
+            let sizeGB = await MainActor.run { () -> Double in
+                if let installed = ModelInventory.shared.installed.first(where: {
+                    $0.kind == .coreML && $0.fileName == url.lastPathComponent
+                }) {
+                    return Double(installed.byteSize) / (1024 * 1024 * 1024)
+                }
+                return AppFiles.directorySizeGB(at: url)
+            }
+
+            if !forceLoad {
+                let safety = await MainActor.run { self.checkCoreMLMemorySafety(modelSizeGB: sizeGB) }
+                if case .dangerous(let requiredGB, let availableGB) = safety {
+                    let req = String(format: "%.1f", requiredGB)
+                    let avail = String(format: "%.1f", availableGB)
+                    await MainActor.run {
+                        guard self.loadGeneration == generation else { return }
+                        self.loadState = .failed(error: "Memory Failsafe: Model requires \(req) GB but only \(avail) GB is safely available right now.")
+                    }
+                    return
+                }
+            }
+
+            guard await MainActor.run(body: { self.loadGeneration == generation }) else { return }
+
+            if needsEviction {
+                await self.unloadModelAsync(invalidatesInFlightLoad: false)
+                guard await MainActor.run(body: { self.loadGeneration == generation }) else { return }
+                await MainActor.run {
+                    self.activeModelURL = url
+                    self.activeBackend = .coreML
+                    self.loadState = .loading(progress: 0.2, status: "Compiling Core ML model…")
+                }
+            }
+
+            await MainActor.run {
+                CrashReporter.note("loading Core ML model \(url.lastPathComponent)")
+                CrashReporter.noteChatModel(url.lastPathComponent)
+            }
+
+            do {
+                try await coreMLRunner.load(path: url.path)
+                let contextWindow = await coreMLRunner.getContextWindowTokens()
+                let trainedContext = await coreMLRunner.getTrainedContextTokens()
+                let isSliding = await coreMLRunner.isSlidingWindow
+
+                // As in `loadModel`'s GGUF path: the load itself can't be interrupted mid-flight,
+                // but a superseded call's result must not overwrite whatever a newer load (or an
+                // explicit unload) already committed.
+                guard await MainActor.run(body: { self.loadGeneration == generation }) else { return }
+
+                // Prefer the install ledger's recorded total (every file in the manifest, already
+                // summed once at download time — see `ModelDownloadManager.finalizeCoreMLDownload`)
+                // over re-walking the directory here — falls back to a live scan only for a
+                // package the ledger doesn't know about.
+                let sizeGB = await MainActor.run { () -> Double in
+                    if let installed = ModelInventory.shared.installed.first(where: {
+                        $0.kind == .coreML && $0.fileName == url.lastPathComponent
+                    }) {
+                        return Double(installed.byteSize) / (1024 * 1024 * 1024)
+                    }
+                    return AppFiles.directorySizeGB(at: url)
+                }
+
+                await MainActor.run {
+                    self.loadState = .loaded(modelName: url.lastPathComponent, sizeGB: sizeGB)
+                    self.modelSupportsVision = false
+                    self.lastUsedModelPath = url.path
+                    self.loadedContextWindow = contextWindow
+                    self.loadedTrainedContext = trainedContext
+                    self.coreMLContextIsSliding = isSliding
+                    self.contextTokensUsed = 0
+                    self.currentResponseTokenCount = 0
+                }
+            } catch {
+                await MainActor.run {
+                    guard self.loadGeneration == generation else { return }
                     self.loadState = .failed(error: error.localizedDescription)
                     self.modelSupportsVision = false
                 }
@@ -1801,12 +2080,28 @@ class LLMManager: ObservableObject {
             await unloadModelAsync()
         }
     }
-    
-    func unloadModelAsync() async {
-        await runner.requestCancel()
-        await runner.unloadModelOnly()
+
+    /// - Parameter invalidatesInFlightLoad: Bumps `loadGeneration`, so any `loadModel`/
+    ///   `loadCoreMLModel` call still awaiting something can no longer commit its result on
+    ///   completion. True for every real caller (an explicit Unload tap, the diffusion handoff
+    ///   freeing memory, `ModelRecovery`'s reset) — false only for the one internal case where
+    ///   `loadModel`/`loadCoreMLModel` call this as their own eviction-before-load step, since
+    ///   that call must not invalidate the very generation token it just captured for itself.
+    func unloadModelAsync(invalidatesInFlightLoad: Bool = true) async {
+        switch activeBackend {
+        case .llamaCpp:
+            await runner.requestCancel()
+            await runner.unloadModelOnly()
+        case .coreML:
+            await coreMLRunner.requestCancel()
+            await coreMLRunner.unload()
+        }
         await MainActor.run {
+            if invalidatesInFlightLoad {
+                self.loadGeneration += 1
+            }
             self.activeModelURL = nil
+            self.activeBackend = .llamaCpp
             self.loadState = .unloaded
             self.modelSupportsVision = false
             self.loadedContextWindow = 0
@@ -1817,7 +2112,10 @@ class LLMManager: ObservableObject {
     }
 
     func cancelGeneration() {
-        Task { await runner.requestCancel() }
+        switch activeBackend {
+        case .llamaCpp: Task { await runner.requestCancel() }
+        case .coreML: Task { await coreMLRunner.requestCancel() }
+        }
         isGenerating = false
     }
 
@@ -1842,27 +2140,41 @@ class LLMManager: ObservableObject {
         isGenerating = true
 
         // Build System Context
+        //
+        // The GGUF backend gets the full treatment below: a date stamp, an instruction against a
+        // specific quantization's known meta-commentary habit, plus custom instructions/memories/
+        // RAG context — routinely several hundred tokens, which is nothing against a multi-
+        // thousand-token GGUF context window. A CoreML model's window is nowhere near that size
+        // (128 tokens fixed for OpenELM, ~576 sliding for the Llama pipeline) — that boilerplate
+        // alone can consume the *entire* window before the user's own message is even added,
+        // which is exactly what was happening: `SingleWindowCoreMLEngine`'s truncation keeps the
+        // tail of the combined token stream, so an oversized system block silently ate the actual
+        // question too. Memories/RAG in particular assume GGUF-sized budgets and don't degrade
+        // gracefully at this scale, so CoreML skips all of it and keeps only the user's own custom
+        // instructions, trimmed — the one thing worth spending part of a tiny window on.
         var systemBlock = ""
-        let dateFormatter = DateFormatter()
-        dateFormatter.dateFormat = "EEEE, MMMM d, yyyy 'at' h:mm a"
-        let currentDateString = dateFormatter.string(from: Date())
-        systemBlock += "Current Date and Time: \(currentDateString)\n\n"
-        // This model (and quantization) has a strong, persistent tendency to open every
-        // reply with meta-commentary about how it plans to respond — style/tone/vibe
-        // "checks," headers like "My internal monologue:", decorative *** separators, and
-        // literal placeholder text like "(Generating response...)". The client-side filter
-        // catches most of this after the fact, but instructing against it directly cuts
-        // down how often it happens at all (and how much budget gets burned on it).
-        systemBlock += "Respond directly in your own voice. Do not include any internal notes, planning, self-analysis, or meta-commentary about how you are going to respond — no headers or asides like 'Style Check:', 'My internal monologue:', 'Target Response Vibe:', decorative '***' separators, or placeholder text like '(Generating response...)'. Output only the actual reply itself.\n\n"
+        if activeBackend == .llamaCpp {
+            let dateFormatter = DateFormatter()
+            dateFormatter.dateFormat = "EEEE, MMMM d, yyyy 'at' h:mm a"
+            let currentDateString = dateFormatter.string(from: Date())
+            systemBlock += "Current Date and Time: \(currentDateString)\n\n"
+            // This model (and quantization) has a strong, persistent tendency to open every
+            // reply with meta-commentary about how it plans to respond — style/tone/vibe
+            // "checks," headers like "My internal monologue:", decorative *** separators, and
+            // literal placeholder text like "(Generating response...)". The client-side filter
+            // catches most of this after the fact, but instructing against it directly cuts
+            // down how often it happens at all (and how much budget gets burned on it).
+            systemBlock += "Respond directly in your own voice. Do not include any internal notes, planning, self-analysis, or meta-commentary about how you are going to respond — no headers or asides like 'Style Check:', 'My internal monologue:', 'Target Response Vibe:', decorative '***' separators, or placeholder text like '(Generating response...)'. Output only the actual reply itself.\n\n"
 
+            if !memoriesContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                systemBlock += memoriesContext.trimmingCharacters(in: .whitespacesAndNewlines) + "\n\n"
+            }
+            if !ragContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                systemBlock += ragContext.trimmingCharacters(in: .whitespacesAndNewlines) + "\n\n"
+            }
+        }
         if !systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             systemBlock += systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines) + "\n\n"
-        }
-        if !memoriesContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            systemBlock += memoriesContext.trimmingCharacters(in: .whitespacesAndNewlines) + "\n\n"
-        }
-        if !ragContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            systemBlock += ragContext.trimmingCharacters(in: .whitespacesAndNewlines) + "\n\n"
         }
 
         var swiftMessages: [(role: String, content: String)] = []
@@ -1927,6 +2239,8 @@ class LLMManager: ObservableObject {
         self.currentResponseTokenCount = 0
         self.thinkingTokensUsed = 0
 
+        let backend = activeBackend
+
         Task {
             var accumulated = ""
             var realPromptTokenCount = estimatedPromptTokens
@@ -1937,18 +2251,32 @@ class LLMManager: ObservableObject {
 
             let stream = AsyncStream<String> { continuation in
                 Task {
-                    await runner.generateStream(
-                        messages: swiftMessages,
-                        maxTokens: tokenLimit,
-                        temperature: self.highVariabilityEnabled ? 2.5 : Float(self.temperature) + temperatureBoost,
-                        continuation: continuation,
-                        onContextTruncated: {
-                            Task { @MainActor in self.isContextTruncating = true }
-                        },
-                        onThinkingProgress: { count in
-                            Task { @MainActor in self.thinkingTokensUsed = count }
-                        }
-                    )
+                    let effectiveTemperature = self.highVariabilityEnabled ? Float(2.5) : Float(self.temperature) + temperatureBoost
+                    switch backend {
+                    case .llamaCpp:
+                        await runner.generateStream(
+                            messages: swiftMessages,
+                            maxTokens: tokenLimit,
+                            temperature: effectiveTemperature,
+                            continuation: continuation,
+                            onContextTruncated: {
+                                Task { @MainActor in self.isContextTruncating = true }
+                            },
+                            onThinkingProgress: { count in
+                                Task { @MainActor in self.thinkingTokensUsed = count }
+                            }
+                        )
+                    case .coreML:
+                        await coreMLRunner.generateStream(
+                            messages: swiftMessages,
+                            maxTokens: tokenLimit,
+                            temperature: effectiveTemperature,
+                            continuation: continuation,
+                            onContextTruncated: {
+                                Task { @MainActor in self.isContextTruncating = true }
+                            }
+                        )
+                    }
                 }
             }
 
@@ -1956,9 +2284,11 @@ class LLMManager: ObservableObject {
                 guard isGenerating else { break }
 
                 tokenCount += 1
-                if tokenCount == 1 {
+                if tokenCount == 1, backend == .llamaCpp {
                     // Prefill just finished — refine the estimate with the actor's real,
-                    // post-truncation tokenizer count.
+                    // post-truncation tokenizer count. Only meaningful for the llama.cpp
+                    // backend, which tracks it; CoreMLRunner has no equivalent, so the
+                    // char-count estimate stands for the whole turn there.
                     let real = await runner.getLastPromptTokenCount()
                     if real > 0 { realPromptTokenCount = real }
                 }
@@ -2004,8 +2334,10 @@ class LLMManager: ObservableObject {
             // A decode failure tears the model down inside the actor (see
             // `handleDecodeFailure`). Without this the app would keep showing a loaded model
             // that can never answer again — which is exactly how this surfaced: "the model
-            // loaded but does not respond".
-            let faulted = await runner.consumeDecodeFault()
+            // loaded but does not respond". `CoreMLRunner` has no equivalent fault-tracking —
+            // a Core ML prediction failure is caught and logged in-line in its own generation
+            // loop instead of tearing the model down, so there's nothing to consume here for it.
+            let faulted = backend == .llamaCpp ? await runner.consumeDecodeFault() : false
 
             await MainActor.run {
                 isGenerating = false
@@ -2052,6 +2384,10 @@ class LLMManager: ObservableObject {
 
     func generateBackgroundAnalysis(prompt: String) async -> String? {
         guard case .loaded = loadState else { return nil }
+        // Auxiliary, non-chat generation stays on the llama.cpp backend only for v1 — the Core
+        // ML backend's 128-token-total window has no room to spare for a background pass on top
+        // of a real chat turn.
+        guard activeBackend == .llamaCpp else { return nil }
         // LlamaRunner is a single serialized actor — a background analysis call that
         // races the main chat response for the actor silently delays the user's real
         // answer by the analysis's entire generation time (no UI indication why).
@@ -2092,6 +2428,8 @@ class LLMManager: ObservableObject {
     /// real chat turn is already in flight, or the model's output doesn't look usable.
     func generateImagePrompt(from userRequest: String) async -> String? {
         guard case .loaded = loadState else { return nil }
+        // Same reasoning as `generateBackgroundAnalysis` — llama.cpp only for v1.
+        guard activeBackend == .llamaCpp else { return nil }
         // Same reasoning as generateBackgroundAnalysis — LlamaRunner is a single
         // serialized actor, never enter if a real chat generation owns it right now.
         guard !isGenerating else { return nil }

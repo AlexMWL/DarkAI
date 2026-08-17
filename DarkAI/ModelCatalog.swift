@@ -17,6 +17,25 @@ enum ModelKind: String, Codable {
     case chat
     /// Diffusion checkpoints driven by stable-diffusion.cpp. Land in `AppFiles.diffusionModels`.
     case diffusion
+    /// Core ML model packages driven by `CoreMLRunner`, executing on the ANE/GPU/CPU via Core
+    /// ML. Land in `AppFiles.coreMLModels`.
+    case coreML
+}
+
+/// One file belonging to a `.coreML` model's install directory.
+///
+/// A Core ML model here is never a single downloadable file the way a GGUF is — the simplest case
+/// (`OpenELM-270M-Instruct`) is a 3-file `.mlpackage` bundle; a chunked ANE pipeline
+/// (`Llama-3.2-1B-Instruct`) is 30+ files across several already-compiled `.mlmodelc` bundles. This
+/// is the complete, ordered manifest for one catalog model — see
+/// `ModelDownloadManager.downloadCoreMLFiles` for how it's fetched (a queue of background
+/// download tasks, one file at a time, not the single-task path every other model kind uses).
+struct CoreMLPackageFile: Hashable {
+    let url: URL
+    /// Path relative to the installed model's root directory, e.g. `"Manifest.json"` or
+    /// `"Llama-3.2-1B-Instruct_chunk1.mlmodelc/weights/weight.bin"`.
+    let relativePath: String
+    let byteSize: Int64
 }
 
 struct CatalogModel: Identifiable, Hashable {
@@ -54,11 +73,17 @@ struct CatalogModel: Identifiable, Hashable {
     /// Civitai-sourced model would install under a literal numeric ID with no extension: hidden
     /// from every extension-filtered model list in the app and unloadable.
     let fileNameOverride: String?
+    /// Non-empty only for `kind == .coreML` — the model's complete file manifest (see
+    /// `CoreMLPackageFile`). `byteSize` above is the sum of every entry's size for this case,
+    /// computed once at catalog-definition time, and `url` is simply the first file's URL —
+    /// neither is a real download target on its own the way they are for `.chat`/`.diffusion`.
+    let coreMLFiles: [CoreMLPackageFile]
 
     init(id: String, kind: ModelKind, displayName: String, publisher: String, byteSize: Int64,
          parameterCount: String, quantization: String, license: String, attribution: String?,
          summary: String, url: URL, approxRuntimeGB: Double,
-         minimumRAMGB: Double, minimumDevice: String, fileNameOverride: String? = nil) {
+         minimumRAMGB: Double, minimumDevice: String, fileNameOverride: String? = nil,
+         coreMLFiles: [CoreMLPackageFile] = []) {
         self.id = id
         self.kind = kind
         self.displayName = displayName
@@ -74,6 +99,7 @@ struct CatalogModel: Identifiable, Hashable {
         self.minimumRAMGB = minimumRAMGB
         self.minimumDevice = minimumDevice
         self.fileNameOverride = fileNameOverride
+        self.coreMLFiles = coreMLFiles
     }
 
     var fileName: String { fileNameOverride ?? url.lastPathComponent }
@@ -250,12 +276,127 @@ enum ModelCatalog {
         )
     ]
 
-    static var all: [CatalogModel] { chatModels + diffusionModels }
+    /// Core ML models, executed via `CoreMLRunner` rather than llama.cpp. Currently one entry: a
+    /// community Core ML conversion of Apple's own OpenELM-270M-Instruct, the only ready-made
+    /// `.mlpackage` build of it available (Apple's own `apple/OpenELM-270M-Instruct` repo ships
+    /// PyTorch weights only). It is a **fixed 128-token window, non-stateful** export — no
+    /// KV-cache reuse across steps — so total conversation length (prompt + reply) tops out at
+    /// 128 tokens. That is a hard ceiling of this specific artifact, not a setting; it is offered
+    /// as a small, on-device ANE demo rather than a general-purpose chat model.
+    static let coreMLModels: [CatalogModel] = {
+        let openELMBase = "https://huggingface.co/corenet-community/coreml-OpenELM-270M-Instruct/resolve/main/OpenELM-270M-Instruct-128-float32.mlpackage"
+        let openELMFiles: [CoreMLPackageFile] = [
+            CoreMLPackageFile(
+                url: URL(string: "\(openELMBase)/Data/com.apple.CoreML/weights/weight.bin")!,
+                relativePath: "Data/com.apple.CoreML/weights/weight.bin",
+                byteSize: 1_086_767_744
+            ),
+            CoreMLPackageFile(
+                url: URL(string: "\(openELMBase)/Manifest.json")!,
+                relativePath: "Manifest.json",
+                byteSize: 617
+            ),
+            CoreMLPackageFile(
+                url: URL(string: "\(openELMBase)/Data/com.apple.CoreML/model.mlmodel")!,
+                relativePath: "Data/com.apple.CoreML/model.mlmodel",
+                byteSize: 270_654
+            )
+        ]
+
+        // Llama 3.2 1B Instruct, converted for the ANE by the coreml-llm-cli project (see
+        // ChunkedPipelineCoreMLEngine's doc comment). Six chunked, already-*compiled* `.mlmodelc`
+        // transformer blocks plus a small KV-cache-shift model — deliberately excludes the
+        // upstream repo's `logit-processor.mlmodelc` (argmax-only, no learned weights), since this
+        // app samples with its own temperature/top-p sampler directly instead. Byte sizes fetched
+        // directly from the Hugging Face API this session, not estimated.
+        let llamaBase = "https://huggingface.co/smpanaro/Llama-3.2-1B-Instruct-CoreML/resolve/main/"
+        let llamaFiles: [CoreMLPackageFile] = [
+            CoreMLPackageFile(url: URL(string: llamaBase + "Llama-3.2-1B-Instruct_chunk1.mlmodelc/analytics/coremldata.bin")!, relativePath: "Llama-3.2-1B-Instruct_chunk1.mlmodelc/analytics/coremldata.bin", byteSize: 243),
+            CoreMLPackageFile(url: URL(string: llamaBase + "Llama-3.2-1B-Instruct_chunk1.mlmodelc/coremldata.bin")!, relativePath: "Llama-3.2-1B-Instruct_chunk1.mlmodelc/coremldata.bin", byteSize: 407),
+            CoreMLPackageFile(url: URL(string: llamaBase + "Llama-3.2-1B-Instruct_chunk1.mlmodelc/metadata.json")!, relativePath: "Llama-3.2-1B-Instruct_chunk1.mlmodelc/metadata.json", byteSize: 2891),
+            CoreMLPackageFile(url: URL(string: llamaBase + "Llama-3.2-1B-Instruct_chunk1.mlmodelc/model.mil")!, relativePath: "Llama-3.2-1B-Instruct_chunk1.mlmodelc/model.mil", byteSize: 10344),
+            CoreMLPackageFile(url: URL(string: llamaBase + "Llama-3.2-1B-Instruct_chunk1.mlmodelc/weights/weight.bin")!, relativePath: "Llama-3.2-1B-Instruct_chunk1.mlmodelc/weights/weight.bin", byteSize: 525599104),
+            CoreMLPackageFile(url: URL(string: llamaBase + "Llama-3.2-1B-Instruct_chunk2.mlmodelc/analytics/coremldata.bin")!, relativePath: "Llama-3.2-1B-Instruct_chunk2.mlmodelc/analytics/coremldata.bin", byteSize: 243),
+            CoreMLPackageFile(url: URL(string: llamaBase + "Llama-3.2-1B-Instruct_chunk2.mlmodelc/coremldata.bin")!, relativePath: "Llama-3.2-1B-Instruct_chunk2.mlmodelc/coremldata.bin", byteSize: 931),
+            CoreMLPackageFile(url: URL(string: llamaBase + "Llama-3.2-1B-Instruct_chunk2.mlmodelc/metadata.json")!, relativePath: "Llama-3.2-1B-Instruct_chunk2.mlmodelc/metadata.json", byteSize: 7803),
+            CoreMLPackageFile(url: URL(string: llamaBase + "Llama-3.2-1B-Instruct_chunk2.mlmodelc/model.mil")!, relativePath: "Llama-3.2-1B-Instruct_chunk2.mlmodelc/model.mil", byteSize: 385989),
+            CoreMLPackageFile(url: URL(string: llamaBase + "Llama-3.2-1B-Instruct_chunk2.mlmodelc/weights/weight.bin")!, relativePath: "Llama-3.2-1B-Instruct_chunk2.mlmodelc/weights/weight.bin", byteSize: 486575936),
+            CoreMLPackageFile(url: URL(string: llamaBase + "Llama-3.2-1B-Instruct_chunk3.mlmodelc/analytics/coremldata.bin")!, relativePath: "Llama-3.2-1B-Instruct_chunk3.mlmodelc/analytics/coremldata.bin", byteSize: 243),
+            CoreMLPackageFile(url: URL(string: llamaBase + "Llama-3.2-1B-Instruct_chunk3.mlmodelc/coremldata.bin")!, relativePath: "Llama-3.2-1B-Instruct_chunk3.mlmodelc/coremldata.bin", byteSize: 931),
+            CoreMLPackageFile(url: URL(string: llamaBase + "Llama-3.2-1B-Instruct_chunk3.mlmodelc/metadata.json")!, relativePath: "Llama-3.2-1B-Instruct_chunk3.mlmodelc/metadata.json", byteSize: 7803),
+            CoreMLPackageFile(url: URL(string: llamaBase + "Llama-3.2-1B-Instruct_chunk3.mlmodelc/model.mil")!, relativePath: "Llama-3.2-1B-Instruct_chunk3.mlmodelc/model.mil", byteSize: 385989),
+            CoreMLPackageFile(url: URL(string: llamaBase + "Llama-3.2-1B-Instruct_chunk3.mlmodelc/weights/weight.bin")!, relativePath: "Llama-3.2-1B-Instruct_chunk3.mlmodelc/weights/weight.bin", byteSize: 486575936),
+            CoreMLPackageFile(url: URL(string: llamaBase + "Llama-3.2-1B-Instruct_chunk4.mlmodelc/analytics/coremldata.bin")!, relativePath: "Llama-3.2-1B-Instruct_chunk4.mlmodelc/analytics/coremldata.bin", byteSize: 243),
+            CoreMLPackageFile(url: URL(string: llamaBase + "Llama-3.2-1B-Instruct_chunk4.mlmodelc/coremldata.bin")!, relativePath: "Llama-3.2-1B-Instruct_chunk4.mlmodelc/coremldata.bin", byteSize: 931),
+            CoreMLPackageFile(url: URL(string: llamaBase + "Llama-3.2-1B-Instruct_chunk4.mlmodelc/metadata.json")!, relativePath: "Llama-3.2-1B-Instruct_chunk4.mlmodelc/metadata.json", byteSize: 7803),
+            CoreMLPackageFile(url: URL(string: llamaBase + "Llama-3.2-1B-Instruct_chunk4.mlmodelc/model.mil")!, relativePath: "Llama-3.2-1B-Instruct_chunk4.mlmodelc/model.mil", byteSize: 385989),
+            CoreMLPackageFile(url: URL(string: llamaBase + "Llama-3.2-1B-Instruct_chunk4.mlmodelc/weights/weight.bin")!, relativePath: "Llama-3.2-1B-Instruct_chunk4.mlmodelc/weights/weight.bin", byteSize: 486575936),
+            CoreMLPackageFile(url: URL(string: llamaBase + "Llama-3.2-1B-Instruct_chunk5.mlmodelc/analytics/coremldata.bin")!, relativePath: "Llama-3.2-1B-Instruct_chunk5.mlmodelc/analytics/coremldata.bin", byteSize: 243),
+            CoreMLPackageFile(url: URL(string: llamaBase + "Llama-3.2-1B-Instruct_chunk5.mlmodelc/coremldata.bin")!, relativePath: "Llama-3.2-1B-Instruct_chunk5.mlmodelc/coremldata.bin", byteSize: 931),
+            CoreMLPackageFile(url: URL(string: llamaBase + "Llama-3.2-1B-Instruct_chunk5.mlmodelc/metadata.json")!, relativePath: "Llama-3.2-1B-Instruct_chunk5.mlmodelc/metadata.json", byteSize: 7803),
+            CoreMLPackageFile(url: URL(string: llamaBase + "Llama-3.2-1B-Instruct_chunk5.mlmodelc/model.mil")!, relativePath: "Llama-3.2-1B-Instruct_chunk5.mlmodelc/model.mil", byteSize: 385989),
+            CoreMLPackageFile(url: URL(string: llamaBase + "Llama-3.2-1B-Instruct_chunk5.mlmodelc/weights/weight.bin")!, relativePath: "Llama-3.2-1B-Instruct_chunk5.mlmodelc/weights/weight.bin", byteSize: 486575936),
+            CoreMLPackageFile(url: URL(string: llamaBase + "Llama-3.2-1B-Instruct_chunk6.mlmodelc/analytics/coremldata.bin")!, relativePath: "Llama-3.2-1B-Instruct_chunk6.mlmodelc/analytics/coremldata.bin", byteSize: 243),
+            CoreMLPackageFile(url: URL(string: llamaBase + "Llama-3.2-1B-Instruct_chunk6.mlmodelc/coremldata.bin")!, relativePath: "Llama-3.2-1B-Instruct_chunk6.mlmodelc/coremldata.bin", byteSize: 501),
+            CoreMLPackageFile(url: URL(string: llamaBase + "Llama-3.2-1B-Instruct_chunk6.mlmodelc/metadata.json")!, relativePath: "Llama-3.2-1B-Instruct_chunk6.mlmodelc/metadata.json", byteSize: 3881),
+            CoreMLPackageFile(url: URL(string: llamaBase + "Llama-3.2-1B-Instruct_chunk6.mlmodelc/model.mil")!, relativePath: "Llama-3.2-1B-Instruct_chunk6.mlmodelc/model.mil", byteSize: 12288),
+            CoreMLPackageFile(url: URL(string: llamaBase + "Llama-3.2-1B-Instruct_chunk6.mlmodelc/weights/weight.bin")!, relativePath: "Llama-3.2-1B-Instruct_chunk6.mlmodelc/weights/weight.bin", byteSize: 525341504),
+            CoreMLPackageFile(url: URL(string: llamaBase + "cache-processor.mlmodelc/analytics/coremldata.bin")!, relativePath: "cache-processor.mlmodelc/analytics/coremldata.bin", byteSize: 243),
+            CoreMLPackageFile(url: URL(string: llamaBase + "cache-processor.mlmodelc/coremldata.bin")!, relativePath: "cache-processor.mlmodelc/coremldata.bin", byteSize: 516),
+            CoreMLPackageFile(url: URL(string: llamaBase + "cache-processor.mlmodelc/metadata.json")!, relativePath: "cache-processor.mlmodelc/metadata.json", byteSize: 3162),
+            CoreMLPackageFile(url: URL(string: llamaBase + "cache-processor.mlmodelc/model.mil")!, relativePath: "cache-processor.mlmodelc/model.mil", byteSize: 3429)
+        ]
+
+        return [
+            CatalogModel(
+                id: "openelm-270m-instruct-coreml-128-f32",
+                kind: .coreML,
+                displayName: "OpenELM 270M Instruct (ANE)",
+                publisher: "Apple (Core ML build by corenet-community)",
+                byteSize: openELMFiles.reduce(0) { $0 + $1.byteSize },
+                parameterCount: "270M",
+                quantization: "Float32",
+                license: "Apple Sample Code License",
+                attribution: "OpenELM by Apple Inc. Core ML conversion by the corenet-community project.",
+                summary: "Runs on the Apple Neural Engine instead of the CPU/GPU path the other models use. Very small and very fast, but limited to short exchanges — about 128 tokens total between your prompt and its reply, with no memory of anything beyond that window.",
+                url: openELMFiles[0].url,
+                approxRuntimeGB: 1.1,
+                minimumRAMGB: 4.0,
+                minimumDevice: "minimum iPhone 11 / SE 3rd gen or newer",
+                fileNameOverride: "OpenELM-270M-Instruct-128-float32.mlpackage",
+                coreMLFiles: openELMFiles
+            ),
+            CatalogModel(
+                id: "llama-3.2-1b-instruct-coreml-ane",
+                kind: .coreML,
+                displayName: "Llama 3.2 1B Instruct (ANE)",
+                publisher: "Meta (Core ML build by smpanaro)",
+                byteSize: llamaFiles.reduce(0) { $0 + $1.byteSize },
+                parameterCount: "1B",
+                quantization: "Float16",
+                license: "Llama 3.2 Community License",
+                attribution: "Built with Llama. Llama 3.2 is licensed under the Llama 3.2 Community License, Copyright © Meta Platforms, Inc. All Rights Reserved. Core ML conversion by smpanaro (coreml-llm-cli).",
+                summary: "A real chat-quality model running on the Apple Neural Engine, with about 512 tokens of live sliding context — once a conversation runs past that, the earliest turns are gradually forgotten rather than the reply being cut off. A much larger download than the ANE demo model, split across several files.",
+                url: llamaFiles[0].url,
+                approxRuntimeGB: 3.2,
+                minimumRAMGB: 6.0,
+                minimumDevice: "minimum iPhone 12 Pro / 14 or newer",
+                fileNameOverride: "Llama-3.2-1B-Instruct-CoreML",
+                coreMLFiles: llamaFiles
+            )
+        ]
+    }()
+
+    static var all: [CatalogModel] { chatModels + diffusionModels + coreMLModels }
 
     static var recommended: CatalogModel { chatModels[0] }
 
     static func models(for kind: ModelKind) -> [CatalogModel] {
-        kind == .chat ? chatModels : diffusionModels
+        switch kind {
+        case .chat: return chatModels
+        case .diffusion: return diffusionModels
+        case .coreML: return coreMLModels
+        }
     }
 
     static func model(withFileName name: String) -> CatalogModel? {
@@ -334,6 +475,18 @@ final class ModelDownloadManager: NSObject, ObservableObject {
     /// to tell a stale resume blob apart from an ordinary network failure.
     private var resumedTaskIDs: Set<Int> = []
 
+    /// Files not yet fetched for an in-progress `.coreML` multi-file download, in order — see
+    /// `downloadCoreMLFiles`. Nothing here needs to survive a failure or relaunch: it's always
+    /// rebuilt from what's actually missing on disk the next time that model's download starts.
+    private var pendingCoreMLFiles: [String: [CoreMLPackageFile]] = [:]
+    /// Bytes already landed on disk for a `.coreML` download's already-completed files this
+    /// session — what `didWriteData` adds the in-flight task's own progress on top of.
+    private var completedCoreMLBytes: [String: Int64] = [:]
+    /// The file each in-flight download task belongs to, for `.coreML` models only. Its presence
+    /// is how delegate callbacks tell a queued multi-file `.coreML` download apart from the
+    /// legacy single-task path every other model kind uses.
+    private var currentCoreMLFile: [Int: CoreMLPackageFile] = [:]
+
     private override init() {
         super.init()
         let configuration = URLSessionConfiguration.background(withIdentifier: "com.DDT.DarkAI.modelDownloads")
@@ -352,16 +505,30 @@ final class ModelDownloadManager: NSObject, ObservableObject {
     /// Whether this specific model is one of the in-flight downloads.
     func isDownloading(_ model: CatalogModel) -> Bool { activeDownloads[model.id] != nil }
 
-    /// Chat weights and diffusion checkpoints are both GGUF but are consumed by different
+    /// Chat weights, diffusion checkpoints, and Core ML packages are consumed by different
     /// engines and listed by different screens, so they have to land in different directories.
     static func installDirectory(for kind: ModelKind) -> URL {
-        kind == .chat ? AppFiles.models : AppFiles.diffusionModels
+        switch kind {
+        case .chat: return AppFiles.models
+        case .diffusion: return AppFiles.diffusionModels
+        case .coreML: return AppFiles.coreMLModels
+        }
     }
 
     func isInstalled(_ model: CatalogModel) -> Bool {
-        let path = Self.installDirectory(for: model.kind)
-            .appendingPathComponent(model.fileName).path
-        return FileManager.default.fileExists(atPath: path)
+        let installedPath = Self.installDirectory(for: model.kind)
+            .appendingPathComponent(model.fileName)
+        guard model.kind == .coreML else {
+            return FileManager.default.fileExists(atPath: installedPath.path)
+        }
+        // The directory existing isn't proof every file landed — every entry in the manifest must
+        // be present at the right size, or this isn't a smaller version of the model, it's one
+        // `MLModel` will refuse to load.
+        return model.coreMLFiles.allSatisfy { file in
+            let path = installedPath.appendingPathComponent(file.relativePath).path
+            let size = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int64) ?? nil
+            return size == file.byteSize
+        }
     }
 
     // MARK: Actions
@@ -391,7 +558,107 @@ final class ModelDownloadManager: NSObject, ObservableObject {
         }
 
         AppFiles.prepare()
-        start(model, resuming: Self.savedResumeData(for: model))
+        if model.kind == .coreML {
+            downloadCoreMLFiles(model)
+        } else {
+            start(model, resuming: Self.savedResumeData(forKey: model.id))
+        }
+    }
+
+    /// Starts (or resumes) a `.coreML` model's multi-file download — every file in
+    /// `model.coreMLFiles` is fetched through its own background `URLSessionDownloadTask`, one at
+    /// a time, rather than the single task `start(_:resuming:)` uses. A `.mlpackage`/chunked
+    /// `.mlmodelc` pipeline downloaded from Hugging Face isn't one file, so there's no single task
+    /// to hang the transfer off of the way every other model kind can.
+    ///
+    /// Resumability here is by construction rather than saved state: a file that already exists on
+    /// disk at its target path with the right byte count is simply skipped, so relaunching the app
+    /// mid-download — or tapping Resume after a failure — only re-fetches what's actually missing.
+    /// Only a file that was *mid-transfer* when interrupted needs the saved-resume-data path,
+    /// exactly like the single-file case, just keyed per file instead of per model.
+    private func downloadCoreMLFiles(_ model: CatalogModel) {
+        let installedPath = Self.installDirectory(for: model.kind).appendingPathComponent(model.fileName)
+        AppFiles.createIfNeeded(installedPath)
+
+        var completedBytes: Int64 = 0
+        var pending: [CoreMLPackageFile] = []
+        for file in model.coreMLFiles {
+            let path = installedPath.appendingPathComponent(file.relativePath).path
+            let size = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int64) ?? nil
+            if let size, size == file.byteSize {
+                completedBytes += file.byteSize
+            } else {
+                pending.append(file)
+            }
+        }
+
+        pendingCoreMLFiles[model.id] = pending
+        completedCoreMLBytes[model.id] = completedBytes
+        activeDownloads[model.id] = Progress(
+            modelID: model.id,
+            kind: model.kind,
+            fractionCompleted: model.byteSize > 0 ? Double(completedBytes) / Double(model.byteSize) : 0,
+            bytesWritten: completedBytes,
+            totalBytes: model.byteSize
+        )
+        LogManager.shared.log("ModelDownload: starting \(model.displayName) (\(pending.count) of \(model.coreMLFiles.count) files remaining)")
+        startNextCoreMLFile(for: model)
+    }
+
+    private func startNextCoreMLFile(for model: CatalogModel) {
+        guard var pending = pendingCoreMLFiles[model.id], !pending.isEmpty else {
+            finalizeCoreMLDownload(model)
+            return
+        }
+        let file = pending.removeFirst()
+        pendingCoreMLFiles[model.id] = pending
+
+        let resumeKey = Self.coreMLFileResumeKey(model: model, file: file)
+        let task: URLSessionDownloadTask
+        if let resumeData = Self.savedResumeData(forKey: resumeKey) {
+            task = session.downloadTask(withResumeData: resumeData)
+            // Without this, `finish(_:with:)` can never tell a resumed coreML file's task apart
+            // from a fresh one — `wasResumed` would always read false, and a permanently stale
+            // resume blob (the server no longer honors the range, or too much time has passed)
+            // would never get cleaned up, so every subsequent attempt would keep reusing the same
+            // dead partial and failing identically forever. See `finish`'s coreML branch.
+            resumedTaskIDs.insert(task.taskIdentifier)
+        } else {
+            var request = URLRequest(url: file.url)
+            request.allowsCellularAccess = allowsCellularDownload
+            request.allowsExpensiveNetworkAccess = allowsCellularDownload
+            request.timeoutInterval = 60
+            task = session.downloadTask(with: request)
+        }
+        task.countOfBytesClientExpectsToReceive = file.byteSize
+
+        tasksByModelID[model.id] = task
+        modelsByTaskID[task.taskIdentifier] = model
+        currentCoreMLFile[task.taskIdentifier] = file
+        task.resume()
+    }
+
+    /// Called once every file in `model.coreMLFiles` is confirmed on disk. Unlike the single-file
+    /// path there's no "move into place" step left to do here — each file already landed at its
+    /// final `relativePath` as it finished in `finishCoreMLFile` — this just closes out the
+    /// bookkeeping the same way the single-file success path does.
+    private func finalizeCoreMLDownload(_ model: CatalogModel) {
+        pendingCoreMLFiles.removeValue(forKey: model.id)
+        completedCoreMLBytes.removeValue(forKey: model.id)
+        resumableModelIDs.remove(model.id)
+        ModelInventory.shared.record(
+            fileName: model.fileName,
+            kind: model.kind,
+            catalogID: model.id,
+            byteSize: model.byteSize
+        )
+        LogManager.shared.log("ModelDownload: installed \(model.fileName)")
+        lastCompletedModelID = model.id
+        finish(model, with: nil)
+    }
+
+    private static func coreMLFileResumeKey(model: CatalogModel, file: CoreMLPackageFile) -> String {
+        "\(model.id)__coreml__\(file.relativePath.replacingOccurrences(of: "/", with: "_"))"
     }
 
     /// Creates and starts the task, from saved resume data when there is any.
@@ -435,6 +702,8 @@ final class ModelDownloadManager: NSObject, ObservableObject {
     /// to throw the bytes away instead.
     func cancel(_ model: CatalogModel) {
         guard let task = tasksByModelID[model.id] else { return }
+        let resumeKey = currentCoreMLFile[task.taskIdentifier]
+            .map { Self.coreMLFileResumeKey(model: model, file: $0) } ?? model.id
         // Goes through the singleton rather than capturing `self`: this callback is delivered on a
         // background queue and outlives the call, and reaching back through `shared` keeps that
         // free of a cross-actor capture instead of relying on one being tolerated.
@@ -442,7 +711,7 @@ final class ModelDownloadManager: NSObject, ObservableObject {
             Task { @MainActor in
                 let manager = ModelDownloadManager.shared
                 if let resumeData {
-                    Self.saveResumeData(resumeData, for: model)
+                    Self.saveResumeData(resumeData, forKey: resumeKey)
                     manager.resumableModelIDs.insert(model.id)
                     LogManager.shared.log("ModelDownload: paused \(model.displayName), \(ByteCountFormatter.string(fromByteCount: Int64(resumeData.count), countStyle: .file)) of resume state kept")
                 } else {
@@ -453,13 +722,26 @@ final class ModelDownloadManager: NSObject, ObservableObject {
         tasksByModelID.removeValue(forKey: model.id)
         modelsByTaskID.removeValue(forKey: task.taskIdentifier)
         resumedTaskIDs.remove(task.taskIdentifier)
+        currentCoreMLFile.removeValue(forKey: task.taskIdentifier)
         activeDownloads.removeValue(forKey: model.id)
+        // pendingCoreMLFiles/completedCoreMLBytes deliberately left alone: downloadCoreMLFiles
+        // recomputes both fresh from disk the next time this model's download starts, so there's
+        // nothing stale here that needs clearing.
     }
 
     /// Throws away a saved partial transfer. Offered next to the resume affordance so a user who
     /// changed their mind isn't stuck carrying a gigabyte of a model they no longer want.
     func discardPartial(for model: CatalogModel) {
-        Self.deleteResumeData(for: model)
+        if model.kind == .coreML {
+            // Only the resume blobs — files that already finished and were verified stay on disk;
+            // "discard the partial" means abandon whatever was mid-transfer, not throw away
+            // completed, byte-verified progress along with it.
+            for file in model.coreMLFiles {
+                Self.deleteResumeData(forKey: Self.coreMLFileResumeKey(model: model, file: file))
+            }
+        } else {
+            Self.deleteResumeData(forKey: model.id)
+        }
         resumableModelIDs.remove(model.id)
         LogManager.shared.log("ModelDownload: discarded partial download of \(model.displayName)")
     }
@@ -469,30 +751,38 @@ final class ModelDownloadManager: NSObject, ObservableObject {
     // MARK: Resume state
 
     /// Resume blobs live beside partial downloads, in the directory that already exists for
-    /// exactly this purpose and is already excluded from backup.
-    private static func resumeFileURL(for modelID: String) -> URL {
-        AppFiles.downloadsInProgress.appendingPathComponent("\(modelID).resume")
+    /// exactly this purpose and is already excluded from backup. `key` is a catalog model ID for
+    /// the single-file path, or `coreMLFileResumeKey(model:file:)` for one file of a `.coreML`
+    /// model's multi-file download.
+    private static func resumeFileURL(for key: String) -> URL {
+        AppFiles.downloadsInProgress.appendingPathComponent("\(key).resume")
     }
 
-    private static func savedResumeData(for model: CatalogModel) -> Data? {
-        try? Data(contentsOf: resumeFileURL(for: model.id))
+    private static func savedResumeData(forKey key: String) -> Data? {
+        try? Data(contentsOf: resumeFileURL(for: key))
     }
 
-    private static func saveResumeData(_ data: Data, for model: CatalogModel) {
+    private static func saveResumeData(_ data: Data, forKey key: String) {
         AppFiles.createIfNeeded(AppFiles.downloadsInProgress)
-        let url = resumeFileURL(for: model.id)
+        let url = resumeFileURL(for: key)
         try? data.write(to: url, options: .atomic)
         AppFiles.excludeFromBackup(url)
     }
 
-    private static func deleteResumeData(for model: CatalogModel) {
-        try? FileManager.default.removeItem(at: resumeFileURL(for: model.id))
+    private static func deleteResumeData(forKey key: String) {
+        try? FileManager.default.removeItem(at: resumeFileURL(for: key))
     }
 
     private static func savedResumableModelIDs() -> Set<String> {
         let files = AppFiles.contents(of: AppFiles.downloadsInProgress, matchingExtensions: ["resume"])
         let known = Set(ModelCatalog.all.map(\.id))
-        return Set(files.map { ($0.lastPathComponent as NSString).deletingPathExtension }.filter(known.contains))
+        return Set(files.compactMap { url -> String? in
+            let stem = (url.lastPathComponent as NSString).deletingPathExtension
+            // A .coreML per-file resume blob is named "<modelID>__coreml__<relPath>" — recover
+            // the owning model's ID rather than treating the whole stem as one.
+            let modelID = stem.components(separatedBy: "__coreml__").first ?? stem
+            return known.contains(modelID) ? modelID : nil
+        })
     }
 
     // MARK: Verification
@@ -550,12 +840,22 @@ extension ModelDownloadManager: URLSessionDownloadDelegate {
         Task { @MainActor in
             guard let model = self.modelsByTaskID[taskID],
                   var progress = self.activeDownloads[model.id] else { return }
-            // `totalBytesExpectedToWrite` is -1 when the server omits Content-Length; the
-            // catalog's known size is the better denominator in that case.
-            let total = totalBytesExpectedToWrite > 0 ? totalBytesExpectedToWrite : progress.totalBytes
-            progress.bytesWritten = totalBytesWritten
-            progress.totalBytes = total
-            progress.fractionCompleted = total > 0 ? min(1.0, Double(totalBytesWritten) / Double(total)) : 0
+            if self.currentCoreMLFile[taskID] != nil {
+                // Multi-file queue: the denominator is the whole model's total size, and the
+                // numerator is bytes from already-completed files plus this file's own progress —
+                // not just this one task's bytes.
+                let completed = self.completedCoreMLBytes[model.id] ?? 0
+                progress.bytesWritten = completed + totalBytesWritten
+                progress.totalBytes = model.byteSize
+                progress.fractionCompleted = model.byteSize > 0 ? min(1.0, Double(progress.bytesWritten) / Double(model.byteSize)) : 0
+            } else {
+                // `totalBytesExpectedToWrite` is -1 when the server omits Content-Length; the
+                // catalog's known size is the better denominator in that case.
+                let total = totalBytesExpectedToWrite > 0 ? totalBytesExpectedToWrite : progress.totalBytes
+                progress.bytesWritten = totalBytesWritten
+                progress.totalBytes = total
+                progress.fractionCompleted = total > 0 ? min(1.0, Double(totalBytesWritten) / Double(total)) : 0
+            }
             self.activeDownloads[model.id] = progress
         }
     }
@@ -583,6 +883,13 @@ extension ModelDownloadManager: URLSessionDownloadDelegate {
                 try? FileManager.default.removeItem(at: temporaryCopy)
                 return
             }
+
+            if let file = self.currentCoreMLFile[taskID] {
+                self.currentCoreMLFile.removeValue(forKey: taskID)
+                self.finishCoreMLFile(file, tempFile: temporaryCopy, model: model)
+                return
+            }
+
             do {
                 try self.verify(fileAt: temporaryCopy, against: model)
 
@@ -597,7 +904,7 @@ extension ModelDownloadManager: URLSessionDownloadDelegate {
 
                 // The partial is worthless now, and the ledger entry is what lets the app tell the
                 // user *which* model vanished if this device is ever restored without it.
-                Self.deleteResumeData(for: model)
+                Self.deleteResumeData(forKey: model.id)
                 self.resumableModelIDs.remove(model.id)
                 ModelInventory.shared.record(
                     fileName: model.fileName,
@@ -614,6 +921,41 @@ extension ModelDownloadManager: URLSessionDownloadDelegate {
                 self.finish(model, with: error)
             }
         }
+    }
+
+    /// One file of a `.coreML` multi-file download has finished — verify its size, move it into
+    /// place at its `relativePath`, and either continue the queue or (once every file has landed)
+    /// finalize the whole model via `finalizeCoreMLDownload`.
+    @MainActor
+    private func finishCoreMLFile(_ file: CoreMLPackageFile, tempFile: URL, model: CatalogModel) {
+        let size = (try? FileManager.default.attributesOfItem(atPath: tempFile.path)[.size] as? Int64) ?? 0
+        guard size == file.byteSize else {
+            try? FileManager.default.removeItem(at: tempFile)
+            let error = NSError(domain: "ModelDownload", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "\(file.relativePath) downloaded as \(ByteCountFormatter.string(fromByteCount: size, countStyle: .file)) but should be \(ByteCountFormatter.string(fromByteCount: file.byteSize, countStyle: .file)). The download was incomplete."
+            ])
+            finish(model, with: error)
+            return
+        }
+
+        do {
+            let installedPath = Self.installDirectory(for: model.kind).appendingPathComponent(model.fileName)
+            let destination = installedPath.appendingPathComponent(file.relativePath)
+            try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if FileManager.default.fileExists(atPath: destination.path) {
+                try FileManager.default.removeItem(at: destination)
+            }
+            try FileManager.default.moveItem(at: tempFile, to: destination)
+            AppFiles.excludeFromBackup(destination)
+        } catch {
+            try? FileManager.default.removeItem(at: tempFile)
+            finish(model, with: error)
+            return
+        }
+
+        Self.deleteResumeData(forKey: Self.coreMLFileResumeKey(model: model, file: file))
+        completedCoreMLBytes[model.id, default: 0] += file.byteSize
+        startNextCoreMLFile(for: model)
     }
 
     nonisolated func urlSession(_ session: URLSession,
@@ -634,7 +976,8 @@ extension ModelDownloadManager: URLSessionDownloadDelegate {
         Task { @MainActor in
             guard let model = self.modelsByTaskID[taskID] else { return }
             if let resumeData {
-                Self.saveResumeData(resumeData, for: model)
+                let key = self.currentCoreMLFile[taskID].map { Self.coreMLFileResumeKey(model: model, file: $0) } ?? model.id
+                Self.saveResumeData(resumeData, forKey: key)
                 self.resumableModelIDs.insert(model.id)
             }
             self.finish(model, with: error, producedResumeData: resumeData != nil)
@@ -653,25 +996,45 @@ extension ModelDownloadManager: URLSessionDownloadDelegate {
         let bytesWritten = activeDownloads[model.id]?.bytesWritten ?? 0
         let taskID = tasksByModelID[model.id]?.taskIdentifier
         let wasResumed = taskID.map { resumedTaskIDs.contains($0) } ?? false
+        let coreMLFile = taskID.flatMap { currentCoreMLFile[$0] }
 
         activeDownloads.removeValue(forKey: model.id)
         tasksByModelID.removeValue(forKey: model.id)
         if let taskID {
             modelsByTaskID.removeValue(forKey: taskID)
             resumedTaskIDs.remove(taskID)
+            currentCoreMLFile.removeValue(forKey: taskID)
+        }
+        if model.kind == .coreML {
+            pendingCoreMLFiles.removeValue(forKey: model.id)
+            completedCoreMLBytes.removeValue(forKey: model.id)
         }
 
         guard let error else { return }
 
-        // Stale resume state: the task was built from a saved partial, produced nothing, and the
-        // system declined to give any back. Retrying would fail identically every time, so drop it
-        // and start over once rather than stranding the model behind a permanently broken resume.
-        if wasResumed, !producedResumeData, bytesWritten == 0 {
-            Self.deleteResumeData(for: model)
-            resumableModelIDs.remove(model.id)
-            LogManager.shared.log("ModelDownload: saved partial for \(model.displayName) was no longer usable — restarting from the beginning")
-            start(model, resuming: nil)
-            return
+        // Stale resume state: the task was built from a saved partial and the system declined to
+        // give any back. Retrying would fail identically every time, so the dead blob has to be
+        // cleared either way — what differs is what happens next.
+        if wasResumed, !producedResumeData {
+            if let coreMLFile {
+                // Multi-file `.coreML` downloads don't auto-restart inline the way the single-file
+                // branch below does — the files already verified on disk make a plain
+                // `download(_:)` retry cheap regardless, so there's no need to replicate that
+                // dance here. But the stale blob for *this specific file* still has to go, or
+                // every subsequent "tap Resume" reuses the same dead partial and fails identically
+                // forever: this used to only ever delete the single-file path's resume key (keyed
+                // by `model.id`), never a coreML file's own (keyed by `coreMLFileResumeKey`), so a
+                // stale coreML resume never actually self-healed the way this comment claimed.
+                Self.deleteResumeData(forKey: Self.coreMLFileResumeKey(model: model, file: coreMLFile))
+                resumableModelIDs.remove(model.id)
+                LogManager.shared.log("ModelDownload: saved partial for \(coreMLFile.relativePath) (\(model.displayName)) was no longer usable — it'll restart fresh next attempt")
+            } else if bytesWritten == 0 {
+                Self.deleteResumeData(forKey: model.id)
+                resumableModelIDs.remove(model.id)
+                LogManager.shared.log("ModelDownload: saved partial for \(model.displayName) was no longer usable — restarting from the beginning")
+                start(model, resuming: nil)
+                return
+            }
         }
 
         let nsError = error as NSError

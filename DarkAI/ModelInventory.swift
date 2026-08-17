@@ -15,7 +15,7 @@ struct InstalledModel: Codable, Identifiable, Hashable {
     var id: String { "\(kind.rawValue)/\(fileName)" }
 
     var directory: URL {
-        kind == .chat ? AppFiles.models : AppFiles.diffusionModels
+        ModelDownloadManager.installDirectory(for: kind)
     }
 
     var url: URL { directory.appendingPathComponent(fileName) }
@@ -133,13 +133,31 @@ final class ModelInventory: ObservableObject {
     /// `catalogID` is recovered by filename where the catalog recognises it, so a model downloaded
     /// by an older build still gets one-tap recovery.
     private func adoptUntrackedFiles() {
+        // Core ML models aren't extension-filtered like the other two kinds: a single-window
+        // model (OpenELM) installs as a `.mlpackage` directory, but a chunked pipeline model
+        // (Llama) installs as a plain-named directory of `.mlmodelc` bundles with no `.mlpackage`
+        // anywhere in it — an extension filter would silently never adopt one of those. Every
+        // Core ML model, whatever its internal shape, is a top-level directory entry directly
+        // under `AppFiles.coreMLModels` and nothing else lives there, so every entry qualifies.
+        let coreMLEntries = (try? FileManager.default.contentsOfDirectory(
+            at: AppFiles.coreMLModels, includingPropertiesForKeys: nil, options: .skipsHiddenFiles
+        )) ?? []
         let discovered = AppFiles.contents(of: AppFiles.models, matchingExtensions: ["gguf"]).map { ($0, ModelKind.chat) }
             + AppFiles.contents(of: AppFiles.diffusionModels, matchingExtensions: SettingsView.acceptedDiffusionExtensions).map { ($0, ModelKind.diffusion) }
+            + coreMLEntries.map { ($0, ModelKind.coreML) }
 
         for (url, kind) in discovered {
             let id = "\(kind.rawValue)/\(url.lastPathComponent)"
             guard !installed.contains(where: { $0.id == id }) else { continue }
-            let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init) ?? 0
+            // `fileSizeKey` only describes a single file — a `.mlpackage` directory needs its
+            // contents summed instead, or every adopted-but-untracked Core ML entry would record
+            // as 0 bytes.
+            let size: Int64
+            if kind == .coreML {
+                size = Int64(AppFiles.directorySizeGB(at: url) * 1024 * 1024 * 1024)
+            } else {
+                size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init) ?? 0
+            }
             record(
                 fileName: url.lastPathComponent,
                 kind: kind,

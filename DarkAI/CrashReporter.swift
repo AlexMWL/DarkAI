@@ -179,6 +179,10 @@ enum CrashReporter {
         let diffusionModel = UserDefaults.standard.string(forKey: diffusionModelKey)
 
         var report: Report?
+        // Only true for the signal/exception-dump branch below — the raw file backing it is only
+        // safe to delete once the decoded report has been durably written elsewhere. See the
+        // deletion at the bottom of this function.
+        var hasSignalFileToClear = false
 
         if let raw = try? String(contentsOf: signalReportURL, encoding: .utf8), !raw.isEmpty {
             let lines = raw.components(separatedBy: "\n")
@@ -197,7 +201,7 @@ enum CrashReporter {
                 chatModel: chatModel,
                 diffusionModel: diffusionModel
             )
-            try? FileManager.default.removeItem(at: signalReportURL)
+            hasSignalFileToClear = true
 
         } else if !cleanExit {
             // No signal, no exception, but the app never shut down cleanly. On iOS that is
@@ -220,9 +224,24 @@ enum CrashReporter {
         }
 
         guard let report else { return }
-        if let encoded = try? JSONEncoder().encode(report) {
-            try? encoded.write(to: pendingReportURL)
-            AppFiles.excludeFromBackup(pendingReportURL)
+
+        // Persist the decoded report before touching its raw source. Deleting the signal file
+        // first (as this used to) loses the report outright if the write below fails — disk full
+        // is a realistic state for a multi-GB-model app to crash in, which is exactly when this
+        // path is most likely to run.
+        guard let encoded = try? JSONEncoder().encode(report) else {
+            LogManager.shared.log("CrashReporter: failed to encode recovered report — \(report.summary)")
+            return
+        }
+        do {
+            try encoded.write(to: pendingReportURL)
+        } catch {
+            LogManager.shared.log("CrashReporter: failed to persist recovered report (\(error.localizedDescription)) — leaving the raw signal file in place to retry next launch")
+            return
+        }
+        AppFiles.excludeFromBackup(pendingReportURL)
+        if hasSignalFileToClear {
+            try? FileManager.default.removeItem(at: signalReportURL)
         }
         LogManager.shared.log("CrashReporter: recovered report — \(report.summary)")
     }

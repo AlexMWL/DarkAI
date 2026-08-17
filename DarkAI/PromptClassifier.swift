@@ -17,15 +17,19 @@ struct PromptClassifier {
     // MARK: Trigger Lists
 
     /// High-confidence prefixes / phrases — model is almost certainly asking for an image.
+    ///
+    /// Deliberately does *not* include a bare "generate " catch-all — see `generateVisualNouns`'s
+    /// doc comment for why that was a bug, not a feature. Every entry here needs a trailing space
+    /// (or to already be a whole word/phrase) so it can only ever match at an actual word
+    /// boundary — a fix for the same bug class "draw me"/"paint me" used to have without one:
+    /// "draw me" (no boundary) matched the start of "draw meaningful conclusions from this data".
     private static let strongTriggers: [String] = [
         "/imagine", "/image", "/img", "/gen", "/draw",
-        // "generate" prefix — catches any "generate X" request
-        "generate ",
         "generate an image", "generate a image", "generate image of",
         "create an image", "create a image", "create an illustration",
         "make an image", "make a image", "make a picture of",
-        "draw me", "draw a ", "draw an ", "draw the ",
-        "paint me", "paint a ", "paint an ", "paint the ",
+        "draw me ", "draw a ", "draw an ", "draw the ",
+        "paint me ", "paint a ", "paint an ", "paint the ",
         "render a ", "render an ", "render the ",
         "show me a picture of", "show me an image of",
         "create a photo of", "generate a photo of",
@@ -33,6 +37,24 @@ struct PromptClassifier {
         "generate art", "create art of", "make art of",
         "generate a portrait", "create a portrait",
         "produce an image", "produce a picture",
+    ]
+
+    /// Visual nouns that make a bare "generate ..." request unambiguously about an image. This
+    /// gates the check added in `classify` for that prefix specifically, replacing what used to
+    /// be an unconditional `"generate "` entry in `strongTriggers` above.
+    ///
+    /// That entry treated *every* "generate X" as an image request unless `X` matched something
+    /// on `exclusionPrefixes` — a blacklist that has to enumerate every non-image use of the word
+    /// "generate" in English to be complete, and silently misroutes whatever isn't yet on it:
+    /// "generate a password", "generate a name for my cat", "generate a random number" all landed
+    /// on the diffusion model, mangled by `stripLeadingTrigger`, instead of the LLM. Requiring a
+    /// visual noun to actually be present inverts the burden of proof — "generate ..." is text
+    /// unless it's actually asking for one of these — which is right for a word this generic,
+    /// and needs no exhaustive enumeration of what it *isn't*.
+    private static let generateVisualNouns: [String] = [
+        "image", "picture", "photo", "photograph", "art", "artwork", "illustration",
+        "drawing", "painting", "portrait", "sketch", "wallpaper", "logo", "icon",
+        "avatar", "scene", "landscape", "concept art", "render", "graphic"
     ]
 
     /// Medium-confidence subject patterns — "X of Y" image request structures.
@@ -85,15 +107,21 @@ struct PromptClassifier {
             if lower.hasPrefix(exclusion) { return .text }
         }
 
-        // 2. Strong triggers (highest confidence).
+        // 2. Bare "generate " — handled separately from the strong triggers below because it
+        // needs the visual-noun gate; see `generateVisualNouns`'s doc comment.
+        if lower.hasPrefix("generate "), generateVisualNouns.contains(where: { lower.contains($0) }) {
+            let refined = stripLeadingTrigger("generate ", from: trimmed)
+            return .imageGeneration(refinedPrompt: refined.isEmpty ? trimmed : refined)
+        }
+
+        // 3. Strong triggers (highest confidence).
         //
         // Two passes, and the split matters for what the diffusion model ends up being asked for.
         //
         // Leading triggers are stripped, because "generate an image of a red barn" is a request
         // wrapped around a subject and only the subject should reach the sampler. Longest match
-        // first: the list has both "generate " and "generate an image", and checking in
-        // declaration order meant the short one won and left "an image of a red barn" — two
-        // wasted CLIP tokens of instruction that describe nothing.
+        // first, so the most specific phrasing present wins — e.g. "generate a photo of" over a
+        // shorter, less specific entry that happens to also be a prefix of the message.
         //
         // A trigger found *mid-sentence* is left alone entirely. It is part of a description
         // there, not a wrapper around one, and the old code cut it out wherever it appeared:
@@ -108,14 +136,14 @@ struct PromptClassifier {
             return .imageGeneration(refinedPrompt: trimmed)
         }
 
-        // 3. Pattern triggers (medium confidence)
+        // 4. Pattern triggers (medium confidence)
         for trigger in patternTriggers {
             if lower.contains(trigger) {
                 return .imageGeneration(refinedPrompt: trimmed)
             }
         }
 
-        // 4. Style keyword triggers (lower confidence — only for short descriptive prompts)
+        // 5. Style keyword triggers (lower confidence — only for short descriptive prompts)
         if trimmed.count < 250 {
             for trigger in styleTriggers {
                 if lower.contains(trigger) {

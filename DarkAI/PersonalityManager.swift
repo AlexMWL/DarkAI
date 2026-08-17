@@ -342,7 +342,16 @@ class PersonalityManager: ObservableObject {
         for sentence in sentences {
             let cleanSentence = sentence.trimmingCharacters(in: .whitespacesAndNewlines)
             let lowerSentence = cleanSentence.lowercased()
-            
+
+            // This is the most common of the three fact-extraction paths in this file — twelve
+            // everyday English openers ("i am", "i have", "im"/"i'm"...) — so it's also the one
+            // most likely to catch a long run-on message when a `.!?\n` separator doesn't show up
+            // for a while. Its two siblings (`addFact` below, and the style-analysis block above)
+            // both cap what they add before it ever reaches `personality`; this path used to add
+            // whatever the message contained verbatim, unbounded, straight into a string injected
+            // into every future system prompt.
+            guard cleanSentence.count < 140 else { continue }
+
             for trigger in aggressiveTriggers {
                 if lowerSentence.hasPrefix(trigger) && cleanSentence.count > trigger.count + 2 {
                     let fact = "The user stated: '\(cleanSentence)'."
@@ -353,18 +362,25 @@ class PersonalityManager: ObservableObject {
                 }
             }
         }
-        
+
         if !newTraits.isEmpty {
             if currentProfile.isEmpty {
                 currentProfile = newTraits.joined(separator: "\n")
             } else {
                 currentProfile += "\n" + newTraits.joined(separator: "\n")
             }
+
+            // Cap growth the same way `analyzeAssistantMessage` and the style-analysis pass below
+            // both already do.
+            let lines = currentProfile.components(separatedBy: "\n")
+            if lines.count > 100 {
+                currentProfile = ([lines[0]] + lines.suffix(99)).joined(separator: "\n")
+            }
             personality = currentProfile
-            
+
             maturityScore = min(1.0, maturityScore + (Double(newTraits.count) * 0.08))
             isMature = maturityScore >= 0.7
-            
+
             savePersonalities()
         }
         

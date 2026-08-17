@@ -29,18 +29,37 @@ class RAGManager: ObservableObject {
     /// point every route into the Mindscape shares — chat file upload and the plain-text Settings
     /// importer both called `ingestDocument` directly with no limit of their own before this.
     static let maxDocumentCharacters = 750_000
-    
+
+    /// Total documents this corpus holds before the oldest are evicted to make room for a new
+    /// one. Every route into the Mindscape funnels through `ingestDocument` below, and none of
+    /// them previously had any cap on the corpus as a whole — `StructuredImport.maxDocuments`
+    /// only bounds a single import's own entry count, not what accumulates over the app's whole
+    /// lifetime. `ingestGeneratedImage` in particular runs on every successful image generation
+    /// with no dedup, so an active user's corpus — and the `UserDefaults` blob it's re-serialized
+    /// into in full on every single ingest — would otherwise grow for as long as the app is used.
+    static let maxDocuments = 1000
+
     init() {
         loadDocuments()
     }
     
     func loadDocuments() {
-        guard let data = UserDefaults.standard.data(forKey: storageKey),
-              let decoded = try? JSONDecoder().decode([RAGDocument].self, from: data) else {
+        guard let data = UserDefaults.standard.data(forKey: storageKey) else {
             // Starts empty. A previous build seeded a "Sideloading Guide" document here that
             // walked the user through installing the app outside the App Store; besides being
             // an automatic rejection, it also meant every new user's very first retrieval
             // result was app-distribution trivia rather than anything they had added.
+            documents = []
+            return
+        }
+        guard let decoded = try? JSONDecoder().decode([RAGDocument].self, from: data) else {
+            // Data existed — this isn't a fresh install — but couldn't be decoded, e.g. a future
+            // non-additive schema change. Starting empty is still the only real option (there is
+            // no partial-recovery path for a corrupt property list), but doing that with no trace
+            // at all is what turns a legitimate schema change into what reads to the single
+            // maintainer as inexplicable, silent data loss. The raw bytes are left in place at
+            // `storageKey` rather than cleared, in case they're worth inspecting later.
+            LogManager.shared.log("RAGManager: found \(data.count) bytes of stored documents but failed to decode them — starting with an empty Mindscape rather than losing them silently")
             documents = []
             return
         }
@@ -72,11 +91,28 @@ class RAGManager: ObservableObject {
         let chunks = splitIntoChunks(text: boundedContent)
         let doc = RAGDocument(name: name, content: boundedContent, chunks: chunks, imageFileName: imageFileName)
         documents.append(doc)
+        evictOldestIfNeeded()
         saveDocuments()
         if wasTruncated {
             LogManager.shared.log("RAGManager: '\(name)' exceeded \(Self.maxDocumentCharacters) characters — truncated on ingest.")
         }
         return wasTruncated
+    }
+
+    /// Drops the oldest documents once the corpus exceeds `maxDocuments`, cleaning up each one's
+    /// backing image file the same way `deleteDocument` does below — an eviction is a deletion,
+    /// not just an array trim, and leaving its file behind would orphan it in `GeneratedImages`.
+    /// Safe to assume `documents` is oldest-first: every ingestion route only ever appends.
+    private func evictOldestIfNeeded() {
+        guard documents.count > Self.maxDocuments else { return }
+        let overflow = documents.count - Self.maxDocuments
+        for doc in documents.prefix(overflow) {
+            if let fileName = doc.imageFileName, let dir = generatedImagesDirectory {
+                try? FileManager.default.removeItem(at: dir.appendingPathComponent(fileName))
+            }
+        }
+        documents.removeFirst(overflow)
+        LogManager.shared.log("RAGManager: corpus exceeded \(Self.maxDocuments) documents — evicted the oldest \(overflow)")
     }
 
     /// Directory where generated-image files backing RAG entries are stored.
@@ -95,9 +131,12 @@ class RAGManager: ObservableObject {
         return dir.appendingPathComponent(fileName)
     }
 
-    /// Creates a RAG text record for an AI-generated image so future LLM prompts
-    /// can reference previously generated images by subject or date.
-    func ingestGeneratedImage(prompt: String, imageData: Data) {
+    /// Creates a RAG text record for an AI-generated image so future LLM prompts can reference
+    /// previously generated images by subject or date. `imageFileName` names a file already
+    /// written to `AppFiles.generatedImages` (see `AppFiles.writeGeneratedImage`) — this used to
+    /// take raw `Data` and write its own second copy of it, when the call site already had (or
+    /// could have) a single on-disk copy the chat message was also going to reference.
+    func ingestGeneratedImage(prompt: String, imageFileName: String) {
         let formatter = DateFormatter()
         formatter.dateStyle = .medium
         formatter.timeStyle = .short
@@ -105,14 +144,6 @@ class RAGManager: ObservableObject {
 
         let shortPrompt = String(prompt.prefix(60)).trimmingCharacters(in: .whitespacesAndNewlines)
         let docName = "Generated Image – \(shortPrompt).txt"
-
-        let imagesDir = AppFiles.generatedImages
-        AppFiles.createIfNeeded(imagesDir)
-
-        let imageFileName = "\(UUID().uuidString).jpg"
-        let imageURL = imagesDir.appendingPathComponent(imageFileName)
-        try? imageData.write(to: imageURL)
-        AppFiles.excludeFromBackup(imageURL)
 
         let content = """
         [AI-Generated Image]

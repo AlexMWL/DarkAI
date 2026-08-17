@@ -93,7 +93,17 @@ enum ImageSafetyAnalyzer {
     private static let skinFractionThreshold = 0.62
 
     private static func heuristicVerdict(imageData: Data) -> Verdict {
-        guard let fraction = skinFraction(imageData: imageData) else { return .allowed }
+        guard let fraction = skinFraction(imageData: imageData) else {
+            // Both layers have now failed to check this image — the system analyzer already
+            // logs its own unavailable/errored case in `systemAnalyzerVerdict`, but this one
+            // didn't, so a decode failure here previously passed the image through with zero
+            // trace of why. Logged, not blocked: a corrupt/undecodable image is far more likely
+            // to be a genuine decode edge case than smuggled content, and refusing every image
+            // this heuristic can't parse would be a much louder failure mode than the risk it
+            // guards against.
+            LogManager.shared.log("ImageSafety: heuristic couldn't decode the image to check it")
+            return .allowed
+        }
         if fraction >= skinFractionThreshold {
             LogManager.shared.log(String(format: "ImageSafety: blocked by heuristic (skin %.0f%%)", fraction * 100))
             return .blocked(reason: "likely explicit imagery")

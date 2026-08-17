@@ -97,7 +97,7 @@ nonisolated enum ContentSafety {
                 message: "This request was blocked. \(AppInfo.displayName) does not process any request that sexualizes a minor, and this rule cannot be turned off."
             )
         }
-        if matchesAny(childExploitationTerms, normalized: normalized, compact: compact, useCompact: true) {
+        if matchesAny(childExploitationTerms, normalized: normalized, compact: compact, useCompact: true, minCompactLength: 4) {
             return Decision(
                 isAllowed: false,
                 category: .childSafety,
@@ -206,7 +206,7 @@ nonisolated enum ContentSafety {
         let normalized = normalize(partialText)
         let compact = compacted(normalized)
 
-        if matchesAny(childExploitationTerms, normalized: normalized, compact: compact, useCompact: true) {
+        if matchesAny(childExploitationTerms, normalized: normalized, compact: compact, useCompact: true, minCompactLength: 4) {
             return .childSafety
         }
         let hasMinor = matchesAny(minorTerms, normalized: normalized, compact: compact, useCompact: true)
@@ -266,15 +266,32 @@ nonisolated enum ContentSafety {
         String(normalized.unicodeScalars.filter { CharacterSet.alphanumerics.contains($0) })
     }
 
+    /// - Parameter minCompactLength: floor below which the compacted (anti-spacing) match is
+    ///   skipped, to avoid the classic "scunthorpe" false-positive of a short needle turning up
+    ///   as a substring of an unrelated word. Defaults to 5, tuned for the general term lists.
+    ///   `childExploitationTerms` passes a lower floor explicitly — see its call sites — because
+    ///   two of its terms ("csam", "loli") are 4-character acronyms/slang with no ordinary-word
+    ///   collision risk, and this is the one list the file's own header says should favour false
+    ///   positives over false negatives without qualification.
     private static func matchesAny(_ terms: [String],
                                    normalized: String,
                                    compact: String,
-                                   useCompact: Bool) -> Bool {
+                                   useCompact: Bool,
+                                   minCompactLength: Int = 5) -> Bool {
         for term in terms {
-            if wordBoundaryMatch(term, in: normalized) { return true }
+            // The term goes through the same `normalize()` pass as the input text before either
+            // match strategy runs. Without this, a term is compared in its raw, as-written form
+            // against text that has already had its digits substituted to letters ("1"→"i",
+            // "3"→"e", ...) — so a digit-spelled `minorTerms` entry like "13 year old" could never
+            // match "13 year old" typed the ordinary way, since normalization turns the *input*
+            // into "ie year old" while the term itself still reads "13 year old". Normalizing both
+            // sides identically is what actually closes that gap, and does so for every list here,
+            // not just the one that happened to contain digits.
+            let normalizedTerm = normalize(term)
+            if wordBoundaryMatch(normalizedTerm, in: normalized) { return true }
             if useCompact {
-                let needle = compacted(term)
-                if needle.count >= 5, compact.contains(needle) { return true }
+                let needle = compacted(normalizedTerm)
+                if needle.count >= minCompactLength, compact.contains(needle) { return true }
             }
         }
         return false

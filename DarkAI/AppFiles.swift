@@ -36,8 +36,34 @@ nonisolated enum AppFiles {
     /// Imported diffusion checkpoints (`.gguf`, `.safetensors`, `.ckpt`).
     static var diffusionModels: URL { documents.appendingPathComponent("DiffusionModels", isDirectory: true) }
 
+    /// Downloaded Core ML model packages (`.mlpackage` directory bundles) plus their compiled
+    /// `.mlmodelc` cache — see `CoreMLRunner.load`.
+    static var coreMLModels: URL { documents.appendingPathComponent("CoreMLModels", isDirectory: true) }
+
     /// Images produced by the diffusion pipeline and retained as RAG entries.
     static var generatedImages: URL { documents.appendingPathComponent("GeneratedImages", isDirectory: true) }
+
+    /// Writes generated-image bytes to `generatedImages` under a fresh UUID filename and returns
+    /// that filename, or `nil` on failure.
+    ///
+    /// The single write point for that directory — `ConversationManager` and `RAGManager` both
+    /// need a copy of the same generated image (one to show it in the chat, one to make it
+    /// retrievable later), and each used to write its own separate file for what was, in memory,
+    /// the exact same `Data`. Writing once here and handing both managers the resulting filename
+    /// means a generated image is stored on disk exactly once, not twice.
+    @discardableResult
+    static func writeGeneratedImage(_ data: Data) -> String? {
+        createIfNeeded(generatedImages)
+        let fileName = "\(UUID().uuidString).jpg"
+        let url = generatedImages.appendingPathComponent(fileName)
+        do {
+            try data.write(to: url)
+        } catch {
+            return nil
+        }
+        excludeFromBackup(url)
+        return fileName
+    }
 
     /// Partial downloads. Separate from `models` so an interrupted download is never mistaken
     /// for an importable model by the settings list.
@@ -53,7 +79,7 @@ nonisolated enum AppFiles {
     static var pendingCrashReportFile: URL { documents.appendingPathComponent("pending_crash.json") }
 
     private static var allDirectories: [URL] {
-        [models, diffusionModels, generatedImages, downloadsInProgress]
+        [models, diffusionModels, coreMLModels, generatedImages, downloadsInProgress]
     }
 
     // MARK: - Setup
@@ -135,6 +161,21 @@ nonisolated enum AppFiles {
     static func fileSizeGB(at url: URL) -> Double {
         guard let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize else { return 0 }
         return Double(size) / (1024 * 1024 * 1024)
+    }
+
+    /// Total size of everything under a directory, in gigabytes — `fileSizeKey` alone is only
+    /// meaningful for a single file, so a `.mlpackage` (a directory bundle) needs this instead.
+    static func directorySizeGB(at url: URL) -> Double {
+        var total: Int64 = 0
+        guard let enumerator = FileManager.default.enumerator(
+            at: url,
+            includingPropertiesForKeys: [.fileSizeKey],
+            options: .skipsHiddenFiles
+        ) else { return 0 }
+        for case let fileURL as URL in enumerator {
+            total += Int64((try? fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+        }
+        return Double(total) / (1024 * 1024 * 1024)
     }
 
     /// Free space on the volume backing the app container, in gigabytes. Uses the

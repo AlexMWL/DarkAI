@@ -47,6 +47,16 @@ nonisolated struct ModelProfile {
     /// Whether the geometry is complete enough to budget a KV cache from.
     var hasUsableGeometry: Bool { nLayer > 0 && nHeadKV > 0 && headDimK > 0 && headDimV > 0 }
 
+    /// Total tensor bytes belonging to each transformer block, keyed by block index — attention,
+    /// FFN (dense or routed), and per-block norms alike. This is the real weight of *this specific*
+    /// block, not an average over the file, so an architecture with uneven block sizes (Gemma's
+    /// mixed local/global attention layers, in particular) is represented as it actually is rather
+    /// than blurred into a flat per-layer figure.
+    ///
+    /// Populated for every block the tensor directory names, dense or MoE alike — unlike
+    /// `expertGBByLayer`, which only tracks the routed-expert portion.
+    let blockGBByLayer: [Int: Double]
+
     /// Routed-expert FFN bytes in each block, keyed by block index. Empty for a dense model.
     let expertGBByLayer: [Int: Double]
 
@@ -119,12 +129,17 @@ nonisolated enum ModelProfiler {
         defer { gguf_free(ctx) }
 
         var expertBytesByLayer: [Int: Double] = [:]
+        var blockBytesByLayer: [Int: Double] = [:]
         var tensorBytes = 0.0
         for index in 0..<gguf_get_n_tensors(ctx) {
             guard let cName = gguf_get_tensor_name(ctx, index) else { continue }
+            let name = String(cString: cName)
             let size = Double(gguf_get_tensor_size(ctx, index))
             tensorBytes += size
-            guard let layer = expertLayerIndex(in: String(cString: cName)) else { continue }
+            if let layer = blockLayerIndex(in: name) {
+                blockBytesByLayer[layer, default: 0] += size
+            }
+            guard let layer = expertLayerIndex(in: name) else { continue }
             expertBytesByLayer[layer, default: 0] += size
         }
 
@@ -157,6 +172,7 @@ nonisolated enum ModelProfiler {
             headDimV: headDimV,
             trainedContext: Int(uintValue(ctx, "\(arch).context_length") ?? 0),
             vocabSize: vocabSize(ctx, arch: arch),
+            blockGBByLayer: blockBytesByLayer.mapValues { $0 / bytesPerGB },
             expertGBByLayer: expertBytesByLayer.mapValues { $0 / bytesPerGB },
             routedFraction: routedFraction(ctx, arch: arch)
         )
@@ -227,6 +243,16 @@ nonisolated enum ModelProfiler {
     /// asymmetric: omitting a genuine expert only forgoes some memory that could have been
     /// streamed, while including a tensor every token needs would silently under-budget the
     /// load. If a model using that form ever needs support, confirm what it is first.
+    /// Block index for any tensor belonging to a transformer block, e.g. `blk.12.attn_q.weight`
+    /// → 12 — unlike `expertLayerIndex`, this doesn't care what role the tensor plays within the
+    /// block, only which block it belongs to.
+    private static func blockLayerIndex(in name: String) -> Int? {
+        guard name.hasPrefix("blk.") else { return nil }
+        let parts = name.split(separator: ".")
+        guard parts.count >= 2, let layer = Int(parts[1]) else { return nil }
+        return layer
+    }
+
     private static func expertLayerIndex(in name: String) -> Int? {
         guard name.hasPrefix("blk.") else { return nil }
         let parts = name.split(separator: ".")

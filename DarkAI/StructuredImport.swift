@@ -234,9 +234,13 @@ nonisolated enum StructuredImport {
             return (flattened ?? objects, title)
         }
 
-        // Last resort: any array of objects anywhere in the top level.
-        for (_, candidate) in object {
-            if let array = candidate as? [Any] {
+        // Last resort: any array of objects anywhere in the top level. Sorted by key rather than
+        // walked in the dictionary's own iteration order, which Swift leaves unspecified (and
+        // varies by process, via hash-seed randomization) — without the sort, importing the exact
+        // same file could pick a different array, and so produce different content, on different
+        // launches.
+        for key in object.keys.sorted() {
+            if let array = object[key] as? [Any] {
                 let objects = array.compactMap { $0 as? [String: Any] }
                 if !objects.isEmpty { return (flattenSections(objects) ?? objects, title) }
             }

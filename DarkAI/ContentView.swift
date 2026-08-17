@@ -12,8 +12,12 @@ struct ContentView: View {
     @StateObject private var webSearchManager = WebSearchManager()
 
     @AppStorage("customInstructions") private var customInstructions: String = "You are a local assistant. Respond with precise answers."
-    @State private var enableRAG = true
-    @State private var enableMemories = true
+    // Was plain `@State`, which meant turning either off — Memories especially, since that's
+    // the feature extracting personal facts from what the user types — silently reset to on
+    // every relaunch. `@AppStorage` still projects to a `Binding<Bool>` via `$`, so the
+    // `SettingsView` call site below needs no change.
+    @AppStorage("enableRAG") private var enableRAG = true
+    @AppStorage("enableMemories") private var enableMemories = true
 
     @State private var showFileImporter = false
     @State private var showAutoLoadAlert = false
@@ -26,6 +30,16 @@ struct ContentView: View {
 
     @State private var showDiffusionNotLoadedBanner = false
     @State private var diffusionBannerTask: Task<Void, Never>? = nil
+
+    /// Which conversation the in-flight image generation actually belongs to — captured when the
+    /// request starts, cleared when it ends. `diffusionManager.isGenerating` alone can't answer
+    /// "for which chat": it's a single global flag, so without this, switching to an unrelated
+    /// conversation whose own last message happened to be a plain assistant reply would render
+    /// that message as a live generation spinner, complete with a Cancel button that — if tapped —
+    /// overwrote that unrelated chat's real last message. Gating the spinner on this too means it
+    /// can only ever appear on the conversation actually generating, so the Cancel button is safe
+    /// without needing its own explicit conversation ID.
+    @State private var imageGenerationConversationId: UUID? = nil
 
     // Content safety + one-off notices (blocked prompts, Photos permission, save results)
     @State private var notice: Notice? = nil
@@ -224,9 +238,9 @@ struct ContentView: View {
         }
         .sheet(item: $reportTarget) { message in
             ReportContentView(
-                content: message.imageData != nil ? "" : message.text,
+                content: message.isImageMessage ? "" : message.text,
                 modelName: llmManager.activeModelURL?.lastPathComponent ?? "none",
-                wasImage: message.imageData != nil
+                wasImage: message.isImageMessage
             ) {
                 conversationManager.deleteMessage(id: message.id)
             }
@@ -793,7 +807,7 @@ struct ContentView: View {
                             Label("Share", systemImage: "square.and.arrow.up")
                         }
                     }
-            } else if let imgData = message.imageData, let uiImg = UIImage(data: imgData) {
+            } else if let imgData = message.resolvedImageData, let uiImg = UIImage(data: imgData) {
                 // AI-generated image bubble
                 Image(systemName: "sparkles")
                     .foregroundColor(Color.purple)
@@ -887,7 +901,9 @@ struct ContentView: View {
                     }
                 }
                 Spacer()
-            } else if message.imageData == nil && !message.isUser && diffusionManager.isGenerating && conversationManager.activeConversation?.messages.last?.id == message.id {
+            } else if !message.isImageMessage && !message.isUser && diffusionManager.isGenerating
+                        && imageGenerationConversationId == conversationManager.activeConversationId
+                        && conversationManager.activeConversation?.messages.last?.id == message.id {
                 // In-progress image generation spinner
                 Image(systemName: "sparkles")
                     .foregroundColor(Color.purple)
@@ -1296,8 +1312,14 @@ struct ContentView: View {
             return
         }
 
+        // Captured once, here, before anything async runs — every write this exchange makes
+        // (image or text) targets this specific conversation from now on, never whatever happens
+        // to be "active" by the time an awaited call actually returns. See
+        // `ConversationManager.addMessageToActive`'s doc comment for the failure this prevents.
+        guard let conversationId = conversationManager.activeConversationId else { return }
+
         if case .imageGeneration(let refinedPrompt) = intent, pendingAttachmentText == nil {
-            conversationManager.addMessageToActive(isUser: true, text: text)
+            conversationManager.addMessageToActive(isUser: true, text: text, conversationId: conversationId)
 
             guard let diffPath = diffusionManager.lastDiffusionModelPath else {
                 diffusionBannerTask?.cancel()
@@ -1314,7 +1336,8 @@ struct ContentView: View {
             }
 
             // Add a placeholder bubble (shows the spinner while generating)
-            conversationManager.addMessageToActive(isUser: false, text: refinedPrompt)
+            conversationManager.addMessageToActive(isUser: false, text: refinedPrompt, conversationId: conversationId)
+            imageGenerationConversationId = conversationId
 
             diffusionManager.beginGenerationSession(stage: "Preparing…")
 
@@ -1322,7 +1345,12 @@ struct ContentView: View {
                 // Closes the session on every exit path — success, thrown error, early return.
                 // The previous version reset the flag by hand at some exit points and missed
                 // others, which is what left the app permanently refusing new messages.
-                defer { diffusionManager.endGenerationSession() }
+                defer {
+                    diffusionManager.endGenerationSession()
+                    if imageGenerationConversationId == conversationId {
+                        imageGenerationConversationId = nil
+                    }
+                }
 
                 // Falls back to the last-used model rather than only the currently resident one.
                 //
@@ -1350,7 +1378,7 @@ struct ContentView: View {
                         // failing the whole request over the model's phrasing.
                         if ContentSafety.review(llmPrompt, surface: .imagePrompt).isAllowed {
                             finalPrompt = llmPrompt
-                            conversationManager.updateLastMessage(text: finalPrompt)
+                            conversationManager.updateLastMessage(text: finalPrompt, conversationId: conversationId)
                         } else {
                             LogManager.shared.log("ContentSafety: rejected LLM-expanded image prompt, using original")
                         }
@@ -1428,18 +1456,31 @@ struct ContentView: View {
                     let verdict = await ImageSafetyAnalyzer.screen(imageData: data)
                     if case .blocked(let reason) = verdict {
                         conversationManager.updateLastMessage(
-                            text: "[The generated image was blocked by the content filter (\(reason)) and has been discarded.]"
+                            text: "[The generated image was blocked by the content filter (\(reason)) and has been discarded.]",
+                            conversationId: conversationId
                         )
                         conversationManager.saveConversations()
                         LogManager.shared.log("ContentSafety: discarded generated image — \(reason)")
                         return
                     }
 
-                    conversationManager.updateLastMessageImage(imageData: data)
-                    ragManager.ingestGeneratedImage(prompt: finalPrompt, imageData: data)
+                    // Written to disk exactly once — the chat message and the RAG entry both
+                    // reference this same file by name rather than each keeping their own copy
+                    // of the bytes. See `AppFiles.writeGeneratedImage`'s doc comment.
+                    guard let imageFileName = AppFiles.writeGeneratedImage(data) else {
+                        conversationManager.updateLastMessage(
+                            text: "[Couldn't save the generated image to disk.]",
+                            conversationId: conversationId
+                        )
+                        conversationManager.saveConversations()
+                        return
+                    }
+                    conversationManager.updateLastMessageImage(imageFileName: imageFileName, conversationId: conversationId)
+                    ragManager.ingestGeneratedImage(prompt: finalPrompt, imageFileName: imageFileName)
                 } else {
                     conversationManager.updateLastMessage(
-                        text: "[Couldn't generate the image. \(failureMessage ?? "The diffusion model failed to run.")]"
+                        text: "[Couldn't generate the image. \(failureMessage ?? "The diffusion model failed to run.")]",
+                        conversationId: conversationId
                     )
                 }
                 conversationManager.saveConversations()
@@ -1451,7 +1492,7 @@ struct ContentView: View {
         // search offer from firing on a message that's really "analyze this attachment."
         let hadAttachment = pendingAttachmentText != nil
 
-        let history = conversationManager.activeConversation?.messages ?? []
+        let history = conversationManager.conversation(id: conversationId)?.messages ?? []
 
         var promptText = text
         if let attachmentName = pendingAttachmentName, let attachmentText = pendingAttachmentText {
@@ -1462,19 +1503,19 @@ struct ContentView: View {
                 promptText = text + fileInfo
             }
 
-            conversationManager.addMessageToActive(isUser: true, text: text.isEmpty ? "[Sent Attachment: \(attachmentName)]" : text + "\n[Sent Attachment: \(attachmentName)]")
+            conversationManager.addMessageToActive(isUser: true, text: text.isEmpty ? "[Sent Attachment: \(attachmentName)]" : text + "\n[Sent Attachment: \(attachmentName)]", conversationId: conversationId)
 
             pendingAttachmentName = nil
             pendingAttachmentText = nil
         } else {
-            conversationManager.addMessageToActive(isUser: true, text: text)
+            conversationManager.addMessageToActive(isUser: true, text: text, conversationId: conversationId)
         }
 
         // Distress signals get resources attached, not a refusal. The model still answers
         // normally below — this appears alongside the conversation rather than replacing it,
         // because cutting someone off mid-sentence is not help.
         if promptDecision.attachesCrisisResources {
-            conversationManager.addMessageToActive(isUser: false, text: LegalText.crisisResources)
+            conversationManager.addMessageToActive(isUser: false, text: LegalText.crisisResources, conversationId: conversationId)
         }
 
         // Gated entirely on the user having turned internet access on in Settings — when it's
@@ -1491,7 +1532,7 @@ struct ContentView: View {
             return
         }
 
-        generateTextResponse(text: text, promptText: promptText, history: history)
+        generateTextResponse(text: text, promptText: promptText, history: history, conversationId: conversationId)
     }
 
     /// Runs a normal (no web search) response for a captured user turn. This is the exact body
@@ -1509,6 +1550,7 @@ struct ContentView: View {
         text: String,
         promptText: String,
         history: [ChatMessage],
+        conversationId: UUID,
         extraRagContext: String = "",
         responseSuffix: String = "",
         createsNewBubble: Bool = true
@@ -1556,7 +1598,7 @@ struct ContentView: View {
                 let memoriesContext = enableMemories ? memoryManager.getFormattedMemoriesForContext() : ""
 
                 if createsNewBubble {
-                    conversationManager.addMessageToActive(isUser: false, text: "")
+                    conversationManager.addMessageToActive(isUser: false, text: "", conversationId: conversationId)
                 }
 
                 let finalSystemPrompt = systemPromptWithPersonality(base: customInstructions)
@@ -1568,8 +1610,8 @@ struct ContentView: View {
                     memoriesContext: memoriesContext,
                     ragContext: ragContext
                 ) { token in
-                    let updated = (conversationManager.activeConversation?.messages.last?.text ?? "") + token
-                    conversationManager.updateLastMessage(text: updated)
+                    let updated = (conversationManager.conversation(id: conversationId)?.messages.last?.text ?? "") + token
+                    conversationManager.updateLastMessage(text: updated, conversationId: conversationId)
 
                     // Abort mid-stream rather than rendering violating tokens and retracting
                     // them a second later. Only screens the non-negotiable category, and only
@@ -1578,7 +1620,8 @@ struct ContentView: View {
                        let violation = ContentSafety.streamingViolation(in: updated) {
                         llmManager.cancelGeneration()
                         conversationManager.updateLastMessage(
-                            text: "[Response stopped by the content filter — \(violation.reportLabel).]"
+                            text: "[Response stopped by the content filter — \(violation.reportLabel).]",
+                            conversationId: conversationId
                         )
                         LogManager.shared.log("ContentSafety: cancelled stream — \(violation.rawValue)")
                     }
@@ -1599,7 +1642,7 @@ struct ContentView: View {
                         cleanedText += responseSuffix
                     }
 
-                    conversationManager.updateLastMessage(text: cleanedText)
+                    conversationManager.updateLastMessage(text: cleanedText, conversationId: conversationId)
                     conversationManager.saveConversations()
 
                     // Run personality analysis only after the real response is fully done,
@@ -1626,7 +1669,11 @@ struct ContentView: View {
     /// `WebSearchQueryType`, since classification is cheap and deterministic and this keeps
     /// `ChatMessage` from needing to know that type exists at all.
     private func respondToSearchOffer(accepted: Bool, query: String, offerMessageId: UUID) {
-        guard let messages = conversationManager.activeConversation?.messages,
+        // Captured here, at the moment of the tap, for the same reason `sendMessage` captures
+        // one before starting a turn — everything this offer triggers (a search, then a
+        // generation) is async from here on, and "active" can change underneath it.
+        guard let conversationId = conversationManager.activeConversationId,
+              let messages = conversationManager.conversation(id: conversationId)?.messages,
               let offerIndex = messages.firstIndex(where: { $0.id == offerMessageId }) else { return }
 
         conversationManager.clearPendingSearch(messageId: offerMessageId)
@@ -1639,18 +1686,33 @@ struct ContentView: View {
         let history = Array(messages[0..<max(0, offerIndex - 1)])
 
         guard accepted else {
-            generateTextResponse(text: query, promptText: query, history: history)
+            generateTextResponse(text: query, promptText: query, history: history, conversationId: conversationId)
             return
         }
-        performWebSearchAndRespond(query: query, history: history)
+        performWebSearchAndRespond(query: query, history: history, conversationId: conversationId)
     }
 
     /// Runs the actual search, then generation, for an accepted offer. Owns its own placeholder
     /// bubble ("🔍 Searching the interwebs…") so there's always visible feedback during the
     /// network round trip — replaced in place by the streamed answer once the search resolves,
     /// or by a plain failure message if it doesn't.
-    private func performWebSearchAndRespond(query: String, history: [ChatMessage]) {
-        conversationManager.addMessageToActive(isUser: false, text: "🔍 Searching the interwebs…")
+    private func performWebSearchAndRespond(query: String, history: [ChatMessage], conversationId: UUID) {
+        // Re-checked here, not just when the offer bubble was created. An offer is persisted and
+        // can sit in a conversation indefinitely — including across a relaunch — so a user who
+        // turns Internet Access off *after* an offer exists but before tapping it could otherwise
+        // still fire a real network request via a stale bubble, contradicting the app's own
+        // privacy copy ("nothing about that message ever leaves your device" once this is off).
+        // Checking at the point the request would actually go out is what actually holds that
+        // promise regardless of how old the offer is.
+        guard webSearchManager.isEnabled else {
+            generateTextResponse(
+                text: query, promptText: query, history: history, conversationId: conversationId,
+                extraRagContext: "\n\n(Internet access is currently off, so answer from what you already know without mentioning a web search.)"
+            )
+            return
+        }
+
+        conversationManager.addMessageToActive(isUser: false, text: "🔍 Searching the interwebs…", conversationId: conversationId)
 
         Task {
             let queryType = WebSearchClassifier.classify(query) ?? .general(query: query)
@@ -1664,9 +1726,9 @@ struct ContentView: View {
                     // Clears the "Searching…" placeholder text so the token-streaming callback's
                     // accumulate-by-appending logic starts from empty rather than appending onto
                     // the stage text.
-                    conversationManager.updateLastMessage(text: "")
+                    conversationManager.updateLastMessage(text: "", conversationId: conversationId)
                     generateTextResponse(
-                        text: query, promptText: query, history: history,
+                        text: query, promptText: query, history: history, conversationId: conversationId,
                         extraRagContext: extraContext, responseSuffix: sourcesFooter,
                         createsNewBubble: false
                     )
@@ -1675,14 +1737,14 @@ struct ContentView: View {
                 // Not a failure — the question just didn't say where. Ask plainly instead of
                 // reporting a failed search or guessing a city.
                 await MainActor.run {
-                    conversationManager.updateLastMessage(text: "Which city should I check the weather for?")
+                    conversationManager.updateLastMessage(text: "Which city should I check the weather for?", conversationId: conversationId)
                     conversationManager.saveConversations()
                 }
             } catch WebSearchError.blocked(let message) {
                 // A deliberate content-policy refusal — this one stays a hard stop, not
                 // something to paper over with a normal answer.
                 await MainActor.run {
-                    conversationManager.updateLastMessage(text: "[\(message)]")
+                    conversationManager.updateLastMessage(text: "[\(message)]", conversationId: conversationId)
                     conversationManager.saveConversations()
                 }
             } catch {
@@ -1695,9 +1757,9 @@ struct ContentView: View {
                 LogManager.shared.log("WebSearch: search failed, answering without results — \(error.localizedDescription)")
                 let extraContext = "\n\n(A web search for \"\(query)\" was attempted but didn't return usable results. Briefly say you couldn't find live results for this, then answer as well as you can from what you already know.)"
                 await MainActor.run {
-                    conversationManager.updateLastMessage(text: "")
+                    conversationManager.updateLastMessage(text: "", conversationId: conversationId)
                     generateTextResponse(
-                        text: query, promptText: query, history: history,
+                        text: query, promptText: query, history: history, conversationId: conversationId,
                         extraRagContext: extraContext, createsNewBubble: false
                     )
                 }
@@ -1760,6 +1822,9 @@ struct ContentView: View {
 
     private func handleFileImport(_ result: Result<[URL], Error>) {
         guard let url = try? result.get().first else { return }
+        // Captured synchronously, before the Task below — same reasoning as `sendMessage`'s
+        // own capture: everything from here on is async, and "active" can change underneath it.
+        guard let conversationId = conversationManager.activeConversationId else { return }
 
         Task {
             guard url.startAccessingSecurityScopedResource() else { return }
@@ -1780,10 +1845,10 @@ struct ContentView: View {
                     let uploadNote = isImage
                         ? "[Image uploaded: \(fileName) — \(extractedText.count) characters extracted via OCR\(truncationNote)]"
                         : "[Document uploaded: \(fileName) — \(extractedText.count) characters extracted\(truncationNote)]"
-                    conversationManager.addMessageToActive(isUser: true, text: uploadNote)
+                    conversationManager.addMessageToActive(isUser: true, text: uploadNote, conversationId: conversationId)
 
                     // Create empty assistant message to stream into
-                    conversationManager.addMessageToActive(isUser: false, text: "")
+                    conversationManager.addMessageToActive(isUser: false, text: "", conversationId: conversationId)
                 }
 
                 // Build a description prompt — the model reads the extracted text and describes it
@@ -1795,7 +1860,7 @@ struct ContentView: View {
                     describePrompt = "The following text was extracted from an uploaded document called '\(url.lastPathComponent)'. Based on this content, identify what kind of document this is (e.g. receipt, resume, code, article, invoice, etc.) and summarize it briefly. Start your response with 'I see you uploaded a document that looks like...' then describe it. Document content:\n\n\(truncatedText)"
                 }
 
-                let history = await MainActor.run { conversationManager.activeConversation?.messages ?? [] }
+                let history = await MainActor.run { conversationManager.conversation(id: conversationId)?.messages ?? [] }
                 let memoriesContext = await MainActor.run { enableMemories ? memoryManager.getFormattedMemoriesForContext() : "" }
 
                 await MainActor.run {
@@ -1807,7 +1872,8 @@ struct ContentView: View {
                         ragContext: ""
                     ) { token in
                         conversationManager.updateLastMessage(
-                            text: (conversationManager.activeConversation?.messages.last?.text ?? "") + token
+                            text: (conversationManager.conversation(id: conversationId)?.messages.last?.text ?? "") + token,
+                            conversationId: conversationId
                         )
                     } onComplete: { finalText in
                         var cleanedText = self.filterThoughts(from: finalText, stripMarkdown: self.personalityManager.isMature)
@@ -1820,7 +1886,7 @@ struct ContentView: View {
                         if !outputDecision.isAllowed {
                             cleanedText = outputDecision.message ?? "[This response was withheld by the content filter.]"
                         }
-                        conversationManager.updateLastMessage(text: cleanedText)
+                        conversationManager.updateLastMessage(text: cleanedText, conversationId: conversationId)
                         conversationManager.saveConversations()
 
                         if enableMemories, llmManager.activeModelURL != nil {
@@ -1831,7 +1897,7 @@ struct ContentView: View {
 
             } catch {
                 await MainActor.run {
-                    conversationManager.addMessageToActive(isUser: false, text: "[System] Failed to process file: \(error.localizedDescription)")
+                    conversationManager.addMessageToActive(isUser: false, text: "[System] Failed to process file: \(error.localizedDescription)", conversationId: conversationId)
                 }
             }
         }

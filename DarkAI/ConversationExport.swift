@@ -140,7 +140,7 @@ nonisolated enum ConversationExport {
         let textBytes = conversation.messages.reduce(0) { $0 + $1.text.utf8.count + 64 }
         guard format.supportsEmbeddedImages, includeImages else { return textBytes }
         // base64 is 4 bytes out for every 3 in.
-        let imageBytes = conversation.messages.reduce(0) { $0 + (($1.imageData?.count ?? 0) * 4 / 3) }
+        let imageBytes = conversation.messages.reduce(0) { $0 + (($1.resolvedImageData?.count ?? 0) * 4 / 3) }
         return textBytes + imageBytes
     }
 
@@ -215,7 +215,7 @@ nonisolated enum ConversationExport {
                         role: message.isUser ? "user" : "assistant",
                         timestamp: message.timestamp,
                         text: message.isUser ? message.text : sanitize(message.text),
-                        image: (includeImages ? message.imageData : nil).map {
+                        image: (includeImages ? message.resolvedImageData : nil).map {
                             .init(format: "jpeg", base64: $0.base64EncodedString())
                         }
                     )

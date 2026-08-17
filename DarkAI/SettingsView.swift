@@ -23,6 +23,7 @@ struct SettingsView: View {
     @StateObject private var inventory = ModelInventory.shared
 
     @State private var importedModels: [URL] = []
+    @State private var importedCoreMLModels: [URL] = []
     @State private var storageUsedGB: Double = 0
     @State private var showModelImporter = false
     @State private var isImporting = false
@@ -132,6 +133,50 @@ struct SettingsView: View {
                                     RoundedRectangle(cornerRadius: 12)
                                         .stroke(Theme.accentCyan.opacity(0.3), lineWidth: 1)
                                 )
+                            }
+                        }
+                        .glassCard(cornerRadius: 16)
+
+                        VStack(alignment: .leading, spacing: 14) {
+                            HStack {
+                                Image(systemName: "cpu.fill")
+                                    .foregroundColor(Theme.accentCyan)
+                                    .font(.headline)
+                                Text("CORE ML MODELS (ANE)")
+                                    .font(.system(size: 14, weight: .bold))
+                                    .foregroundColor(Theme.textPrimary)
+                                    .kerning(1.2)
+                                Spacer()
+                            }
+
+                            Text("Runs on the Apple Neural Engine instead of the CPU/GPU path the models above use. No file import — catalog only.")
+                                .font(.system(size: 11))
+                                .foregroundColor(Theme.textMuted)
+                                .fixedSize(horizontal: false, vertical: true)
+
+                            if importedCoreMLModels.isEmpty {
+                                Text("No Core ML model installed. Download the one below to try it.")
+                                    .font(.system(size: 13))
+                                    .foregroundColor(Theme.textSecondary)
+                                    .padding()
+                                    .frame(maxWidth: .infinity, alignment: .center)
+                                    .glassCard(cornerRadius: 12)
+                            } else {
+                                VStack(spacing: 12) {
+                                    ForEach(importedCoreMLModels, id: \.self) { url in
+                                        coreMLModelRow(for: url)
+                                    }
+                                }
+                            }
+
+                            Divider().background(Theme.border)
+
+                            VStack(alignment: .leading, spacing: 10) {
+                                Text("DOWNLOAD A CORE ML MODEL")
+                                    .font(.system(size: 11, weight: .bold))
+                                    .foregroundColor(Theme.textSecondary)
+                                    .kerning(1.0)
+                                downloadCatalogButton(for: .coreML)
                             }
                         }
                         .glassCard(cornerRadius: 16)
@@ -370,7 +415,36 @@ struct SettingsView: View {
                             }
                             
                             Divider().background(Theme.border)
-                            
+
+                            // The Core ML backend has no adjustable context window — whatever
+                            // `loadedContextWindow` reports is baked into the model graph, not
+                            // something `contextTokenLimit` governs. Showing the GGUF slider here
+                            // would offer a control that does nothing for the model that's
+                            // actually loaded. The two Core ML engines mean different things by
+                            // that number, though (`coreMLContextIsSliding` — see its doc comment
+                            // on `LLMManager`), so the description can't just hardcode either
+                            // engine's specific behavior the way this used to hardcode OpenELM's.
+                            if llmManager.activeBackend == .coreML {
+                                VStack(alignment: .leading, spacing: 6) {
+                                    HStack {
+                                        Text("Context Window:")
+                                            .font(.system(size: 13))
+                                            .foregroundColor(Theme.textSecondary)
+                                        Spacer()
+                                        Text(llmManager.coreMLContextIsSliding
+                                             ? "\(llmManager.loadedContextWindow) tokens (sliding)"
+                                             : "\(llmManager.loadedContextWindow) tokens (fixed)")
+                                            .font(.system(size: 13, weight: .bold, design: .monospaced))
+                                            .foregroundColor(Theme.accent)
+                                    }
+                                    Text(llmManager.coreMLContextIsSliding
+                                         ? "This Core ML model has no adjustable context. Once a conversation passes \(llmManager.loadedContextWindow) tokens, the earliest turns are gradually forgotten rather than the reply being cut off."
+                                         : "This Core ML model has no adjustable context — \(llmManager.loadedContextWindow) tokens total, prompt and reply combined.")
+                                        .font(.system(size: 11))
+                                        .foregroundColor(Theme.textMuted)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                            } else {
                             VStack(alignment: .leading, spacing: 8) {
                                 HStack {
                                     Text("Context Window Limit:")
@@ -423,10 +497,23 @@ struct SettingsView: View {
                                         .foregroundColor(Theme.textMuted)
                                 }
                             }
+                            }
 
 
                             Divider().background(Theme.border)
-                            
+
+                            // Same reasoning as the Context Window gate above: a Core ML model's
+                            // reply is always cut off by its own context window (128 tokens total
+                            // for OpenELM; the sliding cache's own bookkeeping for the Llama
+                            // pipeline) long before this slider's value could ever bind — showing
+                            // it un-gated offered a number the model could structurally never
+                            // reach, e.g. "512 tokens" sitting next to a model capped at 128 total.
+                            if llmManager.activeBackend == .coreML {
+                                Text("Reply length for this Core ML model is bounded by its context window above, not by a separate output limit.")
+                                    .font(.system(size: 11))
+                                    .foregroundColor(Theme.textMuted)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            } else {
                             VStack(alignment: .leading, spacing: 8) {
                                 HStack {
                                     Text("Max Output Limit:")
@@ -437,14 +524,15 @@ struct SettingsView: View {
                                         .font(.system(size: 13, weight: .bold, design: .monospaced))
                                         .foregroundColor(Theme.accent)
                                 }
-                                
+
                                 Slider(value: Binding(
                                     get: { Double(llmManager.maxTokens) },
                                     set: { llmManager.maxTokens = Int($0) }
                                 ), in: 64...8192, step: 128)
                                 .accentColor(Theme.accent)
                             }
-                            
+                            }
+
                             Divider().background(Theme.border)
                             
                             VStack(alignment: .leading, spacing: 8) {
@@ -1041,6 +1129,7 @@ struct SettingsView: View {
 
             .onAppear {
                 refreshModelList()
+                refreshCoreMLModelList()
             }
             // Lives at the root rather than on the download screen itself, since that screen is
             // torn down the moment the user navigates back — a download that finishes while
@@ -1049,6 +1138,7 @@ struct SettingsView: View {
             .onChange(of: downloads.lastCompletedModelID) { _, newValue in
                 guard newValue != nil else { return }
                 refreshModelList()
+                refreshCoreMLModelList()
                 loadDiffusionModels()
             }
         }
@@ -1195,12 +1285,36 @@ struct SettingsView: View {
     /// pushes to `modelDownloadScreen`, which holds the catalog list itself. Reflects an
     /// in-progress download for this `kind` even while collapsed, so leaving the download
     /// screen doesn't hide the fact that a transfer is still running.
+    private func tint(for kind: ModelKind) -> Color {
+        switch kind {
+        case .chat: return Theme.accentCyan
+        case .diffusion: return Color.purple
+        case .coreML: return Theme.accentCyan
+        }
+    }
+
+    private func browseIcon(for kind: ModelKind) -> String {
+        switch kind {
+        case .chat: return "arrow.down.circle.fill"
+        case .diffusion: return "photo.badge.arrow.down.fill"
+        case .coreML: return "cpu.fill"
+        }
+    }
+
+    private func displayName(for kind: ModelKind) -> String {
+        switch kind {
+        case .chat: return "Chat"
+        case .diffusion: return "Diffusion"
+        case .coreML: return "Core ML"
+        }
+    }
+
     @ViewBuilder
     private func downloadCatalogButton(for kind: ModelKind) -> some View {
         // Downloads run concurrently, so more than one of this `kind` can be active at once —
         // the collapsed row aggregates them by bytes rather than trying to name just one.
         let activeForKind = downloads.activeDownloads.values.filter { $0.kind == kind }
-        let tint: Color = kind == .chat ? Theme.accentCyan : Color.purple
+        let tint = tint(for: kind)
         let downloadableCount = ModelCatalog.models(for: kind).filter { !downloads.isInstalled($0) }.count
 
         NavigationLink {
@@ -1215,12 +1329,12 @@ struct SettingsView: View {
                 .id(kind)
         } label: {
             HStack(spacing: 10) {
-                Image(systemName: kind == .chat ? "arrow.down.circle.fill" : "photo.badge.arrow.down.fill")
+                Image(systemName: browseIcon(for: kind))
                     .foregroundColor(tint)
                     .font(.system(size: 16))
                 VStack(alignment: .leading, spacing: 2) {
                     Text(activeForKind.isEmpty
-                         ? "Browse \(kind == .chat ? "Chat" : "Diffusion") Models"
+                         ? "Browse \(displayName(for: kind)) Models"
                          : (activeForKind.count == 1 ? "Downloading…" : "Downloading \(activeForKind.count)…"))
                         .font(.system(size: 13, weight: .semibold))
                         .foregroundColor(Theme.textPrimary)
@@ -1263,7 +1377,7 @@ struct SettingsView: View {
                     .padding()
             }
         }
-        .navigationTitle(kind == .chat ? "Chat Models" : "Diffusion Models")
+        .navigationTitle("\(displayName(for: kind)) Models")
         .navigationBarTitleDisplayMode(.inline)
     }
 
@@ -1483,7 +1597,81 @@ struct SettingsView: View {
         .background(Theme.background.opacity(0.4))
         .cornerRadius(10)
     }
-    
+
+    /// Simplified counterpart to `modelRow` for a Core ML package. Load skips straight to
+    /// `llmManager.loadModel`, which routes anything installed under `AppFiles.coreMLModels` to
+    /// `loadCoreMLModel` internally by checking the parent directory — not, as this used to say,
+    /// by checking for a `.mlpackage` extension, which only ever matched `SingleWindowCoreMLEngine`'s
+    /// own single-file install shape and silently missed the newer chunked-pipeline models that
+    /// install as a plain-named directory instead. `loadCoreMLModel` has its own memory pre-flight
+    /// now too (see its doc comment) — no separate tag needed here the way `modelRow` has one.
+    @ViewBuilder
+    private func coreMLModelRow(for url: URL) -> some View {
+        let sizeGB = AppFiles.directorySizeGB(at: url)
+        let isLoaded = isCurrentModel(url: url)
+
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(url.lastPathComponent)
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundColor(Theme.textPrimary)
+                    .lineLimit(1)
+                Text(String(format: "%.2f GB · ANE", sizeGB))
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundColor(Theme.textSecondary)
+            }
+
+            Spacer()
+
+            HStack(spacing: 8) {
+                if !isLoaded {
+                    Button(action: { deleteCoreMLModel(at: url) }) {
+                        Image(systemName: "trash")
+                            .font(.system(size: 12))
+                            .foregroundColor(Theme.textSecondary)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(Theme.border)
+                            .cornerRadius(8)
+                    }
+                }
+
+                if isLoaded {
+                    Button(action: { llmManager.unloadModel() }) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "eject.fill")
+                                .font(.system(size: 10))
+                            Text("UNLOAD")
+                                .font(.system(size: 11, weight: .bold))
+                        }
+                        .foregroundColor(.red.opacity(0.9))
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(Color.red.opacity(0.08))
+                        .cornerRadius(8)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8)
+                                .stroke(Color.red.opacity(0.35), lineWidth: 1)
+                        )
+                    }
+                } else {
+                    Button(action: { llmManager.loadModel(at: url) }) {
+                        Text("Load")
+                            .font(.system(size: 12, weight: .bold))
+                            .foregroundColor(Theme.textPrimary)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 6)
+                            .background(Theme.border)
+                            .cornerRadius(8)
+                    }
+                }
+            }
+        }
+        .padding(10)
+        .background(Theme.background.opacity(0.4))
+        .cornerRadius(10)
+    }
+
     @ViewBuilder
     private func safetyTag(for safety: MemorySafetyStatus) -> some View {
         switch safety {
@@ -1579,7 +1767,33 @@ struct SettingsView: View {
         importedModels = AppFiles.contents(of: AppFiles.models, matchingExtensions: ["gguf"])
         storageUsedGB = AppFiles.totalUsedGB()
     }
-    
+
+    /// Unlike `.chat`/`.diffusion`, Core ML models are catalog-only — there is no "import an
+    /// arbitrary file" path for them (see `ModelKind`'s doc comment) — so the installed list is
+    /// derived from the catalog plus `ModelDownloadManager.isInstalled`, not a filesystem scan.
+    /// A blind extension filter (the previous approach: `matchingExtensions: ["mlpackage"]`)
+    /// silently dropped any installed model whose root isn't literally a `.mlpackage` directory —
+    /// which every chunked pipeline model is, since it installs as a plain-named folder of several
+    /// `.mlmodelc` bundles, not a single `.mlpackage`.
+    private func refreshCoreMLModelList() {
+        let installDirectory = ModelDownloadManager.installDirectory(for: .coreML)
+        importedCoreMLModels = ModelCatalog.coreMLModels
+            .filter { ModelDownloadManager.shared.isInstalled($0) }
+            .map { installDirectory.appendingPathComponent($0.fileName) }
+    }
+
+    private func deleteCoreMLModel(at url: URL) {
+        do {
+            if FileManager.default.fileExists(atPath: url.path) {
+                try FileManager.default.removeItem(at: url)
+            }
+            ModelInventory.shared.forget(fileName: url.lastPathComponent, kind: .coreML)
+            refreshCoreMLModelList()
+        } catch {
+            print("Failed to delete Core ML model: \(error.localizedDescription)")
+        }
+    }
+
     private func deleteModel(at url: URL, isDiffusion: Bool) {
         do {
             if FileManager.default.fileExists(atPath: url.path) {

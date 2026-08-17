@@ -10,6 +10,11 @@ struct DarkAIApp: App {
     @StateObject private var appearance = AppearanceManager.shared
 
     init() {
+        // First, unconditionally — it installs the signal/exception handlers. Everything below
+        // is real file I/O (directory creation, enumerating and validating every model on disk)
+        // and a crash inside any of it needs to be caught same as a crash during model loading;
+        // running this after that I/O left exactly those crashes invisible to the reporter.
+        CrashReporter.start()
         AppFiles.prepare()
         // Compares the record of what was installed against what is actually on disk. Model files
         // are excluded from iCloud backup by design, so a restore or device transfer brings the
@@ -17,10 +22,6 @@ struct DarkAIApp: App {
         // deleted my model" into a named model with a re-download button. See `ModelInventory`.
         ModelInventory.shared.reconcile()
         AppAppearance.configure()
-        // Must run before anything heavy: it recovers whatever the previous run left behind and
-        // arms the handlers for this one, and a crash during model loading is exactly the case
-        // it exists to catch.
-        CrashReporter.start()
     }
 
     /// Re-gate an existing user when the acceptable-use policy or terms change materially.

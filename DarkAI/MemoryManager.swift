@@ -62,9 +62,19 @@ class MemoryManager: ObservableObject {
     // MARK: - Persistence
 
     func loadMemories() {
-        if let data = UserDefaults.standard.data(forKey: storageKey),
-           let decoded = try? JSONDecoder().decode([Memory].self, from: data) {
-            memories = decoded
+        if let data = UserDefaults.standard.data(forKey: storageKey) {
+            if let decoded = try? JSONDecoder().decode([Memory].self, from: data) {
+                memories = decoded
+                return
+            }
+            // Data existed but couldn't be decoded, e.g. a future non-additive schema change.
+            // Falling through to an empty list is still the only real option, but doing so with
+            // no trace at all is what turns a legitimate schema change into what reads as
+            // inexplicable, silent data loss. Raw bytes left in place at `storageKey` rather than
+            // cleared, in case they're worth inspecting later — the legacy migration below is
+            // skipped either way, since `data` being present at all means this device has already
+            // migrated past the legacy key once.
+            LogManager.shared.log("MemoryManager: found \(data.count) bytes of stored memories but failed to decode them — starting fresh rather than losing them silently")
             return
         }
         // One-time migration from the flat string list. Everything comes across as a preference
