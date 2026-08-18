@@ -34,16 +34,6 @@ nonisolated struct ModelProfile {
     let trainedContext: Int
     let vocabSize: Int
 
-    /// K and V elements cached per token across every layer.
-    var kvElementsPerToken: Double {
-        Double(nLayer * nHeadKV) * Double(headDimK + headDimV)
-    }
-
-    /// A quantised cache needs each head dimension to divide evenly into the 32-element block.
-    var supportsQuantizedKVCache: Bool {
-        headDimK > 0 && headDimV > 0 && headDimK % 32 == 0 && headDimV % 32 == 0
-    }
-
     /// Whether the geometry is complete enough to budget a KV cache from.
     var hasUsableGeometry: Bool { nLayer > 0 && nHeadKV > 0 && headDimK > 0 && headDimV > 0 }
 
@@ -70,18 +60,6 @@ nonisolated struct ModelProfile {
     /// used before this was read from the file.
     let routedFraction: Double
 
-    var isMixtureOfExperts: Bool { !expertGBByLayer.isEmpty }
-
-    /// Bytes held by routed experts across every block.
-    var expertGB: Double { expertGBByLayer.values.reduce(0, +) }
-
-    /// Everything that is not a routed expert: attention, norms, the router itself, token
-    /// embeddings, the output projection, and any shared/always-on expert. Every token needs
-    /// all of it, so this is the part that has to stay resident to keep the model usable.
-    var denseGB: Double { max(0, totalGB - expertGB) }
-
-    /// Every block that has routed experts, in order.
-    var expertLayers: [Int] { expertGBByLayer.keys.sorted() }
 }
 
 /// Reads `ModelProfile`s, cached by file identity.
@@ -228,6 +206,16 @@ nonisolated enum ModelProfiler {
         return String(cString: gguf_get_val_str(ctx, id))
     }
 
+    /// Block index for any tensor belonging to a transformer block, e.g. `blk.12.attn_q.weight`
+    /// → 12 — unlike `expertLayerIndex`, this doesn't care what role the tensor plays within the
+    /// block, only which block it belongs to.
+    private static func blockLayerIndex(in name: String) -> Int? {
+        guard name.hasPrefix("blk.") else { return nil }
+        let parts = name.split(separator: ".")
+        guard parts.count >= 2, let layer = Int(parts[1]) else { return nil }
+        return layer
+    }
+
     /// Block index for a routed-expert FFN tensor, e.g. `blk.12.ffn_up_exps.weight` → 12.
     ///
     /// Matched against an explicit list rather than by looking for `exps` anywhere in the name,
@@ -243,16 +231,6 @@ nonisolated enum ModelProfiler {
     /// asymmetric: omitting a genuine expert only forgoes some memory that could have been
     /// streamed, while including a tensor every token needs would silently under-budget the
     /// load. If a model using that form ever needs support, confirm what it is first.
-    /// Block index for any tensor belonging to a transformer block, e.g. `blk.12.attn_q.weight`
-    /// → 12 — unlike `expertLayerIndex`, this doesn't care what role the tensor plays within the
-    /// block, only which block it belongs to.
-    private static func blockLayerIndex(in name: String) -> Int? {
-        guard name.hasPrefix("blk.") else { return nil }
-        let parts = name.split(separator: ".")
-        guard parts.count >= 2, let layer = Int(parts[1]) else { return nil }
-        return layer
-    }
-
     private static func expertLayerIndex(in name: String) -> Int? {
         guard name.hasPrefix("blk.") else { return nil }
         let parts = name.split(separator: ".")

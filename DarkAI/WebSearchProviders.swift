@@ -35,6 +35,17 @@ protocol WebSearchProvider {
     func search(query: String) async throws -> WebSearchResult
 }
 
+/// Validates an HTTP response's status code — matches the check `BraveSearchProvider` already
+/// did on its own. The other providers below called straight through to `JSONDecoder`/
+/// `XMLParser` without this, so a 4xx/5xx or rate-limited response that happened to decode (or
+/// simply failed to decode) was indistinguishable in the log from an honest "no results," masking
+/// real outages/throttling.
+private func validateHTTPStatus(_ response: URLResponse) throws {
+    guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+        throw WebSearchProviderError.invalidResponse
+    }
+}
+
 // MARK: - Open-Meteo (weather, keyless)
 
 /// Free, keyless weather lookup. Two calls against the same free service: Open-Meteo's own
@@ -79,7 +90,8 @@ struct OpenMeteoProvider: WebSearchProvider {
             URLQueryItem(name: "wind_speed_unit", value: "mph")
         ]
         guard let forecastURL = forecastComponents.url else { throw WebSearchProviderError.invalidResponse }
-        let (forecastData, _) = try await URLSession.shared.data(from: forecastURL)
+        let (forecastData, forecastResponse) = try await URLSession.shared.data(from: forecastURL)
+        try validateHTTPStatus(forecastResponse)
         let forecast = try JSONDecoder().decode(ForecastResponse.self, from: forecastData)
         guard let current = forecast.current else {
             throw WebSearchProviderError.invalidResponse
@@ -130,7 +142,8 @@ struct OpenMeteoProvider: WebSearchProvider {
             URLQueryItem(name: "count", value: "5")
         ]
         guard let url = components.url else { throw WebSearchProviderError.invalidResponse }
-        let (data, _) = try await URLSession.shared.data(from: url)
+        let (data, response) = try await URLSession.shared.data(from: url)
+        try validateHTTPStatus(response)
         let decoded = try JSONDecoder().decode(GeocodeResponse.self, from: data)
         guard let results = decoded.results, !results.isEmpty else {
             throw WebSearchProviderError.noResults
@@ -200,7 +213,8 @@ struct DuckDuckGoInstantAnswerProvider: WebSearchProvider {
             URLQueryItem(name: "skip_disambig", value: "1")
         ]
         guard let url = components.url else { throw WebSearchProviderError.invalidResponse }
-        let (data, _) = try await URLSession.shared.data(from: url)
+        let (data, response) = try await URLSession.shared.data(from: url)
+        try validateHTTPStatus(response)
         let decoded = try JSONDecoder().decode(Response.self, from: data)
 
         if let abstract = decoded.AbstractText, !abstract.isEmpty {
@@ -308,7 +322,8 @@ nonisolated struct GoogleNewsProvider: WebSearchProvider {
         ])
 
         guard let url = components.url else { throw WebSearchProviderError.invalidResponse }
-        let (data, _) = try await URLSession.shared.data(from: url)
+        let (data, response) = try await URLSession.shared.data(from: url)
+        try validateHTTPStatus(response)
 
         let parserDelegate = FeedParser()
         let parser = XMLParser(data: data)
@@ -387,7 +402,8 @@ struct WikipediaProvider: WebSearchProvider {
         request.setValue("\(AppInfo.displayName)/\(AppInfo.version) (on-device iOS app)",
                          forHTTPHeaderField: "User-Agent")
 
-        let (data, _) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        try validateHTTPStatus(response)
         let decoded = try JSONDecoder().decode(Response.self, from: data)
 
         let pages = (decoded.query?.pages?.values).map { Array($0) } ?? []

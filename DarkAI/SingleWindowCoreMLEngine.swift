@@ -187,6 +187,19 @@ actor SingleWindowCoreMLEngine: CoreMLEngine {
             onContextTruncated()
         }
 
+        // Allocated once and reused for every step below, instead of a fresh `MLMultiArray` (plus
+        // 128 individually NSNumber-boxed subscript writes) on every single generated token — the
+        // window is the same fixed shape for the whole call, so there's nothing per-token about
+        // this allocation except its contents.
+        let inputArray: MLMultiArray
+        do {
+            inputArray = try MLMultiArray(shape: [1, NSNumber(value: windowSize)], dataType: .int32)
+        } catch {
+            continuation.yield("[Error: \(error.localizedDescription)]")
+            continuation.finish()
+            return
+        }
+
         var generatedCount = 0
         var hitWindowCeiling = false
         while generatedCount < maxTokens {
@@ -195,7 +208,7 @@ actor SingleWindowCoreMLEngine: CoreMLEngine {
 
             let nextTokenId: Int32
             do {
-                nextTokenId = try predict(model: model, tokens: tokens)
+                nextTokenId = try await predict(model: model, tokens: tokens, inputArray: inputArray)
             } catch {
                 Task { @MainActor in
                     LogManager.shared.log("SingleWindowCoreMLEngine: prediction failed — \(error.localizedDescription)")
@@ -227,15 +240,23 @@ actor SingleWindowCoreMLEngine: CoreMLEngine {
     /// One forward pass over the current (padded-to-128) window, returning the sampled next
     /// token. Every call recomputes the whole window — there is no cache to extend — which is
     /// expected and fine at this model's size; see the type-level doc comment.
-    private func predict(model: MLModel, tokens: [Int32]) throws -> Int32 {
+    ///
+    /// `inputArray` is caller-owned and reused across every step of one `generateStream` call
+    /// (see there) — written here via a raw buffer pointer rather than 128 per-call NSNumber
+    /// subscript writes. Uses the async `prediction(from:options:)` rather than the synchronous
+    /// `prediction(from:)`, matching `ChunkedPipelineCoreMLEngine`: the synchronous call blocks
+    /// this actor's executor for the full inference duration on every token, which also delays a
+    /// queued `requestCancel()` until the in-flight prediction returns.
+    private func predict(model: MLModel, tokens: [Int32], inputArray: MLMultiArray) async throws -> Int32 {
         let windowSize = Self.fixedSequenceLength
-        let inputArray = try MLMultiArray(shape: [1, NSNumber(value: windowSize)], dataType: .int32)
-        for i in 0..<windowSize {
-            inputArray[i] = NSNumber(value: i < tokens.count ? tokens[i] : 0)
+        inputArray.withUnsafeMutableBufferPointer(ofType: Int32.self) { buffer, _ in
+            for i in 0..<windowSize {
+                buffer[i] = i < tokens.count ? tokens[i] : 0
+            }
         }
 
         let input = try MLDictionaryFeatureProvider(dictionary: ["input_ids": inputArray])
-        let output = try model.prediction(from: input)
+        let output = try await model.prediction(from: input, options: MLPredictionOptions())
         guard let logits = output.featureValue(for: "logits")?.multiArrayValue else {
             throw RunnerError.predictionFailed
         }

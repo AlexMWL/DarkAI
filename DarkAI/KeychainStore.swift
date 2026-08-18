@@ -31,18 +31,29 @@ enum KeychainStore {
         }
         guard let data = value.data(using: .utf8) else { return }
 
-        // Delete-then-add rather than update: simpler than handling the "does an entry already
-        // exist" branch, and this is called rarely (a settings field, not a hot path).
-        SecItemDelete(query(forKey: key) as CFDictionary)
-
-        var attributes = query(forKey: key)
-        attributes[kSecValueData as String] = data
-        // Available as soon as the user unlocks the device once after a restart, but not
-        // before — matches how the rest of the app's data is only meaningful once the user is
-        // actively using the phone, and avoids requiring "always available" access for a value
-        // that's never touched from a background context.
-        attributes[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
-        SecItemAdd(attributes as CFDictionary, nil)
+        // Update-in-place when an entry already exists, add only when it doesn't — rather than
+        // the simpler delete-then-add, which has a real (if narrow) race: if `set` were ever
+        // called concurrently for the same key, delete-then-add can interleave and leave the
+        // entry deleted, or written by the "wrong" caller. `SecItemUpdate`/`SecItemAdd` each do
+        // their one operation atomically at the Keychain layer, so there's no window where the
+        // entry doesn't exist between a delete and the following add.
+        let updateAttributes: [String: Any] = [kSecValueData as String: data]
+        let updateStatus = SecItemUpdate(query(forKey: key) as CFDictionary, updateAttributes as CFDictionary)
+        if updateStatus == errSecItemNotFound {
+            var attributes = query(forKey: key)
+            attributes[kSecValueData as String] = data
+            // Available as soon as the user unlocks the device once after a restart, but not
+            // before — matches how the rest of the app's data is only meaningful once the user is
+            // actively using the phone, and avoids requiring "always available" access for a value
+            // that's never touched from a background context.
+            attributes[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
+            let addStatus = SecItemAdd(attributes as CFDictionary, nil)
+            if addStatus != errSecSuccess {
+                LogManager.shared.log("KeychainStore: SecItemAdd failed for key '\(key)' — status \(addStatus)")
+            }
+        } else if updateStatus != errSecSuccess {
+            LogManager.shared.log("KeychainStore: SecItemUpdate failed for key '\(key)' — status \(updateStatus)")
+        }
     }
 
     static func get(forKey key: String) -> String? {
@@ -57,6 +68,11 @@ enum KeychainStore {
     }
 
     static func delete(forKey key: String) {
-        SecItemDelete(query(forKey: key) as CFDictionary)
+        let status = SecItemDelete(query(forKey: key) as CFDictionary)
+        // errSecItemNotFound just means there was nothing to delete — every `set(nil, ...)` call
+        // on an already-empty key hits this, so it's not a real failure worth logging.
+        if status != errSecSuccess && status != errSecItemNotFound {
+            LogManager.shared.log("KeychainStore: SecItemDelete failed for key '\(key)' — status \(status)")
+        }
     }
 }

@@ -71,11 +71,6 @@ final class ContentReportManager: ObservableObject {
         return report
     }
 
-    func delete(_ report: ContentReport) {
-        reports.removeAll { $0.id == report.id }
-        save()
-    }
-
     func clearAll() {
         reports.removeAll()
         save()
@@ -102,19 +97,8 @@ final class ContentReportManager: ObservableObject {
         \(report.note.isEmpty ? "(none)" : report.note)
 
         Content excerpt:
-        \(report.excerpt.isEmpty ? "(image — not included)" : report.excerpt)
+        \(report.wasImage ? "(image — not included)" : report.excerpt)
         """
-    }
-
-    /// `mailto:` fallback for devices with no configured Mail account, where
-    /// `MFMailComposeViewController` refuses to present.
-    func mailtoURL(for report: ContentReport) -> URL? {
-        var components = URLComponents(string: "mailto:\(AppInfo.supportEmail)")
-        components?.queryItems = [
-            URLQueryItem(name: "subject", value: mailSubject(for: report)),
-            URLQueryItem(name: "body", value: mailBody(for: report))
-        ]
-        return components?.url
     }
 }
 

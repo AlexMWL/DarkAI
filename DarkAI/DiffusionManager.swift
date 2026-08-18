@@ -1,11 +1,6 @@
 import Foundation
 import Combine
 import UIKit
-import Darwin
-// LlamaSwift is imported for future llama_generate_image() integration.
-// The current lumina2 architecture is NOT registered in llama.cpp b9837,
-// so we use a pure-Swift GGUF validator instead of llama_model_load_from_file.
-import LlamaSwift
 
 // MARK: - Diffusion Load State
 
@@ -26,11 +21,6 @@ enum DiffusionLoadState: Equatable {
 
     var isLoaded: Bool {
         if case .loaded = self { return true }
-        return false
-    }
-
-    var isLoading: Bool {
-        if case .loading = self { return true }
         return false
     }
 }
@@ -139,13 +129,23 @@ class DiffusionManager: ObservableObject {
     private(set) var isCancelled = false
 
     // MARK: Persisted Settings
-    @Published var steps: Int = UserDefaults.standard.object(forKey: "diffusionSteps") as? Int ?? 20 {
+    //
+    // Clamped/validated against the exact ranges the Settings sliders and resolution picker
+    // offer (SettingsView.swift: steps 4...50, CFG 1.0...12.0, output one of 256/512/768) —
+    // currently the sole writer, but a stale or hand-edited UserDefaults value would otherwise
+    // reach the native engine unclamped.
+    @Published var steps: Int = (UserDefaults.standard.object(forKey: "diffusionSteps") as? Int)
+        .map { min(max($0, 4), 50) } ?? 20 {
         didSet { UserDefaults.standard.set(steps, forKey: "diffusionSteps") }
     }
-    @Published var cfgScale: Double = UserDefaults.standard.object(forKey: "diffusionCFG") as? Double ?? 7.0 {
+    @Published var cfgScale: Double = (UserDefaults.standard.object(forKey: "diffusionCFG") as? Double)
+        .map { min(max($0, 1.0), 12.0) } ?? 7.0 {
         didSet { UserDefaults.standard.set(cfgScale, forKey: "diffusionCFG") }
     }
-    @Published var outputSize: Int = UserDefaults.standard.object(forKey: "diffusionSize") as? Int ?? 512 {
+    @Published var outputSize: Int = {
+        let stored = UserDefaults.standard.object(forKey: "diffusionSize") as? Int
+        return [256, 512, 768].contains(stored ?? 512) ? (stored ?? 512) : 512
+    }() {
         didSet { UserDefaults.standard.set(outputSize, forKey: "diffusionSize") }
     }
     // Reconstructed from the current DiffusionModels directory + a stored filename rather
@@ -497,9 +497,12 @@ class DiffusionManager: ObservableObject {
         return Double(sz) / (1024.0 * 1024.0 * 1024.0)
     }
 
-    /// Parsed resident sizes, keyed by path. The Settings list re-evaluates every row on each
-    /// render, and each miss reads a multi-megabyte header — without this the picker would
-    /// re-parse every checkpoint on screen on every layout pass.
+    /// Parsed resident sizes, keyed by path *and* file size. The Settings list re-evaluates every
+    /// row on each render, and each miss reads a multi-megabyte header — without this the picker
+    /// would re-parse every checkpoint on screen on every layout pass. Folding file size into the
+    /// key (not just the path) is what lets a re-imported checkpoint under a reused filename
+    /// self-invalidate: a genuinely different file overwriting the same path almost always has a
+    /// different size, so the stale entry simply misses instead of being served forever.
     private var residentSizeCache: [String: Double] = [:]
 
     /// What the weights will actually occupy in RAM — the number every memory decision should
@@ -514,8 +517,9 @@ class DiffusionManager: ObservableObject {
     /// Falls back to file size when the format can't be inspected, which is the right answer
     /// for GGUF (already ggml-native types, so nothing expands) and for plain F16 safetensors.
     func effectiveWeightSizeGB(at url: URL) -> Double {
-        if let cached = residentSizeCache[url.path] { return cached }
         let fileSizeGB = getFileSizeGB(at: url)
+        let cacheKey = "\(url.path)|\(fileSizeGB)"
+        if let cached = residentSizeCache[cacheKey] { return cached }
         var resolved = fileSizeGB
         if let bytes = GGUFValidator.residentWeightBytes(path: url.path) {
             let residentGB = Double(bytes) / (1024.0 * 1024.0 * 1024.0)
@@ -530,7 +534,7 @@ class DiffusionManager: ObservableObject {
                 ))
             }
         }
-        residentSizeCache[url.path] = resolved
+        residentSizeCache[cacheKey] = resolved
         return resolved
     }
 

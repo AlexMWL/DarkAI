@@ -136,12 +136,6 @@ enum CrashReporter {
     /// encoder while Juggernaut XL v9 was loaded" — only the second one identifies a checkpoint
     /// worth reproducing against. Persisted rather than captured at crash time because a signal
     /// handler can't safely read Swift state.
-    static func noteLoadedModels(chat: String?, diffusion: String?) {
-        guard isEnabled else { return }
-        UserDefaults.standard.set(chat, forKey: chatModelKey)
-        UserDefaults.standard.set(diffusion, forKey: diffusionModelKey)
-    }
-
     static func noteChatModel(_ name: String?) {
         guard isEnabled else { return }
         UserDefaults.standard.set(name, forKey: chatModelKey)

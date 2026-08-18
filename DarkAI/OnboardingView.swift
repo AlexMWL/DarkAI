@@ -17,7 +17,10 @@ struct OnboardingView: View {
     @AppStorage("acceptedPolicyVersion") private var acceptedPolicyVersion = 0
     @AppStorage("ageConfirmed") private var ageConfirmed = false
 
-    @StateObject private var downloads = ModelDownloadManager.shared
+    // `@ObservedObject`, not `@StateObject`: this view doesn't own `ModelDownloadManager`'s
+    // lifecycle — `.shared` always returns the same instance regardless of which wrapper reads
+    // it, and `@StateObject` implies ownership that isn't real here.
+    @ObservedObject private var downloads = ModelDownloadManager.shared
 
     @State private var page = 0
     @State private var agreedToPolicies = false
@@ -202,6 +205,11 @@ struct OnboardingView: View {
 
     private func catalogRow(_ model: CatalogModel) -> some View {
         let installed = downloads.isInstalled(model)
+        // Same device-fit badges Settings' own catalog row shows (see its `catalogRow` for the
+        // full reasoning on both figures) — this is the first, highest-stakes model choice, so it
+        // shouldn't get less guidance than the same choice made later from Settings.
+        let fitsOnDevice = model.approxRuntimeGB < MemoryBudget.entitledGB
+        let meetsTier = MemoryBudget.physicalGB + 0.6 >= model.minimumRAMGB
         return HStack(spacing: 12) {
             VStack(alignment: .leading, spacing: 3) {
                 Text(model.displayName)
@@ -214,6 +222,17 @@ struct OnboardingView: View {
                     .font(.system(size: 11))
                     .foregroundColor(Theme.textSecondary)
                     .fixedSize(horizontal: false, vertical: true)
+                Text(meetsTier
+                     ? "Runs on this iPhone · recommended \(model.minimumDevice)"
+                     : "Recommended for \(model.minimumDevice)")
+                    .font(.system(size: 10, weight: meetsTier ? .regular : .semibold))
+                    .foregroundColor(meetsTier ? Theme.textMuted : .orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                if !fitsOnDevice {
+                    Text("May not run on this device — needs about \(String(format: "%.1f", model.approxRuntimeGB)) GB of memory.")
+                        .font(.system(size: 10))
+                        .foregroundColor(.orange)
+                }
             }
             Spacer(minLength: 8)
 

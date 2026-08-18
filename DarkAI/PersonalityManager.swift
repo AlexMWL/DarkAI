@@ -233,9 +233,6 @@ class PersonalityManager: ObservableObject {
         UserDefaults.standard.set(encoded, forKey: metricsKey)
     }
 
-    /// Messages observed for a model — drives the maturity readout in Settings.
-    var observedMessageCount: Int { styleMetrics.messageCount }
-    
     private func loadPersonalities() {
         personality = UserDefaults.standard.string(forKey: storageKey) ?? ""
         maturityScore = UserDefaults.standard.double(forKey: maturityKey)

@@ -496,6 +496,101 @@ final class ModelDownloadManager: NSObject, ObservableObject {
         configuration.waitsForConnectivity = true
         session = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
         resumableModelIDs = Self.savedResumableModelIDs()
+
+        // A background `URLSession` survives the app being killed and relaunched by iOS to
+        // deliver a finished or failed transfer — but a fresh launch starts with empty
+        // `tasksByModelID`/`modelsByTaskID` maps, and every delegate callback below depends on
+        // looking a task up in them. Without this, a task that finished (or was still running)
+        // while the app process was dead reports in to a delegate that doesn't recognize its
+        // `taskIdentifier` — `didFinishDownloadingTo` silently deletes the fully-downloaded file
+        // rather than installing it, on exactly the transfer where it matters most: one that took
+        // long enough to outlive the app process. Reattaching the survivors is what closes that
+        // gap. `getAllTasks` only ever returns tasks still running or suspended, never ones that
+        // already fully completed or were cancelled, so this can't resurrect anything stale.
+        session.getAllTasks { [weak self] tasks in
+            guard let self, !tasks.isEmpty else { return }
+            Task { @MainActor in
+                self.reattachSurvivingTasks(tasks)
+            }
+        }
+    }
+
+    /// Rebuilds this session's bookkeeping for whatever background tasks `getAllTasks` reports
+    /// are still alive — see the doc comment on `init()` for why this exists. Relies on
+    /// `taskDescription` (set at every task-creation site below) to recover which catalog model,
+    /// and for a `.coreML` multi-file download which specific file, each surviving task belongs
+    /// to; a task with no recognizable description (there shouldn't be any — nothing else in this
+    /// app uses this session) is left alone.
+    @MainActor
+    private func reattachSurvivingTasks(_ tasks: [URLSessionTask]) {
+        for task in tasks {
+            guard let downloadTask = task as? URLSessionDownloadTask,
+                  let description = task.taskDescription,
+                  let decoded = Self.decodeTaskDescription(description),
+                  let model = ModelCatalog.model(withID: decoded.modelID) else { continue }
+
+            tasksByModelID[model.id] = downloadTask
+            modelsByTaskID[downloadTask.taskIdentifier] = model
+
+            let received = max(0, downloadTask.countOfBytesReceived)
+            let expected = downloadTask.countOfBytesExpectedToReceive
+
+            if let relativePath = decoded.coreMLFileRelativePath,
+               let file = model.coreMLFiles.first(where: { $0.relativePath == relativePath }) {
+                currentCoreMLFile[downloadTask.taskIdentifier] = file
+
+                // Same disk scan `downloadCoreMLFiles` does at a fresh start, excluding the file
+                // this task is already fetching — rebuilds which files already landed so the
+                // queue behind this one (`startNextCoreMLFile`) still fires correctly once it
+                // finishes.
+                let installedPath = Self.installDirectory(for: model.kind).appendingPathComponent(model.fileName)
+                var completedBytes: Int64 = 0
+                var pending: [CoreMLPackageFile] = []
+                for candidate in model.coreMLFiles where candidate.relativePath != relativePath {
+                    let path = installedPath.appendingPathComponent(candidate.relativePath).path
+                    let size = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int64) ?? nil
+                    if let size, size == candidate.byteSize {
+                        completedBytes += candidate.byteSize
+                    } else {
+                        pending.append(candidate)
+                    }
+                }
+                pendingCoreMLFiles[model.id] = pending
+                completedCoreMLBytes[model.id] = completedBytes
+
+                let bytesWritten = completedBytes + received
+                activeDownloads[model.id] = Progress(
+                    modelID: model.id,
+                    kind: model.kind,
+                    fractionCompleted: model.byteSize > 0 ? min(1.0, Double(bytesWritten) / Double(model.byteSize)) : 0,
+                    bytesWritten: bytesWritten,
+                    totalBytes: model.byteSize
+                )
+            } else {
+                let total = expected > 0 ? expected : model.byteSize
+                activeDownloads[model.id] = Progress(
+                    modelID: model.id,
+                    kind: model.kind,
+                    fractionCompleted: total > 0 ? min(1.0, Double(received) / Double(total)) : 0,
+                    bytesWritten: received,
+                    totalBytes: total
+                )
+            }
+
+            LogManager.shared.log("ModelDownload: reattached surviving background task for \(model.displayName) after relaunch")
+        }
+    }
+
+    private static func encodeTaskDescription(modelID: String, coreMLFileRelativePath: String?) -> String {
+        guard let coreMLFileRelativePath else { return "model:\(modelID)" }
+        return "model:\(modelID)|file:\(coreMLFileRelativePath)"
+    }
+
+    private static func decodeTaskDescription(_ description: String) -> (modelID: String, coreMLFileRelativePath: String?)? {
+        guard description.hasPrefix("model:") else { return nil }
+        let parts = description.dropFirst("model:".count).components(separatedBy: "|file:")
+        guard let modelID = parts.first, !modelID.isEmpty else { return nil }
+        return (modelID, parts.count > 1 ? parts[1] : nil)
     }
 
     /// Whether anything at all is downloading — onboarding uses this to gate advancing past the
@@ -594,12 +689,20 @@ final class ModelDownloadManager: NSObject, ObservableObject {
 
         pendingCoreMLFiles[model.id] = pending
         completedCoreMLBytes[model.id] = completedBytes
+        // Resuming either because some files already verified complete on disk, or the next file
+        // to fetch has saved resume data from a prior mid-transfer interruption — either way this
+        // isn't a fresh start. Without this, `OnboardingView`/`SettingsView` (which both branch UI
+        // text on `progress.isResumed`, matching the single-file `start(_:resuming:)` path above)
+        // always showed "Downloading…" for a Core ML model even when genuinely resuming.
+        let isResumed = completedBytes > 0
+            || pending.first.map { Self.savedResumeData(forKey: Self.coreMLFileResumeKey(model: model, file: $0)) != nil } == true
         activeDownloads[model.id] = Progress(
             modelID: model.id,
             kind: model.kind,
             fractionCompleted: model.byteSize > 0 ? Double(completedBytes) / Double(model.byteSize) : 0,
             bytesWritten: completedBytes,
-            totalBytes: model.byteSize
+            totalBytes: model.byteSize,
+            isResumed: isResumed
         )
         LogManager.shared.log("ModelDownload: starting \(model.displayName) (\(pending.count) of \(model.coreMLFiles.count) files remaining)")
         startNextCoreMLFile(for: model)
@@ -631,6 +734,9 @@ final class ModelDownloadManager: NSObject, ObservableObject {
             task = session.downloadTask(with: request)
         }
         task.countOfBytesClientExpectsToReceive = file.byteSize
+        // Read back by `reattachSurvivingTasks` if this task outlives the app process — see
+        // `init()`'s doc comment.
+        task.taskDescription = Self.encodeTaskDescription(modelID: model.id, coreMLFileRelativePath: file.relativePath)
 
         tasksByModelID[model.id] = task
         modelsByTaskID[task.taskIdentifier] = model
@@ -682,6 +788,9 @@ final class ModelDownloadManager: NSObject, ObservableObject {
             LogManager.shared.log("ModelDownload: starting \(model.displayName) (\(model.sizeDescription))")
         }
         task.countOfBytesClientExpectsToReceive = model.byteSize
+        // Read back by `reattachSurvivingTasks` if this task outlives the app process — see
+        // `init()`'s doc comment.
+        task.taskDescription = Self.encodeTaskDescription(modelID: model.id, coreMLFileRelativePath: nil)
 
         tasksByModelID[model.id] = task
         modelsByTaskID[task.taskIdentifier] = model
@@ -745,8 +854,6 @@ final class ModelDownloadManager: NSObject, ObservableObject {
         resumableModelIDs.remove(model.id)
         LogManager.shared.log("ModelDownload: discarded partial download of \(model.displayName)")
     }
-
-    func clearError() { lastError = nil }
 
     // MARK: Resume state
 

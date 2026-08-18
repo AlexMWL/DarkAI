@@ -133,11 +133,6 @@ class ConversationManager: ObservableObject {
         }
     }
 
-    /// Whether the active conversation is currently excluded from disk.
-    var isActiveConversationPrivate: Bool {
-        activeConversation?.isPrivate ?? false
-    }
-    
     var activeConversation: Conversation? {
         conversations.first(where: { $0.id == activeConversationId })
     }
@@ -181,7 +176,6 @@ class ConversationManager: ObservableObject {
               let index = conversations.firstIndex(where: { $0.id == activeId }) else { return }
         conversations[index].messages.removeAll { $0.id == id }
         saveConversations()
-        objectWillChange.send()
     }
     
     /// `conversationId` defaults to whatever's currently active, but every call site reached
@@ -206,11 +200,9 @@ class ConversationManager: ObservableObject {
             }
             
             saveConversations()
-
-            objectWillChange.send()
         }
     }
-    
+
     /// Appends an assistant message offering to search the web, with the original user query
     /// attached via `pendingSearchQuery` so the confirm/decline buttons know what to act on.
     func addSearchOfferToActive(text: String, query: String) {
@@ -220,7 +212,6 @@ class ConversationManager: ObservableObject {
             msg.pendingSearchQuery = query
             conversations[index].messages.append(msg)
             saveConversations()
-            objectWillChange.send()
         }
     }
 
@@ -244,17 +235,6 @@ class ConversationManager: ObservableObject {
            !conversations[index].messages.isEmpty {
             let lastIndex = conversations[index].messages.count - 1
             conversations[index].messages[lastIndex].text = text
-        }
-    }
-
-    /// Appends a completed AI-generated image message to the active conversation.
-    func addImageMessageToActive(prompt: String, imageData: Data) {
-        guard let activeId = activeConversationId else { return }
-        if let index = conversations.firstIndex(where: { $0.id == activeId }) {
-            let msg = ChatMessage(isUser: false, text: prompt, imageData: imageData)
-            conversations[index].messages.append(msg)
-            saveConversations()
-            objectWillChange.send()
         }
     }
 

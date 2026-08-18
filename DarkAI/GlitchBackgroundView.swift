@@ -22,7 +22,18 @@ struct GlitchBackgroundView: View {
     /// actually is, by `readablePanel()`, rather than by washing out the whole backdrop.
     var scrimOpacity: Double = 0.2
 
-    let timer = Timer.publish(every: 0.1, on: .main, in: .common).autoconnect()
+    /// Set to `false` when this view is fully obscured (e.g. a sheet is presented over it) so the
+    /// glitch animation stops doing work it can't be seen doing — the timer keeps ticking either
+    /// way (see `timer` below), but the per-tick animation trigger is skipped.
+    var isActive: Bool = true
+
+    /// `@State`, not `let` — a `let` stored property is re-evaluated every time this struct is
+    /// reconstructed (i.e. on every parent body recomputation, which for `ContentView` happens on
+    /// every streamed token), which built a brand new `Timer.publish(...).autoconnect()` — and a
+    /// fresh `onReceive` subscription to it — on each redraw instead of the one timer this view is
+    /// meant to keep for its whole lifetime. `@State` gives it the same one-per-view-identity
+    /// lifetime everything else here already relies on.
+    @State private var timer = Timer.publish(every: 0.1, on: .main, in: .common).autoconnect()
 
     var body: some View {
         ZStack {
@@ -138,6 +149,7 @@ struct GlitchBackgroundView: View {
                 .allowsHitTesting(false)
         }
         .onReceive(timer) { _ in
+            guard isActive else { return }
             if Double.random(in: 0...1) > 0.85 {
                 withAnimation(.linear(duration: 0.05)) {
                     glitchOffset1 = CGFloat.random(in: -15...15)

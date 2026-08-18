@@ -1395,6 +1395,12 @@ actor LlamaRunner {
 class LLMManager: ObservableObject {
     @Published var loadState: ModelLoadState = .unloaded
     @Published var isGenerating: Bool = false
+    /// Set by `cancelGeneration()`, read (and expected to be reset) by the caller's `onComplete`
+    /// handler in `generateResponse`. Image cancellation already leaves an explicit
+    /// "[Image generation cancelled.]" marker in the chat; text cancellation used to just freeze
+    /// whatever had streamed so far with nothing distinguishing it from a normal, complete reply
+    /// — this is what lets the caller tell the two apart and mark the message accordingly.
+    private(set) var wasCancelled: Bool = false
     @Published var systemMemoryGB: Double = 0.0
     @Published var activeModelURL: URL? = nil
     @Published var generationSpeed: Double = 0.0
@@ -2117,6 +2123,7 @@ class LLMManager: ObservableObject {
         case .coreML: Task { await coreMLRunner.requestCancel() }
         }
         isGenerating = false
+        wasCancelled = true
     }
 
     // MARK: - Inference
@@ -2138,6 +2145,7 @@ class LLMManager: ObservableObject {
         }
 
         isGenerating = true
+        wasCancelled = false
 
         // Build System Context
         //
@@ -2300,7 +2308,10 @@ class LLMManager: ObservableObject {
                 // Infinite Loop Prevention — detect dot/space loops
                 let trimmed = accumulated.trimmingCharacters(in: CharacterSet(charactersIn: ". \n"))
                 if trimmed.isEmpty && elapsed > 5.0 && accumulated.count > 10 {
-                    await self.runner.requestCancel()
+                    switch backend {
+                    case .llamaCpp: await self.runner.requestCancel()
+                    case .coreML: await self.coreMLRunner.requestCancel()
+                    }
                     await MainActor.run {
                         onToken("\n[Loop detected. Stopping generation.]")
                         self.isGenerating = false
@@ -2314,7 +2325,10 @@ class LLMManager: ObservableObject {
                 // narrow dot/space case above. Throttled since it's O(period) per check.
                 if tokenCount % 8 == 0 && accumulated.count > 60 && elapsed > 3.0 {
                     if self.hasTrailingRepetition(accumulated) {
-                        await self.runner.requestCancel()
+                        switch backend {
+                        case .llamaCpp: await self.runner.requestCancel()
+                        case .coreML: await self.coreMLRunner.requestCancel()
+                        }
                         await MainActor.run {
                             onToken("\n[Repetition loop detected. Stopping generation.]")
                             self.isGenerating = false

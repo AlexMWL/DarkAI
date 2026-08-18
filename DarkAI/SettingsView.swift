@@ -18,9 +18,12 @@ struct SettingsView: View {
     @Binding var enableRAG: Bool
     @Binding var enableMemories: Bool
 
-    @StateObject private var downloads = ModelDownloadManager.shared
-    @StateObject private var appearance = AppearanceManager.shared
-    @StateObject private var inventory = ModelInventory.shared
+    // `@ObservedObject`, not `@StateObject`, for all three: this view doesn't own any of these
+    // managers' lifecycles — `.shared` always returns the same instance regardless of which
+    // wrapper reads it, and `@StateObject` implies ownership that isn't real here.
+    @ObservedObject private var downloads = ModelDownloadManager.shared
+    @ObservedObject private var appearance = AppearanceManager.shared
+    @ObservedObject private var inventory = ModelInventory.shared
 
     @State private var importedModels: [URL] = []
     @State private var importedCoreMLModels: [URL] = []
@@ -272,6 +275,7 @@ struct SettingsView: View {
                                                 .font(.system(size: 12, weight: .bold))
                                                 .foregroundColor(Theme.textSecondary)
                                         }
+                                        .accessibilityLabel("Dismiss")
                                     }
                                     Text(importError)
                                         .font(.system(size: 12))
@@ -355,7 +359,7 @@ struct SettingsView: View {
                                         Button(action: { diffusionManager.outputSize = size }) {
                                             Text("\(size)")
                                                 .font(.system(size: 12, weight: .bold, design: .monospaced))
-                                                .foregroundColor(diffusionManager.outputSize == size ? .white : Theme.textSecondary)
+                                                .foregroundColor(diffusionManager.outputSize == size ? Theme.onAccent : Theme.textSecondary)
                                                 .padding(.horizontal, 12)
                                                 .padding(.vertical, 6)
                                                 .background(
@@ -876,7 +880,7 @@ struct SettingsView: View {
                                 }
                             }
 
-                            Text("The app icon changes to match — light mode uses a light icon on your Home Screen.")
+                            Text("This changes the app's colors and text contrast. The Home Screen icon stays the same in every mode.")
                                 .font(.system(size: 11))
                                 .foregroundColor(Theme.textMuted)
                                 .lineSpacing(3)
@@ -1097,15 +1101,16 @@ struct SettingsView: View {
                     .font(.system(size: 16, weight: .bold))
                 }
             }
-            .alert(isPresented: $showContextWarningPopup) {
-                Alert(
-                    title: Text("High RAM Usage Warning"),
-                    message: Text("You have set the context window higher than the safe limit for your device's available memory.\n\nThis dramatically increases the chance iOS will kill the app (crash) due to memory pressure.\n\nAre you sure you want to proceed?"),
-                    primaryButton: .default(Text("Revert to Safe Limit")) {
-                        llmManager.contextTokenLimit = llmManager.safeContextLimit
-                    },
-                    secondaryButton: .destructive(Text("Ignore & Keep")) {}
-                )
+            // New-generation `.alert` form — matches `showInvalidFileTypeAlert` just below. Mixing
+            // the two generations of alert modifier on one view lets the last one silently win
+            // (see the same note in ContentView.swift), so both alerts on this view use this form.
+            .alert("High RAM Usage Warning", isPresented: $showContextWarningPopup) {
+                Button("Revert to Safe Limit") {
+                    llmManager.contextTokenLimit = llmManager.safeContextLimit
+                }
+                Button("Ignore & Keep", role: .destructive) {}
+            } message: {
+                Text("You have set the context window higher than the safe limit for your device's available memory.\n\nThis dramatically increases the chance iOS will kill the app (crash) due to memory pressure.\n\nAre you sure you want to proceed?")
             }
             .alert("Invalid File", isPresented: $showInvalidFileTypeAlert) {
                 Button("OK", role: .cancel) { }
@@ -1268,6 +1273,7 @@ struct SettingsView: View {
                                 .foregroundColor(Theme.textMuted)
                                 .frame(width: 28, height: 28)
                         }
+                        .accessibilityLabel("Dismiss")
                     }
                     .padding(10)
                     .background(Theme.cardBackground)
@@ -1833,6 +1839,13 @@ struct SettingsView: View {
             }
 
             do {
+                // Header-only check (magic bytes, version, a readable `general.architecture` key)
+                // — the same class of validation `validateDiffusionCheckpoint` already does for a
+                // manually imported diffusion checkpoint, which this chat-model import path never
+                // had. Catches a mislabeled or corrupt `.gguf` before it's copied in, rather than
+                // failing much later inside `LlamaRunner` with a less diagnostic error.
+                try GGUFValidator.validate(path: sourceURL.path)
+
                 let fileSizeGB = AppFiles.fileSizeGB(at: sourceURL)
                 let freeGB = AppFiles.availableDiskGB()
 
@@ -1982,6 +1995,11 @@ struct SettingsView: View {
                     // Reject an unusable checkpoint before spending a multi-gigabyte copy on it,
                     // and before it can reach the loader and abort the process.
                     try GGUFValidator.validateDiffusionCheckpoint(path: sourceURL.path)
+
+                    // Matches the GGUF import path's "Copying (keep the app open)..." — without
+                    // this, the row was stuck on "Checking…" for the whole multi-gigabyte copy,
+                    // which for a large SDXL checkpoint can be a real, silent-looking wait.
+                    await MainActor.run { diffusionImportProgress = "Copying (keep the app open)…" }
 
                     if FileManager.default.fileExists(atPath: destURL.path) {
                         try FileManager.default.removeItem(at: destURL)
@@ -2175,7 +2193,7 @@ private struct MindscapeDocumentRow: View {
             }
         }
         .padding()
-        .background(Color.black)
+        .background(Theme.cardBackground)
         .cornerRadius(12)
         .overlay(RoundedRectangle(cornerRadius: 12).stroke(Theme.border, lineWidth: 1))
     }
@@ -2326,6 +2344,7 @@ struct MindscapeView: View {
                             .font(.system(size: 11, weight: .bold))
                             .foregroundColor(Theme.textMuted)
                     }
+                    .accessibilityLabel("Dismiss")
                 }
                 .padding(12)
                 .background((importNote.isError ? Color.orange : Color.green).opacity(0.12))

@@ -8,12 +8,14 @@
 
 /* Begin PBXBuildFile section */
 		7A2D07A146BD83F60AB8384A /* StableDiffusion.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 9FB62EBDB1A141628BED757F /* StableDiffusion.xcframework */; };
+		C31857A102DF850F81D5CA0D /* CoreML.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = FB980549FCC4AE7A4D197457 /* CoreML.framework */; };
 		D46061302FF7273F0064DFE7 /* LlamaSwift in Frameworks */ = {isa = PBXBuildFile; productRef = D5B592C62FF1D16B00788D64 /* LlamaSwift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		9FB62EBDB1A141628BED757F /* StableDiffusion.xcframework */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = wrapper.xcframework; path = StableDiffusion.xcframework; sourceTree = "<group>"; };
 		D5B592AD2FF1D16900788D64 /* DarkAI.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = DarkAI.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		FB980549FCC4AE7A4D197457 /* CoreML.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreML.framework; path = System/Library/Frameworks/CoreML.framework; sourceTree = SDKROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -31,6 +33,7 @@
 			files = (
 				D46061302FF7273F0064DFE7 /* LlamaSwift in Frameworks */,
 				7A2D07A146BD83F60AB8384A /* StableDiffusion.xcframework in Frameworks */,
+				C31857A102DF850F81D5CA0D /* CoreML.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -41,6 +44,7 @@
 			isa = PBXGroup;
 			children = (
 				9FB62EBDB1A141628BED757F /* StableDiffusion.xcframework */,
+				FB980549FCC4AE7A4D197457 /* CoreML.framework */,
 			);
 			name = Frameworks;
 			sourceTree = "<group>";

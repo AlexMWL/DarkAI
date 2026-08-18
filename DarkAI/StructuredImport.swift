@@ -162,7 +162,15 @@ nonisolated enum StructuredImport {
         switch kind {
         case .studyGuide: return studyGuideOutcome(entries, title: title)
         case .journal:    return journalOutcome(entries, title: title)
-        case .transcript: return studyGuideOutcome(entries, title: title)   // unreachable via sniffing
+        case .transcript:
+            // `declaredKind` and `inferKind` above never produce `.transcript` — the only path to
+            // that case is the explicit schema-tag branch at the top of this function, which
+            // returns before reaching this switch at all. Enforced here, rather than left as a
+            // silent fallback, so a future change to either function that starts actually
+            // returning `.transcript` fails loudly in debug builds instead of quietly reusing the
+            // study-guide importer for transcript-shaped data.
+            assertionFailure("declaredKind/inferKind should never produce .transcript")
+            return studyGuideOutcome(entries, title: title)
         }
     }
 

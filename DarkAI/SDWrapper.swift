@@ -1,5 +1,4 @@
 import Foundation
-import Combine
 import UIKit
 import CoreGraphics
 
@@ -45,7 +44,14 @@ nonisolated class SDWrapper: @unchecked Sendable {
     ///   read against what was actually free at the time.
     /// - Parameter modelSizeGB: the checkpoint's own file size, logged for the same reason.
     func loadModel(modelPath: String, availableMemoryGB: Double, modelSizeGB: Double) throws {
-        unload()
+        // A refused unload means a generation is still in flight on the current context — if we
+        // pressed ahead here, the next line below would overwrite `sd_ctx` with the new model's
+        // pointer while that in-flight call still holds the old one, leaking it (nothing would
+        // ever call `free_sd_ctx` on it again) and leaving the app's idea of "loaded model"
+        // silently out of sync with what's actually still generating.
+        guard unload() else {
+            throw NSError(domain: "SDWrapper", code: 8, userInfo: [NSLocalizedDescriptionKey: "Can't switch models while an image is still generating."])
+        }
 
         let pathCStr = strdup(modelPath)
         defer { free(pathCStr) }
@@ -98,10 +104,18 @@ nonisolated class SDWrapper: @unchecked Sendable {
         // conditioning graph, preparing the text encoders, UNet, and VAE as each is needed
         // rather than making all 2.7 GB resident at once.
         ctxParams.enable_mmap = false
-        // Use 2 threads on iOS devices to keep peak RAM within limits during the denoising loop.
-        // Each extra thread requires additional working memory for intermediate ggml tensors.
-        // Reducing to 1 strictly limits the intermediate compute buffers.
-        ctxParams.n_threads = 2
+        // Scale thread count with the headroom `checkMemorySafety` already cleared this load
+        // against, instead of a flat 2 for every device. Each extra thread costs additional
+        // working memory for intermediate ggml tensors, so this stays conservative — it only
+        // grants more concurrency when `availableMemoryGB` shows real room for it — rather than
+        // maxing out `processorCount` outright.
+        let threadBudget: Int
+        switch availableMemoryGB {
+        case ..<1.5: threadBudget = 2
+        case ..<3.0: threadBudget = 3
+        default: threadBudget = 4
+        }
+        ctxParams.n_threads = Int32(min(ProcessInfo.processInfo.processorCount, threadBudget))
         
         // Disabled for both the text encoder AND the diffusion UNet. Flash Attention on this
         // Apple Silicon Metal backend can silently misalign/corrupt memory rather than throwing
@@ -260,17 +274,26 @@ nonisolated class SDWrapper: @unchecked Sendable {
         var numImages: Int32 = 0
         
         guard generate_image(ctx, &imgParams, &imgOut, &numImages), let imgPtr = imgOut, numImages > 0 else {
-            throw NSError(domain: "SDWrapper", code: 3, userInfo: [NSLocalizedDescriptionKey: "txt2img returned nil or failed."])
+            throw NSError(domain: "SDWrapper", code: 3, userInfo: [NSLocalizedDescriptionKey: "Image generation failed. Try again, or try a different prompt or checkpoint."])
         }
-        
+        // The library hands ownership of `imgPtr` (and each image's pixel buffer) to the caller —
+        // must be released via `free_sd_images` on every exit path, including the throws below.
+        defer { free_sd_images(imgPtr, numImages) }
+
         // imgPtr points to an array of sd_image_t.
         let imageStruct = imgPtr.pointee
         let widthU32 = imageStruct.width
         let heightU32 = imageStruct.height
         let channelU32 = imageStruct.channel
-        
+
         let totalBytes = Int(widthU32 * heightU32 * channelU32)
-        let pixelData = Data(bytes: imageStruct.data, count: totalBytes)
+        // `generate_image` returning true is not, on its own, a guarantee of a populated buffer —
+        // guard the pointer and size before copying rather than crashing on a null/short buffer
+        // from an otherwise "successful" native call.
+        guard let dataPtr = imageStruct.data, totalBytes > 0 else {
+            throw NSError(domain: "SDWrapper", code: 10, userInfo: [NSLocalizedDescriptionKey: "Generated image had no pixel data."])
+        }
+        let pixelData = Data(bytes: dataPtr, count: totalBytes)
         
         return try makeJPEG(from: pixelData, width: Int(widthU32), height: Int(heightU32), channels: Int(channelU32))
     }

@@ -149,6 +149,21 @@ final class ModelInventory: ObservableObject {
         for (url, kind) in discovered {
             let id = "\(kind.rawValue)/\(url.lastPathComponent)"
             guard !installed.contains(where: { $0.id == id }) else { continue }
+            let catalogModel = ModelCatalog.model(withFileName: url.lastPathComponent)
+
+            // A Core ML download moves each manifest file into its final directory as soon as
+            // *that file* finishes (unlike chat/diffusion downloads, which only move a file once
+            // fully verified) — so an interrupted multi-file Core ML download can legitimately
+            // leave a partial model directory sitting here. Adopting it as installed using only
+            // the bytes actually present would let a truncated model pass `loadCoreMLModel`'s
+            // memory pre-flight (which trusts this ledger's `byteSize`) with a falsely small
+            // size, only to fail later on missing files. Validate against the catalog's manifest
+            // the same way `ModelDownloadManager.isInstalled` does, and skip adoption — leaving
+            // it for the next completed download or a fresh reconcile — for anything that fails.
+            if kind == .coreML, let catalogModel, !ModelDownloadManager.shared.isInstalled(catalogModel) {
+                continue
+            }
+
             // `fileSizeKey` only describes a single file — a `.mlpackage` directory needs its
             // contents summed instead, or every adopted-but-untracked Core ML entry would record
             // as 0 bytes.
@@ -161,7 +176,7 @@ final class ModelInventory: ObservableObject {
             record(
                 fileName: url.lastPathComponent,
                 kind: kind,
-                catalogID: ModelCatalog.model(withFileName: url.lastPathComponent)?.id,
+                catalogID: catalogModel?.id,
                 byteSize: size
             )
         }
@@ -172,12 +187,6 @@ final class ModelInventory: ObservableObject {
     func dismiss(_ entry: InstalledModel) {
         missing.removeAll { $0.id == entry.id }
         installed.removeAll { $0.id == entry.id }
-        persist()
-    }
-
-    func dismissAllLosses() {
-        for entry in missing { installed.removeAll { $0.id == entry.id } }
-        missing.removeAll()
         persist()
     }
 

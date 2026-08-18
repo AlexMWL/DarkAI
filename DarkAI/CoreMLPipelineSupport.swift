@@ -13,7 +13,6 @@ import CoreVideo
 /// export bakes its window/context sizes into the model graph, so the only reliable source for
 /// them is the graph.
 nonisolated struct PipelineInferenceConfiguration {
-    let vocabSize: Int
     /// Query length — how many new tokens one forward pass through the chunks consumes at once.
     let inputLength: Int
     /// Key + value length the cache holds.
@@ -28,10 +27,11 @@ nonisolated struct PipelineInferenceConfiguration {
             .multiArrayConstraint?.shape.last?.intValue else { return nil }
         self.inputLength = inputLen
 
+        // Nothing here reads the resolved vocab size — only that the last chunk's logits output
+        // has the shape a language-modeling head is expected to have, as a load-time sanity check.
         let logitsDescription = last.modelDescription.outputDescriptionsByName["logits"]
             ?? last.modelDescription.outputDescriptionsByName["logits_0"]
-        guard let vocab = logitsDescription?.multiArrayConstraint?.shape.last?.intValue else { return nil }
-        self.vocabSize = vocab
+        guard logitsDescription?.multiArrayConstraint?.shape.last?.intValue != nil else { return nil }
 
         let innerModels = chunkModels[1..<chunkModels.count - 1]
         guard let firstInner = innerModels.first,
@@ -86,7 +86,12 @@ nonisolated final class PipelineArrayStore {
         self.outputBackingMapping = outputBackingMapping
     }
 
-    convenience init(chunkModels: [MLModel]) {
+    /// Fails (rather than crashing) when an IOSurface-backed tensor can't be allocated — the
+    /// same low-memory condition `emptyIOSurfaceArray` guards against with `CVPixelBufferCreate`
+    /// failures. Callers should treat `nil` as a generation-time load/allocation error, not force
+    /// it — this runs after `LLMManager.checkCoreMLMemorySafety` already gave a best-effort
+    /// clearance, but memory pressure can still shift between that check and this allocation.
+    convenience init?(chunkModels: [MLModel]) {
         var sharedArrays = [String: MLMultiArray]()
         var chunkArrays = [[String: MLMultiArray]]()
         let outputBackingMapping = ["new_x": "x"]
@@ -106,12 +111,14 @@ nonisolated final class PipelineArrayStore {
             let isShared: (String) -> Bool = { !$0.contains("cache") }
             for (name, shape) in floatShapes where isShared(name) {
                 if sharedArrays[name] == nil {
-                    sharedArrays[name] = MLMultiArray.emptyIOSurfaceArray(shape: shape)!
+                    guard let array = MLMultiArray.emptyIOSurfaceArray(shape: shape) else { return nil }
+                    sharedArrays[name] = array
                 }
             }
             var currentChunkArrays = [String: MLMultiArray]()
             for (name, shape) in floatShapes where !isShared(name) {
-                currentChunkArrays[name] = MLMultiArray.emptyIOSurfaceArray(shape: shape)!
+                guard let array = MLMultiArray.emptyIOSurfaceArray(shape: shape) else { return nil }
+                currentChunkArrays[name] = array
             }
             chunkArrays.append(currentChunkArrays)
         }
@@ -197,7 +204,7 @@ nonisolated final class PipelineCacheProcessor {
                 for blockIndex in 0..<inputs.cacheBlockCount() {
                     group.addTask {
                         let blockInputs = try pair.cacheProcessorInputs(forBlock: blockIndex)
-                        let options = pair.cacheProcessorOptions(forBlock: blockIndex)
+                        let options = try pair.cacheProcessorOptions(forBlock: blockIndex)
                         _ = try await processorModel.prediction(from: blockInputs, options: options)
                     }
                 }
@@ -211,6 +218,16 @@ nonisolated final class PipelineCacheProcessor {
     func wait(forChunk chunkIndex: Int) async throws {
         guard let task = chunkTasks[chunkIndex] else { return }
         try await task.value
+    }
+
+    /// Cancels every still-pending chunk task. Called once `generateStream` exits its loop —
+    /// cancel, error, natural stop all take the same path out — so the last chunk's cache-shift
+    /// work doesn't keep running unawaited into buffers the pipeline (`PipelineArrayStore`) is
+    /// about to be torn down along with.
+    func cancelAll() {
+        for task in chunkTasks {
+            task?.cancel()
+        }
     }
 }
 
@@ -227,16 +244,32 @@ private nonisolated extension MLFeatureProvider {
     }
 }
 
+/// Thrown instead of crashing when a cache-processor update can't find an expected feature on a
+/// chunk's `MLFeatureProvider` — a mismatch between this code's assumed feature names and the
+/// actually-compiled model (e.g. a different pipeline export) should surface as a generation
+/// error, not an uncatchable force-unwrap trap inside a detached `Task`.
+private nonisolated struct CacheFeatureMissing: Error, LocalizedError {
+    let name: String
+    var errorDescription: String? { "Cache processor: missing or non-array feature '\(name)'." }
+}
+
 private nonisolated struct PipelineCacheUpdate {
     let inputs: MLFeatureProvider
     let outputs: MLFeatureProvider
 
+    private func array(_ provider: MLFeatureProvider, _ name: String) throws -> MLMultiArray {
+        guard let array = provider.featureValue(for: name)?.multiArrayValue else {
+            throw CacheFeatureMissing(name: name)
+        }
+        return array
+    }
+
     func cacheProcessorInputs(forBlock blockIndex: Int) throws -> MLFeatureProvider {
         let dict: [String: MLMultiArray] = [
-            "old_k_cache": inputs.featureValue(for: "k_cache_\(blockIndex)")!.multiArrayValue!,
-            "new_k_cache": outputs.featureValue(for: "new_k_cache_\(blockIndex)")!.multiArrayValue!,
-            "old_v_cache": inputs.featureValue(for: "v_cache_\(blockIndex)")!.multiArrayValue!,
-            "new_v_cache": outputs.featureValue(for: "new_v_cache_\(blockIndex)")!.multiArrayValue!,
+            "old_k_cache": try array(inputs, "k_cache_\(blockIndex)"),
+            "new_k_cache": try array(outputs, "new_k_cache_\(blockIndex)"),
+            "old_v_cache": try array(inputs, "v_cache_\(blockIndex)"),
+            "new_v_cache": try array(outputs, "new_v_cache_\(blockIndex)"),
         ]
         return try MLDictionaryFeatureProvider(dictionary: dict)
     }
@@ -245,11 +278,11 @@ private nonisolated struct PipelineCacheUpdate {
     /// in place — the same arrays `PipelineArrayStore` keeps handing to this chunk on every
     /// subsequent call, so "updating the cache" and "the chunk's next input already reflecting
     /// that update" are the same write.
-    func cacheProcessorOptions(forBlock blockIndex: Int) -> MLPredictionOptions {
+    func cacheProcessorOptions(forBlock blockIndex: Int) throws -> MLPredictionOptions {
         let options = MLPredictionOptions()
         options.outputBackings = [
-            "updated_k_cache": inputs.featureValue(for: "k_cache_\(blockIndex)")!.multiArrayValue!,
-            "updated_v_cache": inputs.featureValue(for: "v_cache_\(blockIndex)")!.multiArrayValue!,
+            "updated_k_cache": try array(inputs, "k_cache_\(blockIndex)"),
+            "updated_v_cache": try array(inputs, "v_cache_\(blockIndex)"),
         ]
         return options
     }

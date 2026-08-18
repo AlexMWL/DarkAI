@@ -34,18 +34,6 @@ nonisolated enum AppInfo {
     /// violation.
     static let supportEmail = "lostsoccerball@icloud.com"
 
-    /// Shown on the App Store listing and in Settings → About. A plain mailto: is acceptable
-    /// if you have no support site; leave `nil` to hide the row rather than link somewhere dead.
-    static let supportURL: URL? = nil
-
-    /// Apple's standard EULA covers you if you leave this `nil` — the app then displays the
-    /// bundled `LegalText.termsOfUse` instead. Set it only if you host your own custom EULA.
-    static let termsURL: URL? = nil
-
-    /// Optional hosted copy of the privacy policy. The full text is bundled in-app either way,
-    /// but App Store Connect requires a reachable URL in the listing metadata.
-    static let privacyPolicyURL: URL? = nil
-
     /// Apple's standard Licensed Application End User License Agreement.
     static let appleStandardEULA = URL(string: "https://www.apple.com/legal/internet-services/itunes/dev/stdeula/")!
 
@@ -60,13 +48,6 @@ nonisolated enum AppInfo {
     }
 
     static var versionString: String { "Version \(version) (\(build))" }
-
-    /// `true` when every REQUIRED field above has been filled in with something plausible.
-    /// `OnboardingView` surfaces a debug-only banner when this is false so a placeholder build
-    /// can't quietly reach App Review.
-    static var isSubmissionReady: Bool {
-        supportEmail.contains("@") && !supportEmail.hasPrefix("your-")
-    }
 }
 
 // MARK: - Legal & policy text

@@ -75,22 +75,24 @@ actor CoreMLTokenizer {
         vocab = llama_model_get_vocab(mdl)
     }
 
-    var vocabSize: Int {
-        get throws {
-            try ensureLoaded()
-            return Int(llama_vocab_n_tokens(vocab))
-        }
-    }
-
     /// Tokenizes `text`. `addBOS` should be `true` for the start of a prompt — OpenELM's model
     /// card calls this out explicitly as required, unlike most instruct models where it's
     /// implied by the chat template.
     func encode(_ text: String, addBOS: Bool) throws -> [Int32] {
         try ensureLoaded()
         let utf8 = text.utf8
-        let nTokensMax = Int32(utf8.count + 8)
+        var nTokensMax = Int32(utf8.count + 8)
         var tokens = [llama_token](repeating: 0, count: Int(nTokensMax))
-        let n = llama_tokenize(vocab, text, Int32(utf8.count), &tokens, nTokensMax, addBOS, true)
+        var n = llama_tokenize(vocab, text, Int32(utf8.count), &tokens, nTokensMax, addBOS, true)
+        if n < 0 {
+            // llama.cpp's documented convention: a negative return means the supplied buffer was
+            // too small, and its magnitude is the size actually needed. `utf8.count + 8` is
+            // generous for ordinary BPE/SPM tokenization, but retry once at the reported size
+            // rather than silently dropping the tokenization on an input that needs more.
+            nTokensMax = -n
+            tokens = [llama_token](repeating: 0, count: Int(nTokensMax))
+            n = llama_tokenize(vocab, text, Int32(utf8.count), &tokens, nTokensMax, addBOS, true)
+        }
         guard n > 0 else { return [] }
         return Array(tokens.prefix(Int(n)))
     }
@@ -98,8 +100,15 @@ actor CoreMLTokenizer {
     /// Detokenizes a single token to its text piece.
     func decode(_ token: Int32) throws -> String {
         try ensureLoaded()
-        var buf = [CChar](repeating: 0, count: 256)
-        let nChars = llama_token_to_piece(vocab, llama_token(token), &buf, 256, 0, false)
+        var bufSize: Int32 = 256
+        var buf = [CChar](repeating: 0, count: Int(bufSize))
+        var nChars = llama_token_to_piece(vocab, llama_token(token), &buf, bufSize, 0, false)
+        if nChars < 0 {
+            // Same buffer-too-small convention as `encode` above.
+            bufSize = -nChars
+            buf = [CChar](repeating: 0, count: Int(bufSize))
+            nChars = llama_token_to_piece(vocab, llama_token(token), &buf, bufSize, 0, false)
+        }
         guard nChars > 0 else { return "" }
         return String(bytes: buf.prefix(Int(nChars)).map { UInt8(bitPattern: $0) }, encoding: .utf8) ?? ""
     }

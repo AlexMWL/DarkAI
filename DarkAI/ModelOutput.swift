@@ -16,6 +16,47 @@ import Foundation
 /// arguments, no state.
 nonisolated enum ModelOutput {
 
+    // Every pattern below is a fixed literal, so compiling them once here — rather than inside
+    // `filterThoughts` itself — matters: the chat bubble calls `filterThoughts` on the whole
+    // accumulated response on every single streamed token (see `ContentView.swift`'s message
+    // bubble), so recompiling ~7 `NSRegularExpression`s from scratch on every token made the
+    // total cost of a long reply scale quadratically with its length for no reason.
+    private static let reasoningOpenRegex = try! NSRegularExpression(
+        pattern: "<\\|?\\s*(think|thought|thinking|reflect|reason|channel|analysis|internal|scratchpad|deliberat)",
+        options: [.caseInsensitive]
+    )
+    private static let reasoningCloseRegex = try! NSRegularExpression(
+        pattern: "</\\s*(think|thought|thinking|reflect|reflection|reason|reasoning|channel|analysis|internal|scratchpad|deliberation)\\s*>",
+        options: [.caseInsensitive]
+    )
+    private static let reasoningTransitionRegex = try! NSRegularExpression(
+        pattern: "<\\|?/?\\s*(final|message|response|answer)[a-z]*\\s*\\|?>",
+        options: [.caseInsensitive]
+    )
+    private static let bareLabelRegex = try! NSRegularExpression(
+        pattern: "(?:^|\\n)\\s*(?:" +
+            "\\*{3,}|" +
+            "/[A-Za-z][A-Za-z ]{2,29}:|" +
+            "\\*{1,2}[A-Za-z][A-Za-z ,]{2,39}:\\*{0,2}|" +
+            "[\\*\"'\\[\\(]{1,2}\\s*(?:self[- _]?correction|self[- _]?review|internal monologue|internal reasoning|response generation|chain of thought|style check|tone check|voice check|persona check|vibe check|character check|generating response|generating\\.\\.\\.)" +
+            ")",
+        options: [.caseInsensitive]
+    )
+    private static let inlineStatusRegex: NSRegularExpression = {
+        let statusVerbs = "generating|thinking|processing|analyzing|reasoning|writing|composing|working|" +
+            "responding|preparing|drafting|formulating|crafting|considering|reflecting|continuing"
+        let pattern =
+            "(?:\\[\\s*(?:\(statusVerbs))\\b[^\\[\\]\\n]{0,120}\\]" +
+            "|\\(\\s*(?:\(statusVerbs))\\b[^()\\n]{0,120}\\)" +
+            "|<\\|?\\s*(?:\(statusVerbs))\\b[^<>\\n]{0,120}\\|?>)"
+        return try! NSRegularExpression(pattern: pattern, options: [.caseInsensitive])
+    }()
+    private static let personalityLeakRegex = try! NSRegularExpression(
+        pattern: "\\(?(?:Critical Instructions?|User Style Matrix|Communication Style Note)[\\s\\S]*?fr\\.?\\)?",
+        options: [.caseInsensitive, .dotMatchesLineSeparators]
+    )
+    private static let codeBlockRegex = try! NSRegularExpression(pattern: "```[\\s\\S]*?```", options: [])
+
     /// Strips reasoning blocks, scaffolding preambles, role echoes, and chat-template artifacts.
     ///
     /// - Parameter stripMarkdown: also flattens markdown emphasis and headings, preserving fenced
@@ -31,12 +72,10 @@ nonisolated enum ModelOutput {
         // so this keys off vocabulary inside any bracketed tag (<tag>, </tag>, <|tag|>) and
         // exits on whichever comes first: a real close tag, or a transition to a
         // final/message/response/answer channel.
-        let reasoningOpenPattern = "<\\|?\\s*(think|thought|thinking|reflect|reason|channel|analysis|internal|scratchpad|deliberat)"
-        let reasoningClosePattern = "</\\s*(think|thought|thinking|reflect|reflection|reason|reasoning|channel|analysis|internal|scratchpad|deliberation)\\s*>"
-        let transitionPattern = "<\\|?/?\\s*(final|message|response|answer)[a-z]*\\s*\\|?>"
-        if let openRegex = try? NSRegularExpression(pattern: reasoningOpenPattern, options: [.caseInsensitive]),
-           let closeRegex = try? NSRegularExpression(pattern: reasoningClosePattern, options: [.caseInsensitive]),
-           let transitionRegex = try? NSRegularExpression(pattern: transitionPattern, options: [.caseInsensitive]) {
+        do {
+            let openRegex = Self.reasoningOpenRegex
+            let closeRegex = Self.reasoningCloseRegex
+            let transitionRegex = Self.reasoningTransitionRegex
             while let openMatch = openRegex.firstMatch(in: filtered, range: NSRange(filtered.startIndex..., in: filtered)),
                   let openRange = Range(openMatch.range, in: filtered) {
                 let searchRange = NSRange(openRange.upperBound..., in: filtered)
@@ -135,13 +174,8 @@ nonisolated enum ModelOutput {
         // reliable close tag, so the next blank line is treated as the block's end —
         // scoped to near the start of the message only, so a legitimate bolded header
         // later in a well-formed answer is never touched.
-        let bareLabelPattern = "(?:^|\\n)\\s*(?:" +
-            "\\*{3,}|" +
-            "/[A-Za-z][A-Za-z ]{2,29}:|" +
-            "\\*{1,2}[A-Za-z][A-Za-z ,]{2,39}:\\*{0,2}|" +
-            "[\\*\"'\\[\\(]{1,2}\\s*(?:self[- _]?correction|self[- _]?review|internal monologue|internal reasoning|response generation|chain of thought|style check|tone check|voice check|persona check|vibe check|character check|generating response|generating\\.\\.\\.)" +
-            ")"
-        if let bareLabelRegex = try? NSRegularExpression(pattern: bareLabelPattern, options: [.caseInsensitive]) {
+        do {
+            let bareLabelRegex = Self.bareLabelRegex
             var guardIterations = 0
             while guardIterations < 20,
                   let openMatch = bareLabelRegex.firstMatch(in: filtered, range: NSRange(filtered.startIndex..., in: filtered)),
@@ -171,20 +205,12 @@ nonisolated enum ModelOutput {
         // *tail* is intentionally permissive (up to 120 characters of anything short of another
         // bracket or a newline) since these asides range from a bare "[generating...]" to a full
         // narrated sentence like "[generating a detailed response based on your question]".
-        let statusVerbs = "generating|thinking|processing|analyzing|reasoning|writing|composing|working|" +
-            "responding|preparing|drafting|formulating|crafting|considering|reflecting|continuing"
-        let inlineStatusPattern =
-            "(?:\\[\\s*(?:\(statusVerbs))\\b[^\\[\\]\\n]{0,120}\\]" +
-            "|\\(\\s*(?:\(statusVerbs))\\b[^()\\n]{0,120}\\)" +
-            "|<\\|?\\s*(?:\(statusVerbs))\\b[^<>\\n]{0,120}\\|?>)"
-        if let inlineStatusRegex = try? NSRegularExpression(pattern: inlineStatusPattern, options: [.caseInsensitive]) {
-            filtered = inlineStatusRegex.stringByReplacingMatches(
-                in: filtered,
-                options: [],
-                range: NSRange(filtered.startIndex..., in: filtered),
-                withTemplate: ""
-            )
-        }
+        filtered = Self.inlineStatusRegex.stringByReplacingMatches(
+            in: filtered,
+            options: [],
+            range: NSRange(filtered.startIndex..., in: filtered),
+            withTemplate: ""
+        )
 
         // 4. Strip leading role-echo preamble (model parroting its own role prefix).
         let leadingPreambles = ["assistant:", "response:", "answer:", "a:"]
@@ -203,31 +229,24 @@ nonisolated enum ModelOutput {
         }
         
         // 5. Strip personality system-prompt leak via regex.
-        if let regex = try? NSRegularExpression(
-            pattern: "\\(?(?:Critical Instructions?|User Style Matrix|Communication Style Note)[\\s\\S]*?fr\\.?\\)?",
-            options: [.caseInsensitive, .dotMatchesLineSeparators]
-        ) {
-            filtered = regex.stringByReplacingMatches(
-                in: filtered,
-                options: [],
-                range: NSRange(location: 0, length: filtered.utf16.count),
-                withTemplate: ""
-            ).trimmingCharacters(in: .whitespacesAndNewlines)
-        }
+        filtered = Self.personalityLeakRegex.stringByReplacingMatches(
+            in: filtered,
+            options: [],
+            range: NSRange(location: 0, length: filtered.utf16.count),
+            withTemplate: ""
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
         
         // 6. Markdown stripping (mature personality mode only, always preserves fenced code blocks).
         if stripMarkdown {
             var codeBlocks: [String] = []
             var protected = filtered
-            if let codeBlockRegex = try? NSRegularExpression(pattern: "```[\\s\\S]*?```", options: []) {
-                let matches = codeBlockRegex.matches(in: protected, range: NSRange(protected.startIndex..., in: protected)).reversed()
-                for match in matches {
-                    if let range = Range(match.range, in: protected) {
-                        let block = String(protected[range])
-                        let placeholder = "CODEBLOCK_\(codeBlocks.count)_PLACEHOLDER"
-                        codeBlocks.append(block)
-                        protected.replaceSubrange(range, with: placeholder)
-                    }
+            let matches = Self.codeBlockRegex.matches(in: protected, range: NSRange(protected.startIndex..., in: protected)).reversed()
+            for match in matches {
+                if let range = Range(match.range, in: protected) {
+                    let block = String(protected[range])
+                    let placeholder = "CODEBLOCK_\(codeBlocks.count)_PLACEHOLDER"
+                    codeBlocks.append(block)
+                    protected.replaceSubrange(range, with: placeholder)
                 }
             }
             protected = protected.replacingOccurrences(of: "**", with: "")

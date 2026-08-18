@@ -204,6 +204,12 @@ nonisolated enum AppFiles {
                 total += Int64((try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
             }
         }
+        // These live directly in Documents rather than inside one of `allDirectories` (same
+        // reason `prepare()` above excludes them from backup individually) — the diagnostic log
+        // in particular grows continuously between manual clears, and used to be invisible here.
+        for looseFile in [diagnosticLogFile, crashReportFile, pendingCrashReportFile] {
+            total += Int64((try? looseFile.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+        }
         return Double(total) / (1024 * 1024 * 1024)
     }
 }

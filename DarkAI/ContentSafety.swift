@@ -166,8 +166,16 @@ nonisolated enum ContentSafety {
         // Outbound, user-controlled text — a search query is the same kind of thing as a chat
         // prompt: something about to leave the device (to a third party, in the search case)
         // that the app can still choose not to send.
+        //
+        // Blocks on `hasExplicitSexual` alone, mirroring the image surface's
+        // `hasExplicitSexual || nudityTerms` check just above. This used to additionally require
+        // a `pornographicIntentTerms` match (a production-style verb like "write"/"generate"/
+        // "describe in detail"), which let ordinary request phrasing ("give me...", "I want...",
+        // "show me...") through untouched despite `explicitSexualTerms` already matching —
+        // the intent-term list was never meant to be a second required gate, just a set of
+        // verbs `explicitSexualTerms` itself doesn't need repeating for every phrasing.
         case .chatPrompt, .webSearchQuery:
-            if hasExplicitSexual && matchesAny(pornographicIntentTerms, normalized: normalized, compact: compact, useCompact: false) {
+            if hasExplicitSexual {
                 return Decision(
                     isAllowed: false,
                     category: .sexualContent,
@@ -178,8 +186,13 @@ nonisolated enum ContentSafety {
         // Inbound, uncontrolled content — a search result is the same kind of thing as model
         // output: text about to reach the LLM's context or the screen that the app didn't
         // generate and can't vouch for the source of.
+        //
+        // Also blocks on `hasExplicitSexual` alone. Requiring a `pornographicIntentTerms` match
+        // here never made sense for scanning generated/fetched text rather than a user's
+        // request — a passage of already-produced explicit prose has no reason to contain a
+        // request-shaped verb like "write" or "describe in detail" at all.
         case .modelOutput, .webSearchResult:
-            if hasExplicitSexual && matchesAny(pornographicIntentTerms, normalized: normalized, compact: compact, useCompact: false) {
+            if hasExplicitSexual {
                 return Decision(
                     isAllowed: false,
                     category: .sexualContent,
@@ -399,15 +412,6 @@ nonisolated enum ContentSafety {
         "pedophilia", "grooming a child"
     ]
 
-    /// Distinguishes discussion of sexuality from a request to produce pornography. Paired with
-    /// `explicitSexualTerms` so that "explain safe sex" or "what is consent" never trips, while
-    /// "write an explicit sex scene" does.
-    private static let pornographicIntentTerms = [
-        "write", "generate", "create", "make", "produce", "describe in detail",
-        "roleplay", "role play", "story", "scene", "script", "narrate", "continue",
-        "draw", "render", "image", "picture", "photo"
-    ]
-
     private static let goreTerms = [
         "gore", "gory", "mutilated", "mutilation", "dismembered", "dismemberment",
         "decapitated", "decapitation", "beheading", "disemboweled", "eviscerated",
@@ -432,6 +436,6 @@ nonisolated enum ContentSafety {
         "kill myself", "killing myself", "end my life", "ending my life", "suicide",
         "suicidal", "want to die", "wanna die", "better off dead", "self harm",
         "self-harm", "hurt myself", "hurting myself", "cut myself", "cutting myself",
-        "overdose on", "no reason to live", "cant go on", "can t go on"
+        "overdose on", "no reason to live", "cant go on", "can t go on", "can't go on"
     ]
 }

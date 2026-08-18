@@ -26,10 +26,13 @@ cmake -S "$REPO_DIR" -B "$BUILD_DIR/ios" \
     -DCMAKE_SYSTEM_NAME=iOS \
     -DCMAKE_OSX_ARCHITECTURES=arm64 \
     -DCMAKE_OSX_DEPLOYMENT_TARGET="$IOS_DEPLOYMENT_TARGET" \
+    -DCMAKE_BUILD_TYPE=Release \
     -DSD_METAL=ON \
     -DSD_BUILD_EXAMPLES=OFF \
-    -DSD_BUILD_SHARED_LIBS=OFF
-cmake --build "$BUILD_DIR/ios" --config Release -j4
+    -DSD_BUILD_SHARED_LIBS=OFF \
+    -DGGML_LTO=ON \
+    -DGGML_METAL_NDEBUG=ON
+cmake --build "$BUILD_DIR/ios" --config Release -j"$(sysctl -n hw.ncpu)"
 
 # 3. Build for iOS Simulator (arm64)
 echo "Building for iOS Simulator (arm64)..."
@@ -39,10 +42,13 @@ cmake -S "$REPO_DIR" -B "$BUILD_DIR/sim" \
     -DCMAKE_OSX_SYSROOT=iphonesimulator \
     -DCMAKE_OSX_ARCHITECTURES=arm64 \
     -DCMAKE_OSX_DEPLOYMENT_TARGET="$IOS_DEPLOYMENT_TARGET" \
+    -DCMAKE_BUILD_TYPE=Release \
     -DSD_METAL=ON \
     -DSD_BUILD_EXAMPLES=OFF \
-    -DSD_BUILD_SHARED_LIBS=OFF
-cmake --build "$BUILD_DIR/sim" --config Release -j4
+    -DSD_BUILD_SHARED_LIBS=OFF \
+    -DGGML_LTO=ON \
+    -DGGML_METAL_NDEBUG=ON
+cmake --build "$BUILD_DIR/sim" --config Release -j"$(sysctl -n hw.ncpu)"
 
 # 4. Create XCFramework
 echo "Creating XCFramework..."

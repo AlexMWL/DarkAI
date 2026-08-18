@@ -32,6 +32,12 @@ nonisolated final class LogManager: ObservableObject, @unchecked Sendable {
 
     private let queue = DispatchQueue(label: "com.darkai.logmanager", qos: .background)
 
+    /// On-disk cap, checked after every append. Outside a manual "clear logs" the file used to
+    /// grow forever — this keeps it bounded to roughly the same tail already kept in memory
+    /// (`logs`, capped at 1000 lines), so nothing about what `LogExportView` shows changes, only
+    /// what's sitting unbounded on disk.
+    private let maxLogFileBytes = 5 * 1024 * 1024
+
     private init() {
         loadLogs()
         log("Diagnostic Logger initialized.")
@@ -79,9 +85,23 @@ nonisolated final class LogManager: ObservableObject, @unchecked Sendable {
                 fileHandle.write(data)
                 fileHandle.closeFile()
             }
+            rotateIfNeeded()
         } else {
             try? (line + "\n").write(to: logFileURL, atomically: true, encoding: .utf8)
         }
+    }
+
+    /// Truncates the log file to its last 1000 lines once it crosses `maxLogFileBytes`. Runs on
+    /// `queue`, same as every other file touch here, so it can't race the append above.
+    private func rotateIfNeeded() {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: logFileURL.path),
+              let size = attrs[.size] as? Int, size > maxLogFileBytes else { return }
+        guard let content = try? String(contentsOf: logFileURL, encoding: .utf8) else { return }
+        let lines = content
+            .components(separatedBy: "\n")
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        let trimmed = Array(lines.suffix(1000)).joined(separator: "\n") + "\n"
+        try? trimmed.write(to: logFileURL, atomically: true, encoding: .utf8)
     }
 
     func clearLogs() {

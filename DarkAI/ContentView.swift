@@ -27,6 +27,9 @@ struct ContentView: View {
     @State private var inputText: String = ""
     @State private var showSettings = false
     @State private var showDrawer = false
+    /// Last message `id` an animated scroll ran for — lets the chat-scroll `onChange` tell a
+    /// genuinely new message apart from the same message's text growing token-by-token.
+    @State private var lastScrolledMessageID: UUID? = nil
 
     @State private var showDiffusionNotLoadedBanner = false
     @State private var diffusionBannerTask: Task<Void, Never>? = nil
@@ -89,21 +92,30 @@ struct ContentView: View {
                             .frame(maxWidth: Layout.contentMaxWidth)
                             .frame(maxWidth: .infinity)
                         }
-                        // Keyboard Dismissal by Dragging List
                         .gesture(
                             DragGesture().onChanged { _ in
                                 endEditing()
                             }
                         )
-                        // Keyboard Dismissal by Tapping message area
                         .onTapGesture {
                             endEditing()
                         }
                         .onChange(of: activeConv.messages) {
-                            if let last = activeConv.messages.last {
+                            // Fires on every streamed token, not just on a new message — the last
+                            // message's `text` growing is itself an array mutation. Animating a
+                            // scroll transaction on every single token queues dozens/hundreds of
+                            // redundant animations over a long reply, so only the genuinely new
+                            // message (a different `id`) gets an animated scroll; keeping the
+                            // growing last message pinned to the bottom during streaming uses a
+                            // plain, unanimated scroll instead.
+                            guard let last = activeConv.messages.last else { return }
+                            if last.id != lastScrolledMessageID {
+                                lastScrolledMessageID = last.id
                                 withAnimation {
                                     proxy.scrollTo(last.id, anchor: .bottom)
                                 }
+                            } else {
+                                proxy.scrollTo(last.id, anchor: .bottom)
                             }
                         }
                     }
@@ -115,7 +127,7 @@ struct ContentView: View {
 
                 inputArea
             }
-            .background(GlitchBackgroundView().ignoresSafeArea())
+            .background(GlitchBackgroundView(isActive: !showSettings).ignoresSafeArea())
             .blur(radius: showDrawer ? 4 : 0)
             .disabled(showDrawer)
             
@@ -150,9 +162,10 @@ struct ContentView: View {
                             withAnimation { showDiffusionNotLoadedBanner = false }
                         } label: {
                             Image(systemName: "xmark")
-                                .foregroundColor(.white.opacity(0.6))
+                                .foregroundColor(Theme.textSecondary)
                                 .font(.system(size: 12, weight: .bold))
                         }
+                        .accessibilityLabel("Dismiss")
                     }
                     .padding(.horizontal, 14)
                     .padding(.vertical, 10)
@@ -276,7 +289,6 @@ struct ContentView: View {
         }
     }
     
-    // Custom Navigation Header View
     private var customHeaderView: some View {
         HStack(spacing: 14) {
             // Left: Sidebar Toggle
@@ -417,6 +429,7 @@ struct ContentView: View {
                         .font(.system(size: 11, weight: .bold))
                         .foregroundColor(Theme.textSecondary)
                 }
+                .accessibilityLabel("Dismiss")
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
@@ -1053,6 +1066,7 @@ struct ContentView: View {
                         Image(systemName: "xmark.circle.fill")
                             .foregroundColor(.gray)
                     }
+                    .accessibilityLabel("Remove attachment")
                 }
                 .padding(.horizontal, 12)
                 .padding(.vertical, 8)
@@ -1073,6 +1087,7 @@ struct ContentView: View {
                     .clipShape(Circle())
                     .overlay(Circle().stroke(Theme.accentCyan.opacity(0.4), lineWidth: 1))
             }
+            .accessibilityLabel("Attach file")
             
             // Private-chat toggle — this conversation is kept in memory only
             Button(action: {
@@ -1117,6 +1132,7 @@ struct ContentView: View {
                     .neonGlow(color: isModelActive ? Theme.accent : .clear, radius: 4)
             }
             .disabled(!isModelActive && !llmManager.isGenerating)
+            .accessibilityLabel(llmManager.isGenerating ? "Stop generating" : "Send message")
             }
         }
         .padding()
@@ -1155,7 +1171,8 @@ struct ContentView: View {
                             .foregroundColor(Theme.accent)
                             .font(.system(size: 16, weight: .bold))
                     }
-                    
+                    .accessibilityLabel("New chat")
+
                     Button(action: {
                         withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
                             showDrawer = false
@@ -1165,6 +1182,7 @@ struct ContentView: View {
                             .foregroundColor(Theme.textSecondary)
                             .font(.system(size: 14, weight: .bold))
                     }
+                    .accessibilityLabel("Close chat list")
                 }
                 .padding(.top, Layout.barTopPadding + 14)
                 .padding(.horizontal)
@@ -1588,7 +1606,8 @@ struct ContentView: View {
                 if enableMemories && !text.isEmpty {
                     memoryManager.extractMemories(from: text)
                     // NOTE: personality analysis can trigger its own background LLM call
-                    // (every 3rd message). LlamaRunner is a single serialized actor, so
+                    // (every 2nd message — see `PersonalityManager.analyzeUserMessage`'s batch
+                    // threshold). LlamaRunner is a single serialized actor, so
                     // firing that here would race the chat response below for the model —
                     // whichever reaches the actor first runs, silently delaying replies.
                     // It's fired from onComplete instead, strictly after this turn finishes.
@@ -1626,6 +1645,7 @@ struct ContentView: View {
                         LogManager.shared.log("ContentSafety: cancelled stream — \(violation.rawValue)")
                     }
                 } onComplete: { finalText in
+                    let wasCancelled = llmManager.wasCancelled
                     var cleanedText = self.filterThoughts(from: finalText, stripMarkdown: self.personalityManager.isMature)
                     if cleanedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                         cleanedText = "[No response content was generated — the model may have only produced internal notes for this turn. Try regenerating or rephrasing your prompt.]"
@@ -1638,8 +1658,16 @@ struct ContentView: View {
                     if !outputDecision.isAllowed {
                         cleanedText = outputDecision.message ?? "[This response was withheld by the content filter.]"
                         LogManager.shared.log("ContentSafety: withheld response — \(outputDecision.category?.rawValue ?? "unknown")")
-                    } else if !responseSuffix.isEmpty {
-                        cleanedText += responseSuffix
+                    } else {
+                        if !responseSuffix.isEmpty {
+                            cleanedText += responseSuffix
+                        }
+                        if wasCancelled {
+                            // Matches the explicit "[Image generation cancelled.]" marker the
+                            // image path already leaves — without this, a stopped reply just
+                            // froze mid-sentence with nothing telling the two situations apart.
+                            cleanedText += "\n\n[Response stopped.]"
+                        }
                     }
 
                     conversationManager.updateLastMessage(text: cleanedText, conversationId: conversationId)
@@ -1876,6 +1904,7 @@ struct ContentView: View {
                             conversationId: conversationId
                         )
                     } onComplete: { finalText in
+                        let wasCancelled = llmManager.wasCancelled
                         var cleanedText = self.filterThoughts(from: finalText, stripMarkdown: self.personalityManager.isMature)
                         if cleanedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                             cleanedText = "[Context exhausted. Could not produce a description.]"
@@ -1885,6 +1914,8 @@ struct ContentView: View {
                         let outputDecision = ContentSafety.review(cleanedText, surface: .modelOutput)
                         if !outputDecision.isAllowed {
                             cleanedText = outputDecision.message ?? "[This response was withheld by the content filter.]"
+                        } else if wasCancelled {
+                            cleanedText += "\n\n[Response stopped.]"
                         }
                         conversationManager.updateLastMessage(text: cleanedText, conversationId: conversationId)
                         conversationManager.saveConversations()

@@ -22,7 +22,9 @@ nonisolated enum ConversationExport {
         case markdown
         /// No syntax at all. Pastes cleanly into anything.
         case plainText
-        /// Lossless and re-importable. See `StructuredImport` for the read side.
+        /// Structured and re-importable, though not fully lossless: `StructuredImport`'s read
+        /// side (`transcriptOutcome`) drops embedded images and flattens a re-imported
+        /// conversation back down to text.
         case json
 
         var id: String { rawValue }
@@ -333,6 +335,13 @@ struct ConversationExportSheet: View {
     @State private var includeImages = true
     @State private var preparedFile: URL?
     @State private var failure: String?
+    /// Cached result of `ConversationExport.estimatedByteCount`, recomputed only when `format`/
+    /// `includeImages` actually change (see the `onChange` handlers below) rather than read as a
+    /// computed property from `header`'s body. For a conversation with several generated images,
+    /// `estimatedByteCount` reads every one of them fully from disk (`resolvedImageData`) — doing
+    /// that synchronously on the main thread on every unrelated re-render of this sheet (any state
+    /// change at all, since `header` is part of `body`) was a real, avoidable UI hitch.
+    @State private var cachedSizeDescription: String = ""
 
     private var hasImages: Bool { conversation.messages.contains { $0.isImageMessage } }
 
@@ -400,8 +409,16 @@ struct ConversationExportSheet: View {
                 }
             }
         }
-        .onChange(of: format) { _, _ in preparedFile = nil; failure = nil }
-        .onChange(of: includeImages) { _, _ in preparedFile = nil; failure = nil }
+        .onChange(of: format) { _, _ in preparedFile = nil; failure = nil; recomputeSizeDescription() }
+        .onChange(of: includeImages) { _, _ in preparedFile = nil; failure = nil; recomputeSizeDescription() }
+        .onAppear { recomputeSizeDescription() }
+    }
+
+    private func recomputeSizeDescription() {
+        let bytes = ConversationExport.estimatedByteCount(
+            for: conversation, format: format, includeImages: includeImages
+        )
+        cachedSizeDescription = ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
     }
 
     private var header: some View {
@@ -410,17 +427,10 @@ struct ConversationExportSheet: View {
                 .font(.system(size: 18, weight: .bold))
                 .foregroundColor(Theme.textPrimary)
                 .lineLimit(2)
-            Text("\(conversation.messages.count) message\(conversation.messages.count == 1 ? "" : "s") · about \(sizeDescription)")
+            Text("\(conversation.messages.count) message\(conversation.messages.count == 1 ? "" : "s") · about \(cachedSizeDescription)")
                 .font(.system(size: 12, design: .monospaced))
                 .foregroundColor(Theme.textSecondary)
         }
-    }
-
-    private var sizeDescription: String {
-        let bytes = ConversationExport.estimatedByteCount(
-            for: conversation, format: format, includeImages: includeImages
-        )
-        return ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
     }
 
     private func formatRow(_ option: ConversationExport.Format) -> some View {

@@ -32,12 +32,14 @@ actor ChunkedPipelineCoreMLEngine: CoreMLEngine {
         case modelChunksNotFound
         case cacheProcessorNotFound
         case unsupportedInferenceConfiguration
+        case arrayAllocationFailed
 
         var errorDescription: String? {
             switch self {
             case .modelChunksNotFound: return "No model chunk files were found for this Core ML pipeline."
             case .cacheProcessorNotFound: return "The KV-cache processor model could not be found."
             case .unsupportedInferenceConfiguration: return "This Core ML pipeline's model shapes couldn't be understood."
+            case .arrayAllocationFailed: return "Not enough memory available to start generation."
             }
         }
     }
@@ -160,7 +162,11 @@ actor ChunkedPipelineCoreMLEngine: CoreMLEngine {
         }
         var tokens = promptChunks.removeFirst()
 
-        let store = PipelineArrayStore(chunkModels: chunkModels)
+        guard let store = PipelineArrayStore(chunkModels: chunkModels) else {
+            continuation.yield("[\(PipelineError.arrayAllocationFailed.localizedDescription)]")
+            continuation.finish()
+            return
+        }
         let cacheProcessor = PipelineCacheProcessor(chunkCount: chunkModels.count, processorModel: cacheProcessorModel)
 
         var generatedCount = 0
@@ -226,6 +232,10 @@ actor ChunkedPipelineCoreMLEngine: CoreMLEngine {
             await Task.yield()
         }
 
+        // Every exit above (cancel, prediction error, EOS, maxTokens) falls through to here —
+        // cancel whatever cache-shift work is still in flight for the last processed chunk rather
+        // than leaving it to keep running unawaited after this generation is done.
+        cacheProcessor.cancelAll()
         continuation.finish()
     }
 

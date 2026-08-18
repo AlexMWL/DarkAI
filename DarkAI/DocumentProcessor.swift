@@ -51,12 +51,6 @@ nonisolated class DocumentProcessor {
         }.value
     }
 
-    static func extractText(from image: UIImage) async throws -> String {
-        return try await Task.detached(priority: .userInitiated) {
-            try await performOCR(on: image)
-        }.value
-    }
-
     private static func extractTextOffMainActor(from url: URL) async throws -> String {
         let ext = url.pathExtension.lowercased()
 

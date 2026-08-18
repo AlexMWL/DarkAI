@@ -19,7 +19,13 @@ import Foundation
 /// The safetensors layout is simpler: an 8-byte little-endian header length followed by that
 /// many bytes of JSON, whose keys are the tensor names.
 ///
-enum GGUFValidator {
+/// `nonisolated`: pure local file I/O with no shared mutable state, and the project's
+/// `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor` setting would otherwise make every static func
+/// here implicitly main-actor-isolated. `validateDiffusionCheckpoint`'s existing callers all
+/// happen to already run on the main actor, but `validate` is also called from
+/// `SettingsView.copyModelToAppDocuments`'s `Task.detached(priority: .background)` — genuinely
+/// off the main actor, so it can't be blocked waiting for one.
+nonisolated enum GGUFValidator {
 
     // MARK: - GGUF Value Types (subset we need)
     private enum GGUFValueType: UInt32 {
@@ -36,13 +42,32 @@ enum GGUFValidator {
         case uint64  = 10
         case int64   = 11
         case float64 = 12
+
+        /// Byte width for every fixed-size scalar type, `nil` for the two variable-width types
+        /// (`string`, and `array` when nested). Lets `skipGGUFValue` seek a fixed-width array in
+        /// one jump instead of looping element-by-element.
+        var fixedByteWidth: Int? {
+            switch self {
+            case .uint8, .int8, .bool: return 1
+            case .uint16, .int16: return 2
+            case .uint32, .int32, .float32: return 4
+            case .uint64, .int64, .float64: return 8
+            case .string, .array: return nil
+            }
+        }
     }
 
     // MARK: - Public API
 
-    /// Validates that `path` is a GGUF file with the expected architecture.
+    /// Validates that `path` is a well-formed GGUF file — magic bytes, a supported version, and a
+    /// readable `general.architecture` key — and, when `expectedArchitecture` is given, that it
+    /// matches. `nil` (the default) is what a manually side-loaded chat model import uses: chat
+    /// models legitimately span many architectures (llama, qwen2, gemma, phi3, …), so there's no
+    /// single value to check against there, only "is this actually a parseable GGUF file, not a
+    /// mislabeled or corrupt one" — the same class of check `validateDiffusionCheckpoint` already
+    /// does for diffusion imports, just without the fixed architecture this doesn't have.
     /// Throws a descriptive `NSError` if validation fails.
-    static func validate(path: String, expectedArchitecture: String) throws {
+    static func validate(path: String, expectedArchitecture: String? = nil) throws {
         let url = URL(fileURLWithPath: path)
 
         guard FileManager.default.fileExists(atPath: path) else {
@@ -102,7 +127,7 @@ enum GGUFValidator {
             throw error("'general.architecture' key not found in GGUF metadata.")
         }
 
-        guard arch == expectedArchitecture else {
+        if let expectedArchitecture, arch != expectedArchitecture {
             throw error(
                 "Architecture mismatch: file reports '\(arch)', expected '\(expectedArchitecture)'.\n" +
                 "Make sure you are loading a \(expectedArchitecture) diffusion model."
@@ -462,8 +487,25 @@ enum GGUFValidator {
             let elemType = GGUFValueType(rawValue:
                 elemTypeData.withUnsafeBytes { $0.load(as: UInt32.self).littleEndian }) ?? .uint8
             let count    = countData.withUnsafeBytes { $0.load(as: UInt64.self).littleEndian }
-            for _ in 0..<min(count, 65536) {  // cap to avoid hangs on corrupt files
-                try skipGGUFValue(type: elemType, from: handle)
+
+            if let byteWidth = elemType.fixedByteWidth {
+                // Fixed-width elements (e.g. `tokenizer.ggml.scores`, `tokenizer.ggml.token_type`
+                // — both 100k+ entries on a modern vocab) — skip the whole array in one seek
+                // instead of looping. This also removes the old cap-then-silently-return path
+                // below for these, which used to leave the file cursor mid-array (and every
+                // subsequent KV-pair read misaligned) on any array over 65536 elements.
+                handle.seek(toFileOffset: handle.offsetInFile + count * UInt64(byteWidth))
+            } else {
+                // Variable-width elements (nested strings/arrays) can't be skipped by a byte
+                // jump — each has to be decoded to find where the next one starts. Still capped,
+                // to avoid hanging on a corrupt or adversarial count, but hitting the cap now
+                // throws instead of silently returning with the cursor left mid-array.
+                guard count <= 2_000_000 else {
+                    throw error("GGUF array has an implausible element count (\(count)). File may be corrupt.")
+                }
+                for _ in 0..<count {
+                    try skipGGUFValue(type: elemType, from: handle)
+                }
             }
         }
     }

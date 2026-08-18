@@ -33,11 +33,6 @@ final class WebSearchManager: ObservableObject {
         didSet { UserDefaults.standard.set(isEnabled, forKey: "webSearchEnabled") }
     }
 
-    @Published private(set) var isSearching: Bool = false
-    /// What the search is doing right now, shown in place of the assistant's message while a
-    /// search is in flight — same role as `DiffusionManager.generationStage`.
-    @Published private(set) var searchStage: String = ""
-
     /// User-supplied Brave Search API key. Kept in the Keychain, not UserDefaults — this is a
     /// real secret, unlike every other persisted setting in the app. Empty string means "not
     /// configured," which is also what a fresh Keychain read returns, so the two states don't
@@ -45,6 +40,15 @@ final class WebSearchManager: ObservableObject {
     @Published var braveAPIKey: String = KeychainStore.get(forKey: WebSearchManager.braveKeyKeychainKey) ?? "" {
         didSet {
             let trimmed = braveAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+            // Keep the in-memory value trimmed too, not just what lands in the Keychain — a
+            // pasted key with trailing whitespace used to 401 for the rest of the session even
+            // though the persisted copy (read fresh on next launch) was already clean.
+            // Reassigning here re-enters `didSet` once with the already-trimmed value, which
+            // then falls through to the Keychain write below instead of looping.
+            if trimmed != braveAPIKey {
+                braveAPIKey = trimmed
+                return
+            }
             KeychainStore.set(trimmed.isEmpty ? nil : trimmed, forKey: WebSearchManager.braveKeyKeychainKey)
         }
     }
@@ -76,18 +80,13 @@ final class WebSearchManager: ObservableObject {
             throw WebSearchError.blocked(queryDecision.message ?? "That search isn't allowed under the app's content policy.")
         }
 
-        isSearching = true
-        defer { isSearching = false; searchStage = "" }
-
         let result: WebSearchResult
         if case .weather(let place) = queryType {
             // No place in the message means there's nothing to look up — a general search for
             // the bare word "weather" returns nothing useful from any provider. Ask instead.
             guard let place, !place.isEmpty else { throw WebSearchError.needsLocation }
-            searchStage = "Checking the weather…"
             result = try await openMeteo.search(query: place)
         } else {
-            searchStage = "Searching the interwebs…"
             result = try await generalSearch(queryText)
         }
 
