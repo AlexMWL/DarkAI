@@ -1,7 +1,7 @@
 # Privacy Policy for DarkAI
 
 **Effective date:** August 10, 2026
-**Applies to:** DarkAI 1.0 for iOS
+**Applies to:** DarkAI 1.0.7 for iOS
 **Developer:** Alexander Witlock ("we," "us," or "our")
 
 ## Summary
