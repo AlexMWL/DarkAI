@@ -10,6 +10,7 @@ struct ContentView: View {
     @StateObject private var personalityManager = PersonalityManager()
     @StateObject private var diffusionManager = DiffusionManager()
     @StateObject private var webSearchManager = WebSearchManager()
+    @StateObject private var feedbackManager = FeedbackManager()
 
     @AppStorage("customInstructions") private var customInstructions: String = "You are a local assistant. Respond with precise answers."
     // Was plain `@State`, which meant turning either off — Memories especially, since that's
@@ -27,9 +28,6 @@ struct ContentView: View {
     @State private var inputText: String = ""
     @State private var showSettings = false
     @State private var showDrawer = false
-    /// Last message `id` an animated scroll ran for — lets the chat-scroll `onChange` tell a
-    /// genuinely new message apart from the same message's text growing token-by-token.
-    @State private var lastScrolledMessageID: UUID? = nil
 
     @State private var showDiffusionNotLoadedBanner = false
     @State private var diffusionBannerTask: Task<Void, Never>? = nil
@@ -48,10 +46,22 @@ struct ContentView: View {
     @State private var notice: Notice? = nil
     @State private var reportTarget: ChatMessage? = nil
 
+    /// Set when the user taps "Rate Down" — holds the message off to the side while the optional
+    /// reason prompt below is answered, the same deferred-confirmation shape `conversationToDelete`
+    /// and `reportTarget` already use. "Rate Up" has no equivalent state: it needs no follow-up, so
+    /// it commits immediately from the context menu action.
+    @State private var pendingDownVote: ChatMessage? = nil
+    @State private var downVoteReason: String = ""
+
     /// Set when the user taps Export on a chat in the drawer. Holds a snapshot rather than an ID
     /// so the sheet renders the conversation as it was at the moment it was opened, even if
     /// generation is still streaming into the live one behind it.
     @State private var conversationToExport: Conversation? = nil
+
+    /// Set when the user taps Delete on a chat in the drawer — holds off the actual delete until
+    /// the confirmation alert below is answered, matching the destructive-action pattern
+    /// `SettingsView` already uses (Reset Personality, model deletion).
+    @State private var conversationToDelete: Conversation? = nil
 
     /// Crash recovered from the previous run, shown as a dismissible banner.
     @State private var recoveredCrash: CrashReporter.Report? = nil
@@ -64,73 +74,46 @@ struct ContentView: View {
         let message: String
     }
 
-    @State private var pulseActive = false
-
     var body: some View {
         ZStack {
             VStack(spacing: 0) {
-                customHeaderView
+                ChatHeaderView(isModelActive: isModelActive, showDrawer: $showDrawer, showSettings: $showSettings)
 
-                crashRecoveryBanner
+                CrashRecoveryBannerView(recoveredCrash: $recoveredCrash, crashToInspect: $crashToInspect)
 
-                modelBanner
+                ModelBannerView(llmManager: llmManager, diffusionManager: diffusionManager)
 
                 if let activeConv = conversationManager.activeConversation, !activeConv.messages.isEmpty {
-                    ScrollViewReader { proxy in
-                        ScrollView {
-                            LazyVStack(spacing: 16) {
-                                ForEach(activeConv.messages) { message in
-                                    messageBubble(for: message)
-                                        .id(message.id)
-                                }
-                            }
-                            .padding()
-                            // Centred column on wide layouts. See `Layout.contentMaxWidth` — this
-                            // is a no-op on every iPhone and on an 11-inch iPad in portrait, and
-                            // stops a reply being set as one line per sentence across a landscape
-                            // iPad.
-                            .frame(maxWidth: Layout.contentMaxWidth)
-                            .frame(maxWidth: .infinity)
-                        }
-                        .gesture(
-                            DragGesture().onChanged { _ in
-                                endEditing()
-                            }
-                        )
-                        .onTapGesture {
-                            endEditing()
-                        }
-                        .onChange(of: activeConv.messages) {
-                            // Fires on every streamed token, not just on a new message — the last
-                            // message's `text` growing is itself an array mutation. Animating a
-                            // scroll transaction on every single token queues dozens/hundreds of
-                            // redundant animations over a long reply, so only the genuinely new
-                            // message (a different `id`) gets an animated scroll; keeping the
-                            // growing last message pinned to the bottom during streaming uses a
-                            // plain, unanimated scroll instead.
-                            guard let last = activeConv.messages.last else { return }
-                            if last.id != lastScrolledMessageID {
-                                lastScrolledMessageID = last.id
-                                withAnimation {
-                                    proxy.scrollTo(last.id, anchor: .bottom)
-                                }
-                            } else {
-                                proxy.scrollTo(last.id, anchor: .bottom)
-                            }
-                        }
-                    }
+                    chatMessagesView(for: activeConv)
                 } else {
-                    emptyStateView
+                    EmptyStateView(isModelActive: isModelActive, showSettings: $showSettings)
                 }
-                
-                activeParametersIndicator
 
-                inputArea
+                ActiveParametersIndicatorView(
+                    isPrivateMode: conversationManager.privateMode,
+                    enableRAG: enableRAG,
+                    enableMemories: enableMemories,
+                    llmManager: llmManager
+                )
+
+                InputAreaView(
+                    pendingAttachmentName: $pendingAttachmentName,
+                    pendingAttachmentText: $pendingAttachmentText,
+                    showFileImporter: $showFileImporter,
+                    privateMode: Binding(
+                        get: { conversationManager.privateMode },
+                        set: { conversationManager.privateMode = $0 }
+                    ),
+                    inputText: $inputText,
+                    isModelActive: isModelActive,
+                    isGenerating: llmManager.isGenerating,
+                    sendAction: sendMessage
+                )
             }
-            .background(GlitchBackgroundView(isActive: !showSettings).ignoresSafeArea())
+            .background(GlitchBackgroundView(isActive: backgroundAnimationActive).ignoresSafeArea())
             .blur(radius: showDrawer ? 4 : 0)
             .disabled(showDrawer)
-            
+
             if showDrawer {
                 Color.black.opacity(0.6)
                     .ignoresSafeArea()
@@ -141,51 +124,16 @@ struct ContentView: View {
                     }
                     .transition(.opacity)
             }
-            
-            sidebarDrawer
 
-            if showDiffusionNotLoadedBanner {
-                VStack {
-                    HStack(spacing: 10) {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .foregroundColor(.orange)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("No Diffusion Model Loaded")
-                                .font(.system(size: 13, weight: .bold))
-                                .foregroundColor(Theme.textPrimary)
-                            Text("Load a diffusion model in Settings to generate images.")
-                                .font(.system(size: 11))
-                                .foregroundColor(Theme.textSecondary)
-                        }
-                        Spacer()
-                        Button {
-                            withAnimation { showDiffusionNotLoadedBanner = false }
-                        } label: {
-                            Image(systemName: "xmark")
-                                .foregroundColor(Theme.textSecondary)
-                                .font(.system(size: 12, weight: .bold))
-                        }
-                        .accessibilityLabel("Dismiss")
-                    }
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 10)
-                    .background(
-                        RoundedRectangle(cornerRadius: 12)
-                            .fill(Color.orange.opacity(0.18))
-                            .overlay(RoundedRectangle(cornerRadius: 12)
-                                .stroke(Color.orange.opacity(0.5), lineWidth: 1))
-                    )
-                    .padding(.horizontal, 16)
-                    // Clears the header rather than landing on top of it. This overlay is a
-                    // separate ZStack child, so it is still safe-area inset while the chat column
-                    // is not — the header's own height has to be added back. See
-                    // `Layout.belowHeaderPadding`, which derives it instead of guessing.
-                    .padding(.top, Layout.belowHeaderPadding)
-                    Spacer()
-                }
-                .transition(.move(edge: .top).combined(with: .opacity))
-                .zIndex(10)
-            }
+            SidebarDrawerView(
+                conversationManager: conversationManager,
+                showDrawer: $showDrawer,
+                conversationToExport: $conversationToExport,
+                conversationToDelete: $conversationToDelete,
+                onNewConversation: openOrReuseConversation
+            )
+
+            DiffusionNotLoadedBannerView(showDiffusionNotLoadedBanner: $showDiffusionNotLoadedBanner)
         } // end ZStack
         .sheet(isPresented: $showSettings) {
             SettingsView(
@@ -195,6 +143,7 @@ struct ContentView: View {
                 personalityManager: personalityManager,
                 diffusionManager: diffusionManager,
                 webSearchManager: webSearchManager,
+                feedbackManager: feedbackManager,
                 customInstructions: $customInstructions,
                 enableRAG: $enableRAG,
                 enableMemories: $enableMemories
@@ -210,14 +159,18 @@ struct ContentView: View {
             handleFileImport(result)
         }
         .onAppear {
-            // Open to an existing empty chat, or create one if all chats have messages
-            let emptyChat = conversationManager.conversations.first(where: { $0.messages.isEmpty })
-            if let empty = emptyChat {
-                conversationManager.selectConversation(id: empty.id)
-            } else {
-                conversationManager.createConversation()
-            }
-            
+            WebPortalManager.shared.configure(
+                conversationManager: conversationManager,
+                llmManager: llmManager,
+                ragManager: ragManager,
+                memoryManager: memoryManager,
+                personalityManager: personalityManager,
+                feedbackManager: feedbackManager,
+                webSearchManager: webSearchManager
+            )
+
+            openOrReuseConversation()
+
             // A recovered crash is surfaced as a banner, never as a modal at launch.
             //
             // `takePendingReport()` consumes the file immediately, so even if the banner or the
@@ -287,482 +240,57 @@ struct ContentView: View {
         } message: {
             Text("Would you like to load the model you used last?")
         }
+        .modifier(DownVoteReasonAlertModifier(pendingDownVote: $pendingDownVote, downVoteReason: $downVoteReason, onSubmit: submitDownVote))
     }
-    
-    private var customHeaderView: some View {
-        HStack(spacing: 14) {
-            // Left: Sidebar Toggle
-            Button(action: {
-                withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
-                    showDrawer.toggle()
-                }
-            }) {
-                Image(systemName: "line.horizontal.3")
-                    .foregroundColor(Theme.accent)
-                    .font(.system(size: 20, weight: .semibold))
-                    .frame(width: 44, height: 44)
-                    .contentShape(Rectangle())
-            }
-            .accessibilityLabel("Conversations")
 
-            // Center: Futuristic title
-            Spacer(minLength: 0)
-            HStack(spacing: 4) {
-                Text("DARK")
-                    .font(.system(size: 20, weight: .black))
-                    .foregroundColor(Theme.textPrimary)
-                Text("AI")
-                    .font(.system(size: 20, weight: .black))
-                    .foregroundColor(Theme.accent)
-                    .neonGlow(color: Theme.accent, radius: 4)
-            }
-            .kerning(1.5)
-            .lineLimit(1)
-            // Last resort before truncation on the narrowest devices — a shrunken wordmark still
-            // reads as the app's name, "DARK…" does not.
-            .minimumScaleFactor(0.75)
-            .layoutPriority(1)
-            Spacer(minLength: 0)
-
-            // Right: Status indicator pill + Gear icon
-            HStack(spacing: 10) {
-                // Connection Status Pill
-                HStack(spacing: 6) {
-                    Circle()
-                        .fill(isModelActive ? Color.green : Theme.accent)
-                        .frame(width: 6, height: 6)
-                        .scaleEffect(pulseActive ? 1.4 : 1.0)
-                        .onAppear {
-                            withAnimation(.easeInOut(duration: 1.2).repeatForever(autoreverses: true)) {
-                                pulseActive = true
-                            }
-                        }
-
-                    // `lineLimit(1)` + `fixedSize()` is what stopped this reading "OFFLIN / E" on
-                    // an iPhone SE. The pill now refuses to be compressed, and the wordmark's
-                    // `minimumScaleFactor` above gives way instead — which is the right order of
-                    // precedence, and needs no knowledge of how wide the screen is.
-                    Text(isModelActive ? "READY" : "OFFLINE")
-                        .font(.system(size: 10, weight: .bold, design: .monospaced))
-                        .foregroundColor(isModelActive ? .green : Theme.textSecondary)
-                        .lineLimit(1)
-                        .fixedSize()
-                }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 6)
-                .background(
-                    RoundedRectangle(cornerRadius: 12)
-                        .fill(Theme.border.opacity(0.3))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 12)
-                                .stroke(isModelActive ? Color.green.opacity(0.3) : Theme.border, lineWidth: 1)
-                        )
-                )
-                .accessibilityLabel(isModelActive ? "Model ready" : "No model loaded")
-
-                Button(action: { showSettings = true }) {
-                    Image(systemName: "gearshape.fill")
-                        .foregroundColor(Theme.textPrimary)
-                        .font(.system(size: 18))
-                        .frame(width: 32, height: 32)
-                }
-                .accessibilityLabel("Settings")
-            }
-            .fixedSize(horizontal: true, vertical: false)
-        }
-        .padding(.horizontal, 12)
-        // The device-dependent part of this is the safe-area inset the column already has; this is
-        // only the gap above the header's own content. See `Layout` for why it must stay a constant.
-        .padding(.top, Layout.barTopPadding)
-        .padding(.bottom, Layout.barBottomPadding)
-        .background(
-            Theme.chrome
-                .overlay(
-                    Rectangle()
-                        .frame(height: 1)
-                        .foregroundColor(Theme.border),
-                    alignment: .bottom
-                )
+    /// Pulled out of `body` as its own function (not just a computed property) so the type
+    /// checker solves this call — twelve labeled arguments deep, three of them closures — on its
+    /// own, rather than as one more term inside `body`'s already-large `ZStack`. Same fix as the
+    /// "unable to type-check this expression in reasonable time" issue `SettingsView`'s cards hit
+    /// for the same underlying reason; see the comment above `localLlmModelsCard` there.
+    @ViewBuilder
+    private func chatMessagesView(for activeConv: Conversation) -> some View {
+        ChatMessagesScrollView(
+            conversationManager: conversationManager,
+            llmManager: llmManager,
+            diffusionManager: diffusionManager,
+            feedbackManager: feedbackManager,
+            messages: activeConv.messages,
+            stripMarkdown: personalityManager.isMature,
+            imageGenerationConversationId: imageGenerationConversationId,
+            reportTarget: $reportTarget,
+            onSaveToPhotos: saveToPhotos,
+            onCancelImageGeneration: cancelImageGeneration,
+            onSearchOfferResponse: respondToSearchOffer,
+            onRegenerate: regenerateResponse,
+            onRateUp: rateUp,
+            onRateDown: { pendingDownVote = $0 }
         )
+        // Forces a fresh instance (and fresh scroll state) per conversation, rather than reusing
+        // the same view identity and its stale scroll position/near-bottom flag when the user
+        // switches chats from the drawer.
+        .id(activeConv.id)
     }
-    
+
     private var isModelActive: Bool {
         if case .loaded = llmManager.loadState {
             return true
         }
         return false
     }
-    
-    /// Non-modal replacement for the launch-time crash dialog. Inline, dismissible, and it
-    /// cannot block the app if anything about it fails to draw.
-    @ViewBuilder
-    private var crashRecoveryBanner: some View {
-        if let crash = recoveredCrash {
-            HStack(spacing: 10) {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .foregroundColor(.orange)
-                    .font(.system(size: 14))
 
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("\(AppInfo.displayName) closed unexpectedly last time")
-                        .font(.system(size: 12, weight: .bold))
-                        .foregroundColor(Theme.textPrimary)
-                    Text(crash.reason)
-                        .font(.system(size: 11))
-                        .foregroundColor(Theme.textSecondary)
-                        .lineLimit(2)
-                }
-
-                Spacer(minLength: 4)
-
-                Button("View") { crashToInspect = crash }
-                    .font(.system(size: 12, weight: .bold))
-                    .foregroundColor(Theme.onAccent)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 6)
-                    .background(RoundedRectangle(cornerRadius: 8).fill(Color.orange.opacity(0.85)))
-
-                Button {
-                    withAnimation { recoveredCrash = nil }
-                } label: {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 11, weight: .bold))
-                        .foregroundColor(Theme.textSecondary)
-                }
-                .accessibilityLabel("Dismiss")
-            }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
-            .background(Color.orange.opacity(0.12))
-            .overlay(
-                Rectangle().frame(height: 1).foregroundColor(Color.orange.opacity(0.4)),
-                alignment: .bottom
-            )
-            // Attached here rather than to the root ZStack so it isn't competing with the
-            // settings and content-report sheets during launch layout.
-            .sheet(item: $crashToInspect) { report in
-                CrashReportView(report: report) { }
-            }
-        }
-    }
-
-    /// Either actively generating, or unwinding a cancelled run that hasn't released the
-    /// checkpoint yet. Both are states where the bar should describe the image pipeline rather
-    /// than the chat model, which is unloaded throughout.
-    private var diffusionBusy: Bool {
-        diffusionManager.isGenerating || diffusionManager.isFinishingCancelledRun
-    }
-
-    /// Whether either engine is parked on an error the user can be got out of.
+    /// Whether the animated backdrop should keep doing work.
     ///
-    /// Not shown while something is actively running: a stale failure from a previous attempt is
-    /// still on screen during the next one, and offering to tear down a load in progress is how a
-    /// user turns a recovering app back into a broken one.
-    private var needsRecovery: Bool {
-        guard !diffusionBusy, !llmManager.isGenerating else { return false }
-        if case .failed = llmManager.loadState { return true }
-        if case .failed = diffusionManager.diffusionLoadState { return true }
-        return false
+    /// Previously wired only to `!showSettings`, so the glitch timer's per-tick animation trigger
+    /// kept firing behind the conversations drawer and every other sheet/alert that can sit above
+    /// the chat screen — all of them visually hiding the animation without stopping it. This
+    /// combines every piece of state that can obscure the chat screen so the background actually
+    /// stops doing invisible work whenever one of them is up.
+    private var backgroundAnimationActive: Bool {
+        !showSettings && !showDrawer && !showFileImporter && !showAutoLoadAlert
+            && notice == nil && reportTarget == nil && conversationToExport == nil
+            && crashToInspect == nil && conversationToDelete == nil && pendingDownVote == nil
     }
-
-    /// Diffusion checkpoint driving the current generation.
-    ///
-    /// Prefers the name the loader reported, since that is the checkpoint actually resident.
-    /// Falls back to the selected file's name for the stretch before the load completes — the
-    /// banner needs something to say from the moment generation starts, not just once the
-    /// weights are up.
-    private var activeDiffusionModelName: String? {
-        if case let .loaded(name, _) = diffusionManager.diffusionLoadState {
-            return name
-        }
-        if let url = diffusionManager.activeDiffusionURL {
-            return url.lastPathComponent
-        }
-        if let path = diffusionManager.lastDiffusionModelPath {
-            return URL(fileURLWithPath: path).lastPathComponent
-        }
-        return nil
-    }
-
-    @ViewBuilder
-    private var modelBanner: some View {
-        HStack {
-            Image(systemName: diffusionBusy ? "photo.fill" : "cpu.fill")
-                .foregroundColor(diffusionBusy ? .purple : Theme.accent)
-
-            // Image generation evicts the chat model to make room, so `llmManager.loadState`
-            // reads `.unloaded` for the whole operation — the bar used to say "No model loaded.
-            // Choose one in Settings to start." while the app was visibly busy generating.
-            // Show what is actually running instead, and let it fall back to the LLM state on
-            // its own once the session ends and the chat model is reloaded.
-            if diffusionManager.isFinishingCancelledRun {
-                // The sampler can't be interrupted, so this covers the gap between the user
-                // cancelling and the run unwinding far enough to put the chat model back.
-                Text("Cancelling — the chat model will reload when the current step finishes.")
-                    .foregroundColor(Theme.textSecondary)
-                    .lineLimit(2)
-            } else if diffusionManager.isGenerating {
-                HStack(spacing: 8) {
-                    Text("Generating with \(activeDiffusionModelName ?? "diffusion model")")
-                        .foregroundColor(Theme.textPrimary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-
-                    if diffusionManager.generationProgress > 0 {
-                        Text("\(Int(diffusionManager.generationProgress * 100))%")
-                            .foregroundColor(.purple)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
-                            .background(Color.purple.opacity(0.15))
-                            .cornerRadius(4)
-                    }
-                }
-                .font(.system(size: 11, weight: .semibold, design: .monospaced))
-            } else {
-            switch llmManager.loadState {
-            case .unloaded:
-                Text("No model loaded. Choose one in Settings to start.")
-                    .foregroundColor(Theme.textSecondary)
-            case .loading(_, let status):
-                Text(status)
-                    .foregroundColor(Theme.textPrimary)
-            case let .loaded(name, size):
-                HStack(spacing: 8) {
-                    Text("\(name) [\(String(format: "%.2f GB", size)) weights]")
-                        .foregroundColor(Theme.textPrimary)
-                    
-                    if llmManager.isGenerating && llmManager.generationSpeed > 0 {
-                        Text("\(String(format: "%.1f", llmManager.generationSpeed)) t/s")
-                            .foregroundColor(Theme.accentCyan)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
-                            .background(Theme.accentCyan.opacity(0.1))
-                            .cornerRadius(4)
-                    }
-                }
-                .font(.system(size: 11, weight: .semibold, design: .monospaced))
-            case .failed(let error):
-                Text(error)
-                    .foregroundColor(Theme.accent)
-                    .lineLimit(3)
-            }
-            }
-
-            Spacer(minLength: 6)
-
-            // Recovery, right next to the failure that needs it. Every state this bar can report
-            // as `.failed` — a memory warning that unloaded the model, an image generation that
-            // evicted the chat model and then couldn't load the checkpoint — used to leave
-            // force-quitting as the only way forward.
-            if needsRecovery {
-                ResetModelsButton(llmManager: llmManager, diffusionManager: diffusionManager, compact: true)
-                    .fixedSize()
-            }
-        }
-        .font(.system(size: 12))
-        .padding(.horizontal, 16)
-        .padding(.vertical, 8)
-        .background(diffusionBusy ? Color.purple.opacity(0.10) : Theme.background)
-        .animation(.easeInOut(duration: 0.25), value: diffusionBusy)
-        .overlay(
-            Rectangle()
-                .frame(height: 1)
-                .foregroundColor(Theme.border),
-            alignment: .bottom
-        )
-    }
-    
-    @ViewBuilder
-    private var emptyStateView: some View {
-        // Scrollable, and that is a keyboard fix rather than a scrolling feature.
-        //
-        // As a plain `VStack` this had a minimum height of roughly 400 pt — the welcome panel is
-        // fixed-size content and `Spacer`s can only collapse to zero around it. Add the header,
-        // banners, status strip, and input row and the column's minimum came to about 720 pt. On an
-        // iPhone SE the keyboard leaves 376 pt. When SwiftUI cannot shrink a column into the space
-        // the keyboard leaves, it slides it instead: the header went off the top of the screen and
-        // the input row — the one thing that must stay visible while typing — went underneath the
-        // keyboard.
-        //
-        // Inside a `ScrollView` the region's minimum height is zero, so the column always fits and
-        // the input row stays put. `minHeight` keeps the panel vertically centred whenever there is
-        // room, which is how it looked before, and it simply scrolls when there isn't.
-        GeometryReader { proxy in
-            ScrollView {
-                VStack(spacing: 18) {
-                    Spacer(minLength: 0)
-
-                    welcomePanel
-
-                    Spacer(minLength: 0)
-                }
-                .padding(.horizontal, 20)
-                .frame(maxWidth: Layout.contentMaxWidth)
-                .frame(maxWidth: .infinity, minHeight: proxy.size.height)
-            }
-            .scrollBounceBehavior(.basedOnSize)
-            .scrollDismissesKeyboard(.interactively)
-        }
-    }
-
-    /// The welcome copy and its shade panel. Split out from `emptyStateView` so the panel wraps
-    /// only the content — wrapping the enclosing `VStack` would stretch it across the spacers
-    /// and shade the entire screen, which is the thing this is meant to avoid.
-    @ViewBuilder
-    private var welcomePanel: some View {
-        VStack(spacing: 18) {
-            Image(systemName: isModelActive ? "bubble.left.and.bubble.right.fill" : "square.and.arrow.down.fill")
-                .font(.system(size: 52))
-                .foregroundColor(Theme.accent)
-                .neonGlow(color: Theme.accent, radius: 10)
-
-            Text(isModelActive ? "Ask me anything" : "Add a model to begin")
-                .font(.system(size: 19, weight: .bold))
-                .foregroundColor(Theme.textPrimary)
-
-            Text(isModelActive
-                 ? "Everything runs on this device. Try a question, or describe a picture to generate one."
-                 : "\(AppInfo.displayName) needs a model to run. Open Settings to download one — it only takes a minute.")
-                .font(.system(size: 13))
-                .foregroundColor(Theme.textSecondary)
-                .multilineTextAlignment(.center)
-                .lineSpacing(3)
-                .frame(maxWidth: 300)
-
-            if !isModelActive {
-                Button {
-                    showSettings = true
-                } label: {
-                    Text("Open Settings")
-                        .font(.system(size: 14, weight: .bold))
-                        .foregroundColor(Theme.onAccent)
-                        .padding(.horizontal, 26)
-                        .padding(.vertical, 11)
-                        .background(RoundedRectangle(cornerRadius: 12).fill(Theme.accent))
-                }
-            }
-
-            // Sets expectations before the first response rather than after — a reviewer
-            // opening a fresh install sees this, and so does a user about to trust an answer.
-            Text("Responses are generated by a model on this device and can be inaccurate. Check anything important.")
-                .font(.system(size: 11))
-                .foregroundColor(Theme.textMuted)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: 290)
-                .padding(.top, 6)
-        }
-        .padding(.horizontal, 24)
-        .padding(.vertical, 26)
-        // Shade behind the copy rather than over the whole screen, so the backdrop stays part
-        // of the design while the text sitting on it keeps its contrast.
-        .readablePanel(cornerRadius: 28)
-    }
-    
-    // Indicator pills
-    //
-    // Horizontally scrollable rather than a plain `HStack`. Laid out flat, the strip needs roughly
-    // 390 pt with everything showing and about 460 pt once the TRUNCATING pill appears — so on an
-    // SE (375 pt) it was already clipping the context and token counters, and on a 15 Pro the
-    // truncation warning pushed them off too. A `Spacer` between the groups made it worse by
-    // guaranteeing the overflow landed on the right-hand readouts, which are the numbers most worth
-    // watching. Scrolling keeps every pill at full size and legible on every device; on wide screens
-    // the content simply doesn't fill the row and nothing scrolls.
-    @ViewBuilder
-    private var activeParametersIndicator: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            statusPills
-                .padding(.vertical, 8)
-                .padding(.horizontal, 16)
-        }
-        .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
-        .background(Theme.chrome)
-        .overlay(
-            Rectangle()
-                .frame(height: 1)
-                .foregroundColor(Theme.border),
-            alignment: .top
-        )
-    }
-
-    @ViewBuilder
-    private var statusPills: some View {
-        HStack(spacing: 12) {
-            if conversationManager.privateMode {
-                HStack(spacing: 4) {
-                    Image(systemName: "eye.slash.fill")
-                    Text("PRIVATE — NOT SAVED")
-                }
-                .font(.system(size: 9, weight: .bold))
-                .foregroundColor(Theme.accent)
-                .neonGlow(color: Theme.accent, radius: 4)
-            } else {
-                HStack(spacing: 4) {
-                    Image(systemName: "tray.full.fill")
-                    Text("SAVED ON DEVICE")
-                }
-                .font(.system(size: 9, weight: .bold))
-                .foregroundColor(.green)
-            }
-
-            // Was a `Spacer`, which is meaningless inside a horizontal scroll view — it has no
-            // width to expand into. A rule keeps the visual break between "where this chat is
-            // stored" and "what the model is doing" that the gap used to provide.
-            Rectangle()
-                .fill(Theme.border)
-                .frame(width: 1, height: 10)
-
-            if enableRAG {
-                Text("RAG")
-                    .font(.system(size: 9, weight: .bold))
-                    .foregroundColor(Theme.accentCyan)
-            }
-            if enableMemories {
-                Text("MEMORIES")
-                    .font(.system(size: 9, weight: .bold))
-                    .foregroundColor(Theme.accent)
-            }
-
-            // Shown whenever the oldest conversation history (or, mid-generation, the
-            // oldest tokens in the live KV cache) had to be dropped to fit the context
-            // window — the conversation keeps going, this just makes it visible when it's
-            // happening rather than a silent, confusing drop in what the model can recall.
-            if llmManager.isContextTruncating {
-                HStack(spacing: 3) {
-                    Image(systemName: "arrow.trianglehead.2.clockwise")
-                    Text("TRUNCATING")
-                }
-                .font(.system(size: 9, weight: .bold))
-                .foregroundColor(.orange)
-            }
-
-            // Live context-window usage vs. the limit actually applied to the loaded
-            // model (which can be lower than the requested setting once clamped to
-            // available RAM). Turns orange near the limit as an early warning.
-            let ctxLimit = llmManager.loadedContextWindow > 0 ? llmManager.loadedContextWindow : llmManager.contextTokenLimit
-            if ctxLimit > 0 {
-                let ctxFraction = Double(llmManager.contextTokensUsed) / Double(ctxLimit)
-                Text("CTX: \(llmManager.contextTokensUsed)/\(ctxLimit)T")
-                    .font(.system(size: 9, weight: .bold, design: .monospaced))
-                    .foregroundColor(ctxFraction >= 0.9 ? .orange : Theme.textSecondary)
-            }
-
-            // Shows live generated-token progress against the cap while streaming, so the
-            // max-response-size setting is directly observable being enforced in the UI.
-            if llmManager.isGenerating {
-                Text("GEN: \(llmManager.currentResponseTokenCount)/\(llmManager.maxTokens)T")
-                    .font(.system(size: 9, weight: .bold, design: .monospaced))
-                    .foregroundColor(Theme.accentCyan)
-            } else {
-                Text("MAX: \(llmManager.maxTokens)T")
-                    .font(.system(size: 9, weight: .bold, design: .monospaced))
-                    .foregroundColor(Theme.textSecondary)
-            }
-        }
-        // Each pill keeps its ideal width. Without this the scroll view would still be free to
-        // compress a `Text` that has somewhere to truncate to, which is the behaviour being fixed.
-        .fixedSize(horizontal: true, vertical: false)
-    }
-
 
     // MARK: - Output Filtering
 
@@ -773,506 +301,139 @@ struct ContentView: View {
         ModelOutput.filterThoughts(from: text, stripMarkdown: stripMarkdown)
     }
 
-    /// Layers the personality matrix and measured writing style onto a base system prompt.
-    ///
-    /// Shared by every path that calls `llmManager.generateResponse` — the ordinary chat turn and
-    /// the file-upload auto-description — so an attached file doesn't reset the assistant's voice
-    /// to a bare, unadapted default for that one reply.
+    /// Forwards to `ChatOrchestration.systemPromptWithPersonality`, which is where this logic now
+    /// lives so `WebPortalManager` can apply the identical layering to a Web Portal chat turn.
     private func systemPromptWithPersonality(base: String) -> String {
-        guard llmManager.activeModelURL != nil else { return base }
-        let personality = personalityManager.getPersonality()
-        guard !personality.isEmpty else { return base }
-
-        let score = personalityManager.maturityScore
-        if score < 0.4 {
-            return base + "\n\n[Communication Style Note — adapt naturally to user's style]:\n" + personality
-        } else if score < 0.7 {
-            return base + "\n\n" + personality
-        } else {
-            let identityAnchor = base
-                .components(separatedBy: CharacterSet(charactersIn: ".!?\n"))
-                .first?
-                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            return identityAnchor.isEmpty ? personality : identityAnchor + ".\n\n" + personality
-        }
-    }
-
-    private func messageBubble(for message: ChatMessage) -> some View {
-        HStack(alignment: .top, spacing: 12) {
-            if message.isUser {
-                Spacer()
-                Text(message.text)
-                    .font(.system(size: 14))
-                    .foregroundColor(Theme.onAccent)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 10)
-                    .background(
-                        RoundedRectangle(cornerRadius: 14)
-                            .fill(LinearGradient(colors: [Theme.accent, Theme.accentRose], startPoint: .topLeading, endPoint: .bottomTrailing))
-                    )
-                    .contextMenu {
-                        Button {
-                            UIPasteboard.general.string = message.text
-                        } label: {
-                            Label("Copy", systemImage: "doc.on.doc")
-                        }
-                        ShareLink(item: ConversationExport.shareText(for: message)) {
-                            Label("Share", systemImage: "square.and.arrow.up")
-                        }
-                    }
-            } else if let imgData = message.resolvedImageData, let uiImg = UIImage(data: imgData) {
-                // AI-generated image bubble
-                Image(systemName: "sparkles")
-                    .foregroundColor(Color.purple)
-                    .font(.system(size: 12))
-                    .padding(8)
-                    .background(Theme.border.opacity(0.4))
-                    .clipShape(Circle())
-
-                VStack(alignment: .leading, spacing: 8) {
-                    // Image
-                    Image(uiImage: uiImg)
-                        .resizable()
-                        .scaledToFit()
-                        .frame(maxWidth: Layout.chatImageMaxWidth)
-                        .clipShape(RoundedRectangle(cornerRadius: 12))
-                        .overlay(RoundedRectangle(cornerRadius: 12)
-                            .stroke(Color.purple.opacity(0.35), lineWidth: 1))
-                        .contextMenu {
-                            Button {
-                                saveToPhotos(uiImg)
-                            } label: {
-                                Label("Save to Photos", systemImage: "square.and.arrow.down")
-                            }
-                            Button {
-                                UIPasteboard.general.image = uiImg
-                            } label: {
-                                Label("Copy Image", systemImage: "doc.on.doc")
-                            }
-                            Divider()
-                            Button(role: .destructive) {
-                                reportTarget = message
-                            } label: {
-                                Label("Report a Concern", systemImage: "flag")
-                            }
-                        }
-
-                    // Always-visible action row
-                    HStack(spacing: 10) {
-                        Button {
-                            saveToPhotos(uiImg)
-                        } label: {
-                            Label("Save", systemImage: "square.and.arrow.down")
-                                .font(.system(size: 11, weight: .semibold))
-                                .foregroundColor(Theme.onAccent)
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 5)
-                                .background(
-                                    RoundedRectangle(cornerRadius: 7)
-                                        .fill(Color.purple.opacity(0.75))
-                                )
-                        }
-
-                        Button {
-                            UIPasteboard.general.image = uiImg
-                        } label: {
-                            Label("Copy", systemImage: "doc.on.doc")
-                                .font(.system(size: 11, weight: .semibold))
-                                .foregroundColor(Theme.textSecondary)
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 5)
-                                .background(
-                                    RoundedRectangle(cornerRadius: 7)
-                                        .fill(Theme.border.opacity(0.5))
-                                )
-                        }
-
-                        // Report button — a visible, one-tap path to flag generated imagery,
-                        // not just a hidden long-press affordance.
-                        Button {
-                            reportTarget = message
-                        } label: {
-                            Label("Report", systemImage: "flag")
-                                .font(.system(size: 11, weight: .semibold))
-                                .foregroundColor(Theme.textSecondary)
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 5)
-                                .background(
-                                    RoundedRectangle(cornerRadius: 7)
-                                        .fill(Theme.border.opacity(0.5))
-                                )
-                        }
-
-                        Spacer(minLength: 0)
-                    }
-
-                    if !message.text.isEmpty {
-                        Text(message.text)
-                            .font(.system(size: 11, design: .monospaced))
-                            .foregroundColor(Theme.textSecondary)
-                            .lineLimit(2)
-                    }
-                }
-                Spacer()
-            } else if !message.isImageMessage && !message.isUser && diffusionManager.isGenerating
-                        && imageGenerationConversationId == conversationManager.activeConversationId
-                        && conversationManager.activeConversation?.messages.last?.id == message.id {
-                // In-progress image generation spinner
-                Image(systemName: "sparkles")
-                    .foregroundColor(Color.purple)
-                    .font(.system(size: 12))
-                    .padding(8)
-                    .background(Theme.border.opacity(0.4))
-                    .clipShape(Circle())
-
-                VStack(alignment: .leading, spacing: 7) {
-                    // Naming the stage matters here: loading a 3 GB checkpoint shows no sampler
-                    // progress at all, so a bare "0%" for two minutes reads as a frozen app.
-                    Text(diffusionManager.generationStage.isEmpty ? "Working…" : diffusionManager.generationStage)
-                        .font(.system(size: 13, design: .monospaced))
-                        .foregroundColor(Theme.textPrimary)
-
-                    if diffusionManager.generationProgress > 0 {
-                        ProgressView(value: diffusionManager.generationProgress)
-                            .progressViewStyle(LinearProgressViewStyle(tint: Color.purple))
-                            .frame(width: 170)
-                        Text("\(Int(diffusionManager.generationProgress * 100))%")
-                            .font(.system(size: 11, design: .monospaced))
-                            .foregroundColor(Theme.textSecondary)
-                    } else {
-                        ProgressView()
-                            .progressViewStyle(CircularProgressViewStyle(tint: Color.purple))
-                            .scaleEffect(0.7)
-                            .frame(height: 18, alignment: .leading)
-                    }
-
-                    // An escape hatch that always works. Generation itself can't be aborted, but
-                    // the user should never be stuck staring at a bar with no way back.
-                    Button {
-                        diffusionManager.cancelGeneration()
-                        conversationManager.updateLastMessage(text: "[Image generation cancelled.]")
-                        conversationManager.saveConversations()
-                    } label: {
-                        Text("Cancel")
-                            .font(.system(size: 11, weight: .semibold))
-                            .foregroundColor(Theme.accent)
-                    }
-                }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 10)
-                .background(Theme.cardBackground)
-                .cornerRadius(14)
-                .overlay(RoundedRectangle(cornerRadius: 14)
-                    .stroke(Color.purple.opacity(0.3), lineWidth: 1))
-                Spacer()
-            } else {
-                // Standard text bubble
-                Image(systemName: "terminal.fill")
-                    .foregroundColor(Theme.accentCyan)
-                    .font(.system(size: 12))
-                    .padding(8)
-                    .background(Theme.border.opacity(0.4))
-                    .clipShape(Circle())
-
-                let filteredText = filterThoughts(from: message.text, stripMarkdown: personalityManager.isMature)
-                let isThinking = filteredText.isEmpty && llmManager.isGenerating
-                // Suppressed thinking/preamble tokens are never streamed as visible text, so
-                // without this the bubble would show a bare "Thinking..." with no indication
-                // whether it's actively working or has stalled — indistinguishable from a hang.
-                let thinkingLabel = llmManager.thinkingTokensUsed > 0
-                    ? "Thinking... (\(llmManager.thinkingTokensUsed)T)"
-                    : "Thinking..."
-
-                VStack(alignment: .leading, spacing: 8) {
-                    Text(isThinking ? thinkingLabel : filteredText)
-                        .font(.system(size: 14, design: .monospaced))
-                        .foregroundColor(isThinking ? Theme.textSecondary : Theme.textPrimary)
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 10)
-                        .background(Theme.cardBackground)
-                        .cornerRadius(14)
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 14)
-                                .stroke(Theme.border, lineWidth: 1)
-                        )
-                        .contextMenu {
-                            Button {
-                                UIPasteboard.general.string = isThinking ? message.text : filteredText
-                            } label: {
-                                Label("Copy", systemImage: "doc.on.doc")
-                            }
-                            ShareLink(item: filteredText) {
-                                Label("Share", systemImage: "square.and.arrow.up")
-                            }
-                            Divider()
-                            Button(role: .destructive) {
-                                reportTarget = message
-                            } label: {
-                                Label("Report a Concern", systemImage: "flag")
-                            }
-                        }
-
-                    // Web search offer buttons.
-                    // Only ever set on an assistant message asking whether to search — see
-                    // `respondToSearchOffer`. Cleared the moment either button is tapped, so
-                    // this never lingers once the user has answered.
-                    if let query = message.pendingSearchQuery {
-                        HStack(spacing: 8) {
-                            Button {
-                                respondToSearchOffer(accepted: true, query: query, offerMessageId: message.id)
-                            } label: {
-                                Label("Search", systemImage: "magnifyingglass")
-                                    .font(.system(size: 12, weight: .semibold))
-                                    .foregroundColor(Theme.onAccent)
-                                    .padding(.horizontal, 12)
-                                    .padding(.vertical, 6)
-                                    .background(RoundedRectangle(cornerRadius: 8).fill(Theme.accentCyan))
-                            }
-                            Button {
-                                respondToSearchOffer(accepted: false, query: query, offerMessageId: message.id)
-                            } label: {
-                                Text("No, just answer")
-                                    .font(.system(size: 12, weight: .semibold))
-                                    .foregroundColor(Theme.textSecondary)
-                                    .padding(.horizontal, 12)
-                                    .padding(.vertical, 6)
-                                    .background(RoundedRectangle(cornerRadius: 8).fill(Theme.border.opacity(0.5)))
-                            }
-                        }
-                    }
-                }
-                Spacer()
-            }
-        }
-    }
-
-    @ViewBuilder
-    private var inputArea: some View {
-        VStack(alignment: .leading, spacing: 8) {
-
-            if let attName = pendingAttachmentName {
-                HStack {
-                    Image(systemName: "doc.text.image")
-                        .foregroundColor(Theme.accentCyan)
-                    Text(attName)
-                        .font(.system(size: 12, weight: .bold))
-                        .foregroundColor(Theme.textPrimary)
-                        .lineLimit(1)
-                    Spacer()
-                    Button(action: {
-                        pendingAttachmentName = nil
-                        pendingAttachmentText = nil
-                    }) {
-                        Image(systemName: "xmark.circle.fill")
-                            .foregroundColor(.gray)
-                    }
-                    .accessibilityLabel("Remove attachment")
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-                .background(Theme.cardBackground)
-                .cornerRadius(12)
-                .overlay(RoundedRectangle(cornerRadius: 12).stroke(Theme.border, lineWidth: 1))
-            }
-            
-            HStack(spacing: 10) {
-            
-            // Universal OCR / Vision Upload Button (Always available for all models via iOS Native Vision)
-            Button(action: { showFileImporter = true }) {
-                Image(systemName: "paperclip")
-                    .foregroundColor(Theme.accentCyan)
-                    .font(.system(size: 18))
-                    .frame(width: 40, height: 40)
-                    .background(Theme.accentCyan.opacity(0.15))
-                    .clipShape(Circle())
-                    .overlay(Circle().stroke(Theme.accentCyan.opacity(0.4), lineWidth: 1))
-            }
-            .accessibilityLabel("Attach file")
-            
-            // Private-chat toggle — this conversation is kept in memory only
-            Button(action: {
-                conversationManager.privateMode.toggle()
-            }) {
-                Image(systemName: conversationManager.privateMode ? "eye.slash.fill" : "eye.fill")
-                    .foregroundColor(conversationManager.privateMode ? Theme.accent : Theme.textSecondary)
-                    .font(.system(size: 18))
-                    .frame(width: 40, height: 40)
-                    .background(Theme.border.opacity(0.3))
-                    .clipShape(Circle())
-                    .overlay(
-                        Circle()
-                            .stroke(conversationManager.privateMode ? Theme.accent : Color.clear, lineWidth: 1.5)
-                    )
-            }
-            .accessibilityLabel(conversationManager.privateMode ? "Private chat on" : "Private chat off")
-            
-            TextField(isModelActive ? "Execute prompt..." : "Model unloaded...", text: $inputText, axis: .vertical)
-                .lineLimit(1...8)
-                .font(.system(size: 14))
-                .foregroundColor(Theme.textPrimary)
-                .padding(.horizontal, 14)
-                .padding(.vertical, 10)
-                .background(Theme.background)
-                .cornerRadius(20)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 20)
-                        .stroke(Theme.border, lineWidth: 1.5)
-                )
-                .disabled(!isModelActive)
-            
-            Button(action: sendMessage) {
-                Image(systemName: llmManager.isGenerating ? "stop.fill" : "arrow.up")
-                    .foregroundColor(isModelActive ? Theme.onAccent : Theme.textSecondary)
-                    .font(.system(size: 14, weight: .bold))
-                    .padding(10)
-                    .background(
-                        Circle()
-                            .fill(isModelActive ? Theme.accent : Theme.border)
-                    )
-                    .neonGlow(color: isModelActive ? Theme.accent : .clear, radius: 4)
-            }
-            .disabled(!isModelActive && !llmManager.isGenerating)
-            .accessibilityLabel(llmManager.isGenerating ? "Stop generating" : "Send message")
-            }
-        }
-        .padding()
-        // Matches the message column so the field lines up with the conversation above it rather
-        // than running the full width of an iPad while the text stops well short of it.
-        .frame(maxWidth: Layout.contentMaxWidth)
-        .frame(maxWidth: .infinity)
-        .background(Theme.chrome)
-        .overlay(
-            Rectangle()
-                .frame(height: 1)
-                .foregroundColor(Theme.border),
-            alignment: .top
+        ChatOrchestration.systemPromptWithPersonality(
+            base: base,
+            llmManager: llmManager,
+            personalityManager: personalityManager,
+            feedbackManager: feedbackManager
         )
     }
 
-    private var sidebarDrawer: some View {
-        HStack(spacing: 0) {
-            VStack(alignment: .leading, spacing: 20) {
-
-                HStack {
-                    Text("CHATS")
-                        .font(.system(size: 13, weight: .black))
-                        .foregroundColor(Theme.textPrimary)
-                        .kerning(2.0)
-                    
-                    Spacer()
-
-                    Button(action: {
-                        conversationManager.createConversation()
-                        withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
-                            showDrawer = false
-                        }
-                    }) {
-                        Image(systemName: "plus")
-                            .foregroundColor(Theme.accent)
-                            .font(.system(size: 16, weight: .bold))
-                    }
-                    .accessibilityLabel("New chat")
-
-                    Button(action: {
-                        withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
-                            showDrawer = false
-                        }
-                    }) {
-                        Image(systemName: "xmark")
-                            .foregroundColor(Theme.textSecondary)
-                            .font(.system(size: 14, weight: .bold))
-                    }
-                    .accessibilityLabel("Close chat list")
-                }
-                .padding(.top, Layout.barTopPadding + 14)
-                .padding(.horizontal)
-
-                ScrollView {
-                    VStack(spacing: 12) {
-                        ForEach(conversationManager.conversations) { conversation in
-                            HStack {
-                                Button(action: {
-                                    conversationManager.selectConversation(id: conversation.id)
-                                    withAnimation(.spring()) {
-                                        showDrawer = false
-                                    }
-                                }) {
-                                    HStack(spacing: 10) {
-                                        Image(systemName: "chevron.right.square.fill")
-                                            .foregroundColor(conversationManager.activeConversationId == conversation.id ? Theme.accent : Theme.textMuted)
-                                        Text(conversation.title)
-                                            .font(.system(size: 13, weight: .semibold))
-                                            .foregroundColor(conversationManager.activeConversationId == conversation.id ? Theme.textPrimary : Theme.textSecondary)
-                                            .lineLimit(1)
-                                    }
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                }
-                                
-                                // Export conversation. Sits next to Delete on purpose: this is the
-                                // one place a chat can leave the device, and it should be as easy
-                                // to find as the action that destroys it.
-                                Button(action: {
-                                    conversationToExport = conversation
-                                }) {
-                                    Image(systemName: "square.and.arrow.up")
-                                        .foregroundColor(Theme.textMuted)
-                                        .font(.system(size: 12))
-                                        .frame(width: 26, height: 26)
-                                        .contentShape(Rectangle())
-                                }
-                                .accessibilityLabel("Export \(conversation.title)")
-                                .disabled(conversation.messages.isEmpty)
-                                .opacity(conversation.messages.isEmpty ? 0.35 : 1)
-
-                                Button(action: {
-                                    conversationManager.deleteConversation(id: conversation.id)
-                                }) {
-                                    Image(systemName: "trash")
-                                        .foregroundColor(Theme.textMuted)
-                                        .font(.system(size: 12))
-                                        .frame(width: 26, height: 26)
-                                        .contentShape(Rectangle())
-                                }
-                                .accessibilityLabel("Delete \(conversation.title)")
-                            }
-                            .padding(10)
-                            .background(
-                                RoundedRectangle(cornerRadius: 8)
-                                    .fill(conversationManager.activeConversationId == conversation.id ? Theme.border.opacity(0.3) : Color.clear)
-                            )
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 8)
-                                    .stroke(conversationManager.activeConversationId == conversation.id ? Theme.border : Color.clear, lineWidth: 1)
-                            )
-                        }
-                    }
-                    .padding(.horizontal)
-                }
-                
-                Spacer()
-            }
-            .frame(width: Layout.drawerWidth)
-            .background(Theme.background)
-            .overlay(
-                Rectangle()
-                    .frame(width: 1)
-                    .foregroundColor(Theme.border),
-                alignment: .trailing
-            )
-            .offset(x: showDrawer ? 0 : -Layout.drawerWidth)
-
-            Spacer()
+    /// The nearest user message before `message` in its conversation — the prompt that produced
+    /// this reply. Used to give a rating enough context to be useful later (both for the human
+    /// reviewing feedback in Settings and for the background directive-synthesis pass), without
+    /// storing the whole conversation on every vote.
+    private func precedingUserPrompt(for message: ChatMessage, in conversation: Conversation) -> String {
+        guard let index = conversation.messages.firstIndex(where: { $0.id == message.id }) else { return "" }
+        for candidate in conversation.messages[..<index].reversed() where candidate.isUser {
+            return candidate.text
         }
-        .ignoresSafeArea(.container, edges: [.leading, .trailing])
+        return ""
     }
-    
+
+    private func rateUp(_ message: ChatMessage) {
+        guard let conversation = conversationManager.activeConversation else { return }
+        feedbackManager.rateUp(
+            conversationId: conversation.id,
+            messageId: message.id,
+            userPrompt: precedingUserPrompt(for: message, in: conversation),
+            assistantResponse: message.text
+        )
+    }
+
+    /// Commits the down-vote started by tapping "Rate Down" in the message context menu, once the
+    /// optional-reason alert (`pendingDownVote`) is dismissed. `reason` is whatever the user typed,
+    /// blank or not — `FeedbackManager` treats an empty string the same as no reason at all.
+    private func submitDownVote(_ message: ChatMessage, reason: String) {
+        guard let conversation = conversationManager.activeConversation else { return }
+        feedbackManager.rateDown(
+            conversationId: conversation.id,
+            messageId: message.id,
+            userPrompt: precedingUserPrompt(for: message, in: conversation),
+            assistantResponse: message.text,
+            reason: reason,
+            llmManager: llmManager
+        )
+    }
+
+    // MARK: - Haptics
+
+    /// Centralizes the exact feedback-generator calls used at every haptic call site in this
+    /// file, so send/cancel/complete/blocked all get a consistent, correctly-styled tap instead
+    /// of each call site picking its own generator by hand.
+    private func hapticImpact(_ style: UIImpactFeedbackGenerator.FeedbackStyle) {
+        UIImpactFeedbackGenerator(style: style).impactOccurred()
+    }
+
+    private func hapticNotification(_ type: UINotificationFeedbackGenerator.FeedbackType) {
+        UINotificationFeedbackGenerator().notificationOccurred(type)
+    }
+
+    // MARK: - Conversations
+
+    /// Opens an existing empty chat instead of creating a redundant one — the same rule
+    /// `.onAppear` applies at launch, reused here so tapping "+" repeatedly doesn't leave a trail
+    /// of empty "Chat N" conversations behind.
+    private func openOrReuseConversation() {
+        // A just-seeded Welcome conversation is never "empty" (it always has its one welcome
+        // message), so it would never match the reuse check below — meaning the very first call
+        // to this function, from `.onAppear` on a clean install, would immediately bury it under
+        // a brand-new blank chat before the user ever saw it. This is a one-shot check: only the
+        // launch-time call sees `true`, so the "+" button still creates a real new chat rather
+        // than bouncing back to Welcome for the rest of the session.
+        if conversationManager.consumeJustSeededWelcome() { return }
+        if let empty = conversationManager.conversations.first(where: { $0.messages.isEmpty }) {
+            conversationManager.selectConversation(id: empty.id)
+        } else {
+            conversationManager.createConversation()
+        }
+    }
+
+    /// Re-runs generation for the user turn that produced `assistantMessage`, through the same
+    /// `runImageGeneration` / `generateTextResponse` paths a fresh send uses — never a second copy
+    /// of either. The caller (`ChatMessagesScrollView.bubble(for:)`) only offers this for the last
+    /// assistant message in the conversation, since finding "the turn that led to this reply" for
+    /// anything earlier would have to guess across intervening regenerations or edits.
+    private func regenerateResponse(for assistantMessage: ChatMessage) {
+        // Not just `isGenerating`: that flag goes false the instant Cancel is tapped, while the
+        // cancelled native call can still be finishing on its own thread — `isFinishingCancelledRun`
+        // covers that tail (see `ModelBannerView.diffusionBusy`, which reads the same two flags for
+        // the same reason). Racing a second `generateImage` against that tail is exactly what
+        // `SDWrapper`'s own re-entrancy guard now refuses.
+        guard !diffusionManager.isGenerating, !diffusionManager.isFinishingCancelledRun, !llmManager.isGenerating,
+              let conversationId = conversationManager.activeConversationId,
+              let conversation = conversationManager.conversation(id: conversationId),
+              let assistantIndex = conversation.messages.firstIndex(where: { $0.id == assistantMessage.id }),
+              let userIndex = conversation.messages[0..<assistantIndex].lastIndex(where: { $0.isUser })
+        else { return }
+
+        let userMessage = conversation.messages[userIndex]
+        let history = Array(conversation.messages[0..<userIndex])
+
+        hapticImpact(.medium)
+        conversationManager.deleteMessage(id: assistantMessage.id)
+
+        // Re-classify rather than assume text: the failed turn being regenerated might be a
+        // stalled/blocked image request just as easily as a stopped text reply, and this is what
+        // routes each back through the pipeline that actually handles it.
+        let intent = PromptClassifier.classify(userMessage.text)
+        if case .imageGeneration(let refinedPrompt) = intent {
+            runImageGeneration(prompt: refinedPrompt, conversationId: conversationId)
+        } else {
+            conversationManager.addMessageToActive(isUser: false, text: "", conversationId: conversationId)
+            generateTextResponse(text: userMessage.text, promptText: userMessage.text, history: history, conversationId: conversationId)
+        }
+    }
+
+    /// Cancels an in-flight image generation and replaces its placeholder bubble with an explicit
+    /// marker — used by the spinner bubble's Cancel button (`MessageBubbleView`).
+    private func cancelImageGeneration() {
+        diffusionManager.cancelGeneration()
+        conversationManager.updateLastMessage(text: "[Image generation cancelled.]")
+        conversationManager.saveConversations()
+    }
+
     private func sendMessage() {
         // Only one heavy model can be resident at a time, so a second request during image
         // generation would put two multi-gigabyte models in memory at once and get the app
         // killed. Say so rather than dropping the message on the floor — silently discarding
         // input is what made the earlier stuck-flag bug present as a dead app rather than a
         // visible error.
-        if diffusionManager.isGenerating {
+        if diffusionManager.isGenerating || diffusionManager.isFinishingCancelledRun {
+            hapticNotification(.warning)
             notice = Notice(
                 title: "Still Generating",
                 message: "Wait for the current image to finish, or tap Cancel on it, before sending another message."
@@ -1281,6 +442,7 @@ struct ContentView: View {
         }
 
         if llmManager.isGenerating {
+            hapticImpact(.medium)
             llmManager.cancelGeneration()
             return
         }
@@ -1322,6 +484,7 @@ struct ContentView: View {
             // positives, and silently destroying what someone typed is the wrong way to be
             // wrong about one.
             inputText = text
+            hapticNotification(.error)
             notice = Notice(
                 title: "Request Blocked",
                 message: promptDecision.message ?? "This request isn't allowed under the app's content policy."
@@ -1336,173 +499,11 @@ struct ContentView: View {
         // `ConversationManager.addMessageToActive`'s doc comment for the failure this prevents.
         guard let conversationId = conversationManager.activeConversationId else { return }
 
+        hapticImpact(.medium)
+
         if case .imageGeneration(let refinedPrompt) = intent, pendingAttachmentText == nil {
             conversationManager.addMessageToActive(isUser: true, text: text, conversationId: conversationId)
-
-            guard let diffPath = diffusionManager.lastDiffusionModelPath else {
-                diffusionBannerTask?.cancel()
-                withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) {
-                    showDiffusionNotLoadedBanner = true
-                }
-                diffusionBannerTask = Task {
-                    try? await Task.sleep(nanoseconds: 5_000_000_000)
-                    await MainActor.run {
-                        withAnimation { showDiffusionNotLoadedBanner = false }
-                    }
-                }
-                return
-            }
-
-            // Add a placeholder bubble (shows the spinner while generating)
-            conversationManager.addMessageToActive(isUser: false, text: refinedPrompt, conversationId: conversationId)
-            imageGenerationConversationId = conversationId
-
-            diffusionManager.beginGenerationSession(stage: "Preparing…")
-
-            Task {
-                // Closes the session on every exit path — success, thrown error, early return.
-                // The previous version reset the flag by hand at some exit points and missed
-                // others, which is what left the app permanently refusing new messages.
-                defer {
-                    diffusionManager.endGenerationSession()
-                    if imageGenerationConversationId == conversationId {
-                        imageGenerationConversationId = nil
-                    }
-                }
-
-                // Falls back to the last-used model rather than only the currently resident one.
-                //
-                // `activeModelURL` is nil whenever no chat model happens to be loaded, and that
-                // is exactly the state a previous cancellation leaves behind — so the failure
-                // compounded: one cancelled generation unloaded the model, and every attempt
-                // afterwards captured nil and had nothing to put back. Resolving through
-                // `lastUsedModelPath` means "restore the last used LLM" holds even when the run
-                // started with nothing loaded.
-                let savedLLMUrl = llmManager.activeModelURL
-                    ?? llmManager.lastUsedModelPath.map { URL(fileURLWithPath: $0) }
-
-                // Ask the currently loaded chat model to expand the request into a
-                // richer SD prompt — must happen BEFORE the unload below, since it needs
-                // the model resident. Falls back to the rule-based `refinedPrompt` if no
-                // model is loaded, the actor is busy, or the model's output isn't usable.
-                var finalPrompt = refinedPrompt
-                if llmManager.isModelLoaded {
-                    diffusionManager.updateGenerationStage("Writing the image prompt…")
-                    if let llmPrompt = await llmManager.generateImagePrompt(from: refinedPrompt) {
-                        // The expansion is model output, and an imported model can embellish an
-                        // innocuous request into something that would never have passed the
-                        // original screen. Re-check what actually reaches the sampler; fall back
-                        // to the rule-based prompt, which has already been cleared, rather than
-                        // failing the whole request over the model's phrasing.
-                        if ContentSafety.review(llmPrompt, surface: .imagePrompt).isAllowed {
-                            finalPrompt = llmPrompt
-                            conversationManager.updateLastMessage(text: finalPrompt, conversationId: conversationId)
-                        } else {
-                            LogManager.shared.log("ContentSafety: rejected LLM-expanded image prompt, using original")
-                        }
-                    }
-                }
-                guard !diffusionManager.isCancelled else { return }
-
-                diffusionManager.updateGenerationStage("Freeing memory…")
-                await llmManager.unloadModelAsync()
-                // Wait for the LLM's memory to actually come back before attempting to map
-                // SDXL's massive weights into RAM. A flat sleep here was the same mistake
-                // already fixed on the reverse handoff below (see `MemoryBudget.waitForRelease`):
-                // Metal returns buffers to the system on its own schedule, so a fixed delay is
-                // routinely too short and makes the diffusion safety check read less headroom
-                // than is really about to be available.
-                let diffSizeGB = diffusionManager.effectiveWeightSizeGB(at: URL(fileURLWithPath: diffPath))
-                await MemoryBudget.waitForRelease(atLeastGB: diffusionManager.memoryHeadroomNeededGB(
-                    forModelSizeGB: diffSizeGB, outputSize: diffusionManager.outputSize
-                ))
-
-                var resultData: Data? = nil
-                var failureMessage: String? = nil
-
-                // Cancelling here skips the work but must NOT skip the teardown below. The chat
-                // model has already been evicted at this point, so returning early — which is
-                // what this path used to do — left the user with no model loaded at all and a
-                // bar reading "No model loaded", as though cancelling had unloaded their model
-                // on purpose. Falling through restores it exactly as a completed run does.
-                if !diffusionManager.isCancelled {
-                    do {
-                        diffusionManager.updateGenerationStage("Loading diffusion model…")
-                        try await diffusionManager.loadDiffusionModelAsync(at: URL(fileURLWithPath: diffPath))
-
-                        diffusionManager.updateGenerationStage("Generating…")
-                        // Each `await` inside releases the MainActor, so the UI stays responsive
-                        // throughout the multi-minute denoising loop.
-                        resultData = try await diffusionManager.generateImageAsync(prompt: finalPrompt)
-                    } catch {
-                        failureMessage = error.localizedDescription
-                        LogManager.shared.log("Image generation failed — \(error.localizedDescription)")
-                    }
-                }
-
-                // Teardown runs whether or not generation succeeded, so a failure never strands
-                // several gigabytes of checkpoint resident with no chat model loaded.
-                diffusionManager.updateGenerationStage("Freeing memory…")
-                await diffusionManager.unloadDiffusionModelAsync()
-
-                if let llm = savedLLMUrl {
-                    // Wait for the checkpoint's memory to actually come back before asking the
-                    // chat model to load. A flat sleep here meant the reload ran its safety
-                    // check while Metal was still handing several gigabytes back to the system,
-                    // so a successful generation could still end with an out-of-memory error
-                    // sitting in the model bar.
-                    let needed = llmManager.memoryHeadroomNeededGB(
-                        forModelSizeGB: llmManager.getModelSizeGB(at: llm)
-                    )
-                    await MemoryBudget.waitForRelease(atLeastGB: needed)
-
-                    diffusionManager.updateGenerationStage("Restoring chat model…")
-                    llmManager.loadModel(at: llm)
-                }
-
-                // A cancelled run has already had its bubble replaced and its session closed;
-                // dropping the result here is the whole point of cancellation.
-                guard !diffusionManager.isCancelled else { return }
-
-                if let data = resultData {
-                    // Screen the pixels, not just the prompt. Prompt filtering only governs what
-                    // was asked for; an uncensored checkpoint can produce explicit output from a
-                    // request that contained nothing to object to. This is the only point where
-                    // that can actually be caught, so a flagged image is discarded here — never
-                    // shown in the conversation, never written to RAG, never saved to Photos.
-                    diffusionManager.updateGenerationStage("Checking result…")
-                    let verdict = await ImageSafetyAnalyzer.screen(imageData: data)
-                    if case .blocked(let reason) = verdict {
-                        conversationManager.updateLastMessage(
-                            text: "[The generated image was blocked by the content filter (\(reason)) and has been discarded.]",
-                            conversationId: conversationId
-                        )
-                        conversationManager.saveConversations()
-                        LogManager.shared.log("ContentSafety: discarded generated image — \(reason)")
-                        return
-                    }
-
-                    // Written to disk exactly once — the chat message and the RAG entry both
-                    // reference this same file by name rather than each keeping their own copy
-                    // of the bytes. See `AppFiles.writeGeneratedImage`'s doc comment.
-                    guard let imageFileName = AppFiles.writeGeneratedImage(data) else {
-                        conversationManager.updateLastMessage(
-                            text: "[Couldn't save the generated image to disk.]",
-                            conversationId: conversationId
-                        )
-                        conversationManager.saveConversations()
-                        return
-                    }
-                    conversationManager.updateLastMessageImage(imageFileName: imageFileName, conversationId: conversationId)
-                    ragManager.ingestGeneratedImage(prompt: finalPrompt, imageFileName: imageFileName)
-                } else {
-                    conversationManager.updateLastMessage(
-                        text: "[Couldn't generate the image. \(failureMessage ?? "The diffusion model failed to run.")]",
-                        conversationId: conversationId
-                    )
-                }
-                conversationManager.saveConversations()
-            }
+            runImageGeneration(prompt: refinedPrompt, conversationId: conversationId)
             return
         }
 
@@ -1551,6 +552,182 @@ struct ContentView: View {
         }
 
         generateTextResponse(text: text, promptText: promptText, history: history, conversationId: conversationId)
+    }
+
+    /// Runs image generation for `prompt` from placeholder bubble through final result or
+    /// failure. Factored out of `sendMessage()` so `regenerateResponse(for:)` can retry a failed
+    /// or stopped image request through the exact same pipeline instead of a second copy of it.
+    /// Assumes the triggering user message has already been added to the conversation (or, for a
+    /// regenerate, still is one) — this only ever appends the assistant side.
+    private func runImageGeneration(prompt refinedPrompt: String, conversationId: UUID) {
+        guard let diffPath = diffusionManager.lastDiffusionModelPath else {
+            diffusionBannerTask?.cancel()
+            withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) {
+                showDiffusionNotLoadedBanner = true
+            }
+            diffusionBannerTask = Task {
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                await MainActor.run {
+                    withAnimation { showDiffusionNotLoadedBanner = false }
+                }
+            }
+            return
+        }
+
+        // Add a placeholder bubble (shows the spinner while generating)
+        conversationManager.addMessageToActive(isUser: false, text: refinedPrompt, conversationId: conversationId)
+        imageGenerationConversationId = conversationId
+
+        diffusionManager.beginGenerationSession(stage: "Preparing…")
+
+        Task {
+            // Closes the session on every exit path — success, thrown error, early return.
+            // The previous version reset the flag by hand at some exit points and missed
+            // others, which is what left the app permanently refusing new messages.
+            defer {
+                diffusionManager.endGenerationSession()
+                if imageGenerationConversationId == conversationId {
+                    imageGenerationConversationId = nil
+                }
+            }
+
+            // Falls back to the last-used model rather than only the currently resident one.
+            //
+            // `activeModelURL` is nil whenever no chat model happens to be loaded, and that
+            // is exactly the state a previous cancellation leaves behind — so the failure
+            // compounded: one cancelled generation unloaded the model, and every attempt
+            // afterwards captured nil and had nothing to put back. Resolving through
+            // `lastUsedModelPath` means "restore the last used LLM" holds even when the run
+            // started with nothing loaded.
+            let savedLLMUrl = llmManager.activeModelURL
+                ?? llmManager.lastUsedModelPath.map { URL(fileURLWithPath: $0) }
+
+            // Ask the currently loaded chat model to expand the request into a
+            // richer SD prompt — must happen BEFORE the unload below, since it needs
+            // the model resident. Falls back to the rule-based `refinedPrompt` if no
+            // model is loaded, the actor is busy, or the model's output isn't usable.
+            var finalPrompt = refinedPrompt
+            if llmManager.isModelLoaded {
+                diffusionManager.updateGenerationStage("Writing the image prompt…")
+                if let llmPrompt = await llmManager.generateImagePrompt(from: refinedPrompt) {
+                    // The expansion is model output, and an imported model can embellish an
+                    // innocuous request into something that would never have passed the
+                    // original screen. Re-check what actually reaches the sampler; fall back
+                    // to the rule-based prompt, which has already been cleared, rather than
+                    // failing the whole request over the model's phrasing.
+                    if ContentSafety.review(llmPrompt, surface: .imagePrompt).isAllowed {
+                        finalPrompt = llmPrompt
+                        conversationManager.updateLastMessage(text: finalPrompt, conversationId: conversationId)
+                    } else {
+                        LogManager.shared.log("ContentSafety: rejected LLM-expanded image prompt, using original")
+                    }
+                }
+            }
+            guard !diffusionManager.isCancelled else { return }
+
+            diffusionManager.updateGenerationStage("Freeing memory…")
+            await llmManager.unloadModelAsync()
+            // Wait for the LLM's memory to actually come back before attempting to map
+            // SDXL's massive weights into RAM. A flat sleep here was the same mistake
+            // already fixed on the reverse handoff below (see `MemoryBudget.waitForRelease`):
+            // Metal returns buffers to the system on its own schedule, so a fixed delay is
+            // routinely too short and makes the diffusion safety check read less headroom
+            // than is really about to be available.
+            let diffSizeGB = diffusionManager.effectiveWeightSizeGB(at: URL(fileURLWithPath: diffPath))
+            await MemoryBudget.waitForRelease(atLeastGB: diffusionManager.memoryHeadroomNeededGB(
+                forModelSizeGB: diffSizeGB, outputSize: diffusionManager.outputSize
+            ))
+
+            var resultData: Data? = nil
+            var failureMessage: String? = nil
+
+            // Cancelling here skips the work but must NOT skip the teardown below. The chat
+            // model has already been evicted at this point, so returning early — which is
+            // what this path used to do — left the user with no model loaded at all and a
+            // bar reading "No model loaded", as though cancelling had unloaded their model
+            // on purpose. Falling through restores it exactly as a completed run does.
+            if !diffusionManager.isCancelled {
+                do {
+                    diffusionManager.updateGenerationStage("Loading diffusion model…")
+                    try await diffusionManager.loadDiffusionModelAsync(at: URL(fileURLWithPath: diffPath))
+
+                    diffusionManager.updateGenerationStage("Generating…")
+                    // Each `await` inside releases the MainActor, so the UI stays responsive
+                    // throughout the multi-minute denoising loop.
+                    resultData = try await diffusionManager.generateImageAsync(prompt: finalPrompt)
+                } catch {
+                    failureMessage = error.localizedDescription
+                    LogManager.shared.log("Image generation failed — \(error.localizedDescription)")
+                }
+            }
+
+            // Teardown runs whether or not generation succeeded, so a failure never strands
+            // several gigabytes of checkpoint resident with no chat model loaded.
+            diffusionManager.updateGenerationStage("Freeing memory…")
+            await diffusionManager.unloadDiffusionModelAsync()
+
+            if let llm = savedLLMUrl {
+                // Wait for the checkpoint's memory to actually come back before asking the
+                // chat model to load. A flat sleep here meant the reload ran its safety
+                // check while Metal was still handing several gigabytes back to the system,
+                // so a successful generation could still end with an out-of-memory error
+                // sitting in the model bar.
+                let needed = llmManager.memoryHeadroomNeededGB(
+                    forModelSizeGB: llmManager.getModelSizeGB(at: llm)
+                )
+                await MemoryBudget.waitForRelease(atLeastGB: needed)
+
+                diffusionManager.updateGenerationStage("Restoring chat model…")
+                llmManager.loadModel(at: llm)
+            }
+
+            // A cancelled run has already had its bubble replaced and its session closed;
+            // dropping the result here is the whole point of cancellation.
+            guard !diffusionManager.isCancelled else { return }
+
+            if let data = resultData {
+                // Screen the pixels, not just the prompt. Prompt filtering only governs what
+                // was asked for; an uncensored checkpoint can produce explicit output from a
+                // request that contained nothing to object to. This is the only point where
+                // that can actually be caught, so a flagged image is discarded here — never
+                // shown in the conversation, never written to RAG, never saved to Photos.
+                diffusionManager.updateGenerationStage("Checking result…")
+                let verdict = await ImageSafetyAnalyzer.screen(imageData: data)
+                if case .blocked(let reason) = verdict {
+                    conversationManager.updateLastMessage(
+                        text: "[The generated image was blocked by the content filter (\(reason)) and has been discarded.]",
+                        conversationId: conversationId
+                    )
+                    conversationManager.saveConversations()
+                    LogManager.shared.log("ContentSafety: discarded generated image — \(reason)")
+                    hapticNotification(.warning)
+                    return
+                }
+
+                // Written to disk exactly once — the chat message and the RAG entry both
+                // reference this same file by name rather than each keeping their own copy
+                // of the bytes. See `AppFiles.writeGeneratedImage`'s doc comment.
+                guard let imageFileName = AppFiles.writeGeneratedImage(data) else {
+                    conversationManager.updateLastMessage(
+                        text: "[Couldn't save the generated image to disk.]",
+                        conversationId: conversationId
+                    )
+                    conversationManager.saveConversations()
+                    hapticNotification(.error)
+                    return
+                }
+                conversationManager.updateLastMessageImage(imageFileName: imageFileName, conversationId: conversationId)
+                ragManager.ingestGeneratedImage(prompt: finalPrompt, imageFileName: imageFileName)
+                hapticNotification(.success)
+            } else {
+                conversationManager.updateLastMessage(
+                    text: "[Couldn't generate the image. \(failureMessage ?? "The diffusion model failed to run.")]",
+                    conversationId: conversationId
+                )
+                hapticNotification(.error)
+            }
+            conversationManager.saveConversations()
+        }
     }
 
     /// Runs a normal (no web search) response for a captured user turn. This is the exact body
@@ -1643,6 +820,7 @@ struct ContentView: View {
                             conversationId: conversationId
                         )
                         LogManager.shared.log("ContentSafety: cancelled stream — \(violation.rawValue)")
+                        hapticNotification(.error)
                     }
                 } onComplete: { finalText in
                     let wasCancelled = llmManager.wasCancelled
@@ -1658,6 +836,7 @@ struct ContentView: View {
                     if !outputDecision.isAllowed {
                         cleanedText = outputDecision.message ?? "[This response was withheld by the content filter.]"
                         LogManager.shared.log("ContentSafety: withheld response — \(outputDecision.category?.rawValue ?? "unknown")")
+                        hapticNotification(.warning)
                     } else {
                         if !responseSuffix.isEmpty {
                             cleanedText += responseSuffix
@@ -1692,7 +871,7 @@ struct ContentView: View {
     // MARK: - Web search
 
     /// Handles the user tapping Search or No on a pending offer bubble — see
-    /// `messageBubble(for:)` and `ChatMessage.pendingSearchQuery`. `query` is the original user
+    /// `MessageBubbleView` and `ChatMessage.pendingSearchQuery`. `query` is the original user
     /// message the offer was generated from; re-classified here rather than persisted as a
     /// `WebSearchQueryType`, since classification is cheap and deterministic and this keeps
     /// `ChatMessage` from needing to know that type exists at all.
@@ -1929,9 +1108,1503 @@ struct ContentView: View {
             } catch {
                 await MainActor.run {
                     conversationManager.addMessageToActive(isUser: false, text: "[System] Failed to process file: \(error.localizedDescription)", conversationId: conversationId)
+                    hapticNotification(.error)
                 }
             }
         }
+    }
+}
+
+/// The optional-reason prompt shown after tapping "Rate Down" in a message's context menu.
+///
+/// Pulled out as its own `ViewModifier` rather than an inline `.alert(...)` chained onto `body`
+/// — `body`'s modifier chain is already long enough that the type checker hits its "unable to
+/// type-check this expression in reasonable time" limit if one more non-trivial `.alert` closure
+/// is added directly to it (the same issue that drove the "one property per card" split in
+/// `SettingsView`). A `ViewModifier` type checks its own `body(content:)` independently, so it
+/// doesn't add to that one shared expression the way an inline modifier would.
+private struct DownVoteReasonAlertModifier: ViewModifier {
+    @Binding var pendingDownVote: ChatMessage?
+    @Binding var downVoteReason: String
+    let onSubmit: (ChatMessage, String) -> Void
+
+    func body(content: Content) -> some View {
+        content.alert(
+            "What was wrong?",
+            isPresented: Binding(get: { pendingDownVote != nil }, set: { if !$0 { pendingDownVote = nil; downVoteReason = "" } }),
+            presenting: pendingDownVote
+        ) { message in
+            TextField("Optional — helps it avoid this next time", text: $downVoteReason)
+            Button("Cancel", role: .cancel) { downVoteReason = "" }
+            Button("Submit") {
+                onSubmit(message, downVoteReason)
+                downVoteReason = ""
+            }
+        } message: { _ in
+            Text("This stays on your device — it only helps steer future replies away from this pattern.")
+        }
+    }
+}
+
+// MARK: - Header
+
+private struct ChatHeaderView: View {
+    let isModelActive: Bool
+    @Binding var showDrawer: Bool
+    @Binding var showSettings: Bool
+
+    @State private var pulseActive = false
+
+    var body: some View {
+        HStack(spacing: 14) {
+            Button(action: {
+                withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
+                    showDrawer.toggle()
+                }
+            }) {
+                Image(systemName: "line.horizontal.3")
+                    .foregroundColor(Theme.accent)
+                    .font(.system(size: 20, weight: .semibold))
+                    .frame(width: 44, height: 44)
+                    .contentShape(Rectangle())
+            }
+            .accessibilityLabel("Conversations")
+
+            Spacer(minLength: 0)
+            HStack(spacing: 4) {
+                Text("DARK")
+                    .font(.system(size: 20, weight: .black))
+                    .foregroundColor(Theme.textPrimary)
+                Text("AI")
+                    .font(.system(size: 20, weight: .black))
+                    .foregroundColor(Theme.accent)
+                    .neonGlow(color: Theme.accent, radius: 4)
+            }
+            .kerning(1.5)
+            .lineLimit(1)
+            // Last resort before truncation on the narrowest devices — a shrunken wordmark still
+            // reads as the app's name, "DARK…" does not.
+            .minimumScaleFactor(0.75)
+            .layoutPriority(1)
+            Spacer(minLength: 0)
+
+            HStack(spacing: 10) {
+                HStack(spacing: 6) {
+                    Circle()
+                        .fill(isModelActive ? Color.green : Theme.accent)
+                        .frame(width: 6, height: 6)
+                        .scaleEffect(pulseActive ? 1.4 : 1.0)
+                        .onAppear {
+                            withAnimation(.easeInOut(duration: 1.2).repeatForever(autoreverses: true)) {
+                                pulseActive = true
+                            }
+                        }
+
+                    // `lineLimit(1)` + `fixedSize()` is what stopped this reading "OFFLIN / E" on
+                    // an iPhone SE. The pill now refuses to be compressed, and the wordmark's
+                    // `minimumScaleFactor` above gives way instead — which is the right order of
+                    // precedence, and needs no knowledge of how wide the screen is.
+                    Text(isModelActive ? "READY" : "OFFLINE")
+                        .font(.system(size: 10, weight: .bold, design: .monospaced))
+                        .foregroundColor(isModelActive ? .green : Theme.textSecondary)
+                        .lineLimit(1)
+                        .fixedSize()
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(
+                    RoundedRectangle(cornerRadius: 12)
+                        .fill(Theme.border.opacity(0.3))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 12)
+                                .stroke(isModelActive ? Color.green.opacity(0.3) : Theme.border, lineWidth: 1)
+                        )
+                )
+                .accessibilityLabel(isModelActive ? "Model ready" : "No model loaded")
+
+                Button(action: { showSettings = true }) {
+                    Image(systemName: "gearshape.fill")
+                        .foregroundColor(Theme.textPrimary)
+                        .font(.system(size: 18))
+                        .frame(width: 32, height: 32)
+                }
+                .accessibilityLabel("Settings")
+            }
+            .fixedSize(horizontal: true, vertical: false)
+        }
+        .padding(.horizontal, 12)
+        // The device-dependent part of this is the safe-area inset the column already has; this is
+        // only the gap above the header's own content. See `Layout` for why it must stay a constant.
+        .padding(.top, Layout.barTopPadding)
+        .padding(.bottom, Layout.barBottomPadding)
+        .background(
+            Theme.chrome
+                .overlay(
+                    Rectangle()
+                        .frame(height: 1)
+                        .foregroundColor(Theme.border),
+                    alignment: .bottom
+                )
+        )
+    }
+}
+
+// MARK: - Crash recovery banner
+
+/// Non-modal replacement for the launch-time crash dialog. Inline, dismissible, and it cannot
+/// block the app if anything about it fails to draw.
+private struct CrashRecoveryBannerView: View {
+    @Binding var recoveredCrash: CrashReporter.Report?
+    @Binding var crashToInspect: CrashReporter.Report?
+
+    var body: some View {
+        if let crash = recoveredCrash {
+            HStack(spacing: 10) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundColor(.orange)
+                    .font(.system(size: 14))
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("\(AppInfo.displayName) closed unexpectedly last time")
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundColor(Theme.textPrimary)
+                    Text(crash.reason)
+                        .font(.system(size: 11))
+                        .foregroundColor(Theme.textSecondary)
+                        .lineLimit(2)
+                }
+
+                Spacer(minLength: 4)
+
+                Button("View") { crashToInspect = crash }
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundColor(Theme.onAccent)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(RoundedRectangle(cornerRadius: 8).fill(Color.orange.opacity(0.85)))
+
+                Button {
+                    withAnimation { recoveredCrash = nil }
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundColor(Theme.textSecondary)
+                }
+                .accessibilityLabel("Dismiss")
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(Color.orange.opacity(0.12))
+            .overlay(
+                Rectangle().frame(height: 1).foregroundColor(Color.orange.opacity(0.4)),
+                alignment: .bottom
+            )
+            // Attached here rather than to the root ZStack so it isn't competing with the
+            // settings and content-report sheets during launch layout.
+            .sheet(item: $crashToInspect) { report in
+                CrashReportView(report: report) { }
+            }
+        }
+    }
+}
+
+// MARK: - Model banner
+
+private struct ModelBannerView: View {
+    @ObservedObject var llmManager: LLMManager
+    @ObservedObject var diffusionManager: DiffusionManager
+
+    /// Either actively generating, or unwinding a cancelled run that hasn't released the
+    /// checkpoint yet. Both are states where the bar should describe the image pipeline rather
+    /// than the chat model, which is unloaded throughout.
+    private var diffusionBusy: Bool {
+        diffusionManager.isGenerating || diffusionManager.isFinishingCancelledRun
+    }
+
+    /// Whether either engine is parked on an error the user can be got out of.
+    ///
+    /// Not shown while something is actively running: a stale failure from a previous attempt is
+    /// still on screen during the next one, and offering to tear down a load in progress is how a
+    /// user turns a recovering app back into a broken one.
+    private var needsRecovery: Bool {
+        guard !diffusionBusy, !llmManager.isGenerating else { return false }
+        if case .failed = llmManager.loadState { return true }
+        if case .failed = diffusionManager.diffusionLoadState { return true }
+        return false
+    }
+
+    /// Diffusion checkpoint driving the current generation.
+    ///
+    /// Prefers the name the loader reported, since that is the checkpoint actually resident.
+    /// Falls back to the selected file's name for the stretch before the load completes — the
+    /// banner needs something to say from the moment generation starts, not just once the
+    /// weights are up.
+    private var activeDiffusionModelName: String? {
+        if case let .loaded(name, _) = diffusionManager.diffusionLoadState {
+            return name
+        }
+        if let url = diffusionManager.activeDiffusionURL {
+            return url.lastPathComponent
+        }
+        if let path = diffusionManager.lastDiffusionModelPath {
+            return URL(fileURLWithPath: path).lastPathComponent
+        }
+        return nil
+    }
+
+    var body: some View {
+        HStack {
+            Image(systemName: diffusionBusy ? "photo.fill" : "cpu.fill")
+                .foregroundColor(diffusionBusy ? .purple : Theme.accent)
+
+            // Image generation evicts the chat model to make room, so `llmManager.loadState`
+            // reads `.unloaded` for the whole operation — the bar used to say "No model loaded.
+            // Choose one in Settings to start." while the app was visibly busy generating.
+            // Show what is actually running instead, and let it fall back to the LLM state on
+            // its own once the session ends and the chat model is reloaded.
+            if diffusionManager.isFinishingCancelledRun {
+                // The sampler can't be interrupted, so this covers the gap between the user
+                // cancelling and the run unwinding far enough to put the chat model back.
+                Text("Cancelling — the chat model will reload when the current step finishes.")
+                    .foregroundColor(Theme.textSecondary)
+                    .lineLimit(2)
+            } else if diffusionManager.isGenerating {
+                HStack(spacing: 8) {
+                    Text("Generating with \(activeDiffusionModelName ?? "diffusion model")")
+                        .foregroundColor(Theme.textPrimary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+
+                    if diffusionManager.generationProgress > 0 {
+                        Text("\(Int(diffusionManager.generationProgress * 100))%")
+                            .foregroundColor(.purple)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.purple.opacity(0.15))
+                            .cornerRadius(4)
+                    }
+                }
+                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+            } else {
+            switch llmManager.loadState {
+            case .unloaded:
+                Text("No model loaded. Choose one in Settings to start.")
+                    .foregroundColor(Theme.textSecondary)
+            case .loading(_, let status):
+                Text(status)
+                    .foregroundColor(Theme.textPrimary)
+            case let .loaded(name, size):
+                HStack(spacing: 8) {
+                    Text("\(name) [\(String(format: "%.2f GB", size)) weights]")
+                        .foregroundColor(Theme.textPrimary)
+
+                    if llmManager.isGenerating && llmManager.generationSpeed > 0 {
+                        Text("\(String(format: "%.1f", llmManager.generationSpeed)) t/s")
+                            .foregroundColor(Theme.accentCyan)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Theme.accentCyan.opacity(0.1))
+                            .cornerRadius(4)
+                    }
+                }
+                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+            case .failed(let error):
+                Text(error)
+                    .foregroundColor(Theme.accent)
+                    .lineLimit(3)
+            }
+            }
+
+            Spacer(minLength: 6)
+
+            // Recovery, right next to the failure that needs it. Every state this bar can report
+            // as `.failed` — a memory warning that unloaded the model, an image generation that
+            // evicted the chat model and then couldn't load the checkpoint — used to leave
+            // force-quitting as the only way forward.
+            if needsRecovery {
+                ResetModelsButton(llmManager: llmManager, diffusionManager: diffusionManager, compact: true)
+                    .fixedSize()
+            }
+        }
+        .font(.system(size: 12))
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .background(diffusionBusy ? Color.purple.opacity(0.10) : Theme.background)
+        .animation(.easeInOut(duration: 0.25), value: diffusionBusy)
+        .overlay(
+            Rectangle()
+                .frame(height: 1)
+                .foregroundColor(Theme.border),
+            alignment: .bottom
+        )
+    }
+}
+
+// MARK: - Diffusion-not-loaded banner
+
+private struct DiffusionNotLoadedBannerView: View {
+    @Binding var showDiffusionNotLoadedBanner: Bool
+
+    var body: some View {
+        if showDiffusionNotLoadedBanner {
+            VStack {
+                HStack(spacing: 10) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundColor(.orange)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("No Diffusion Model Loaded")
+                            .font(.system(size: 13, weight: .bold))
+                            .foregroundColor(Theme.textPrimary)
+                        Text("Load a diffusion model in Settings to generate images.")
+                            .font(.system(size: 11))
+                            .foregroundColor(Theme.textSecondary)
+                    }
+                    Spacer()
+                    Button {
+                        withAnimation { showDiffusionNotLoadedBanner = false }
+                    } label: {
+                        Image(systemName: "xmark")
+                            .foregroundColor(Theme.textSecondary)
+                            .font(.system(size: 12, weight: .bold))
+                    }
+                    .accessibilityLabel("Dismiss")
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .background(
+                    RoundedRectangle(cornerRadius: 12)
+                        .fill(Color.orange.opacity(0.18))
+                        .overlay(RoundedRectangle(cornerRadius: 12)
+                            .stroke(Color.orange.opacity(0.5), lineWidth: 1))
+                )
+                .padding(.horizontal, 16)
+                // Clears the header rather than landing on top of it. This overlay is a
+                // separate ZStack child, so it is still safe-area inset while the chat column
+                // is not — the header's own height has to be added back. See
+                // `Layout.belowHeaderPadding`, which derives it instead of guessing.
+                .padding(.top, Layout.belowHeaderPadding)
+                Spacer()
+            }
+            .transition(.move(edge: .top).combined(with: .opacity))
+            .zIndex(10)
+        }
+    }
+}
+
+// MARK: - Empty state
+
+private struct EmptyStateView: View {
+    let isModelActive: Bool
+    @Binding var showSettings: Bool
+
+    var body: some View {
+        // Scrollable, and that is a keyboard fix rather than a scrolling feature.
+        //
+        // As a plain `VStack` this had a minimum height of roughly 400 pt — the welcome panel is
+        // fixed-size content and `Spacer`s can only collapse to zero around it. Add the header,
+        // banners, status strip, and input row and the column's minimum came to about 720 pt. On an
+        // iPhone SE the keyboard leaves 376 pt. When SwiftUI cannot shrink a column into the space
+        // the keyboard leaves, it slides it instead: the header went off the top of the screen and
+        // the input row — the one thing that must stay visible while typing — went underneath the
+        // keyboard.
+        //
+        // Inside a `ScrollView` the region's minimum height is zero, so the column always fits and
+        // the input row stays put. `minHeight` keeps the panel vertically centred whenever there is
+        // room, which is how it looked before, and it simply scrolls when there isn't.
+        GeometryReader { proxy in
+            ScrollView {
+                VStack(spacing: 18) {
+                    Spacer(minLength: 0)
+
+                    WelcomePanelView(isModelActive: isModelActive, showSettings: $showSettings)
+
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 20)
+                .frame(maxWidth: Layout.contentMaxWidth)
+                .frame(maxWidth: .infinity, minHeight: proxy.size.height)
+            }
+            .scrollBounceBehavior(.basedOnSize)
+            .scrollDismissesKeyboard(.interactively)
+        }
+    }
+}
+
+/// The welcome copy and its shade panel. Split out from `EmptyStateView` so the panel wraps
+/// only the content — wrapping the enclosing `VStack` would stretch it across the spacers
+/// and shade the entire screen, which is the thing this is meant to avoid.
+private struct WelcomePanelView: View {
+    let isModelActive: Bool
+    @Binding var showSettings: Bool
+
+    var body: some View {
+        VStack(spacing: 18) {
+            Image(systemName: isModelActive ? "bubble.left.and.bubble.right.fill" : "square.and.arrow.down.fill")
+                .font(.system(size: 52))
+                .foregroundColor(Theme.accent)
+                .neonGlow(color: Theme.accent, radius: 10)
+
+            Text(isModelActive ? "Ask me anything" : "Add a model to begin")
+                .font(.system(size: 19, weight: .bold))
+                .foregroundColor(Theme.textPrimary)
+
+            Text(isModelActive
+                 ? "Everything runs on this device. Try a question, or describe a picture to generate one."
+                 : "\(AppInfo.displayName) needs a model to run. Open Settings to download one — it only takes a minute.")
+                .font(.system(size: 13))
+                .foregroundColor(Theme.textSecondary)
+                .multilineTextAlignment(.center)
+                .lineSpacing(3)
+                .frame(maxWidth: 300)
+
+            if !isModelActive {
+                Button {
+                    showSettings = true
+                } label: {
+                    Text("Open Settings")
+                        .font(.system(size: 14, weight: .bold))
+                        .foregroundColor(Theme.onAccent)
+                        .padding(.horizontal, 26)
+                        .padding(.vertical, 11)
+                        .background(RoundedRectangle(cornerRadius: 12).fill(Theme.accent))
+                }
+            }
+
+            // Sets expectations before the first response rather than after — a reviewer
+            // opening a fresh install sees this, and so does a user about to trust an answer.
+            Text("Responses are generated by a model on this device and can be inaccurate. Check anything important.")
+                .font(.system(size: 11))
+                .foregroundColor(Theme.textMuted)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 290)
+                .padding(.top, 6)
+        }
+        .padding(.horizontal, 24)
+        .padding(.vertical, 26)
+        // Shade behind the copy rather than over the whole screen, so the backdrop stays part
+        // of the design while the text sitting on it keeps its contrast.
+        .readablePanel(cornerRadius: 28)
+    }
+}
+
+// MARK: - Status strip
+
+// Indicator pills
+//
+// Horizontally scrollable rather than a plain `HStack`. Laid out flat, the strip needs roughly
+// 390 pt with everything showing and about 460 pt once the TRUNCATING pill appears — so on an
+// SE (375 pt) it was already clipping the context and token counters, and on a 15 Pro the
+// truncation warning pushed them off too. A `Spacer` between the groups made it worse by
+// guaranteeing the overflow landed on the right-hand readouts, which are the numbers most worth
+// watching. Scrolling keeps every pill at full size and legible on every device; on wide screens
+// the content simply doesn't fill the row and nothing scrolls.
+private struct ActiveParametersIndicatorView: View {
+    let isPrivateMode: Bool
+    let enableRAG: Bool
+    let enableMemories: Bool
+    @ObservedObject var llmManager: LLMManager
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            StatusPillsView(isPrivateMode: isPrivateMode, enableRAG: enableRAG, enableMemories: enableMemories, llmManager: llmManager)
+                .padding(.vertical, 8)
+                .padding(.horizontal, 16)
+        }
+        .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
+        .background(Theme.chrome)
+        .overlay(
+            Rectangle()
+                .frame(height: 1)
+                .foregroundColor(Theme.border),
+            alignment: .top
+        )
+    }
+}
+
+private struct StatusPillsView: View {
+    let isPrivateMode: Bool
+    let enableRAG: Bool
+    let enableMemories: Bool
+    @ObservedObject var llmManager: LLMManager
+
+    var body: some View {
+        HStack(spacing: 12) {
+            if isPrivateMode {
+                HStack(spacing: 4) {
+                    Image(systemName: "eye.slash.fill")
+                    Text("PRIVATE — NOT SAVED")
+                }
+                .font(.system(size: 9, weight: .bold))
+                .foregroundColor(Theme.accent)
+                .neonGlow(color: Theme.accent, radius: 4)
+            } else {
+                HStack(spacing: 4) {
+                    Image(systemName: "tray.full.fill")
+                    Text("SAVED ON DEVICE")
+                }
+                .font(.system(size: 9, weight: .bold))
+                .foregroundColor(.green)
+            }
+
+            // Was a `Spacer`, which is meaningless inside a horizontal scroll view — it has no
+            // width to expand into. A rule keeps the visual break between "where this chat is
+            // stored" and "what the model is doing" that the gap used to provide.
+            Rectangle()
+                .fill(Theme.border)
+                .frame(width: 1, height: 10)
+
+            if enableRAG {
+                Text("RAG")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundColor(Theme.accentCyan)
+            }
+            if enableMemories {
+                Text("MEMORIES")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundColor(Theme.accent)
+            }
+
+            // Shown whenever the oldest conversation history (or, mid-generation, the
+            // oldest tokens in the live KV cache) had to be dropped to fit the context
+            // window — the conversation keeps going, this just makes it visible when it's
+            // happening rather than a silent, confusing drop in what the model can recall.
+            if llmManager.isContextTruncating {
+                HStack(spacing: 3) {
+                    Image(systemName: "arrow.trianglehead.2.clockwise")
+                    Text("TRUNCATING")
+                }
+                .font(.system(size: 9, weight: .bold))
+                .foregroundColor(.orange)
+            }
+
+            // Live context-window usage vs. the limit actually applied to the loaded
+            // model (which can be lower than the requested setting once clamped to
+            // available RAM). Turns orange near the limit as an early warning.
+            let ctxLimit = llmManager.loadedContextWindow > 0 ? llmManager.loadedContextWindow : llmManager.contextTokenLimit
+            if ctxLimit > 0 {
+                let ctxFraction = Double(llmManager.contextTokensUsed) / Double(ctxLimit)
+                Text("CTX: \(llmManager.contextTokensUsed)/\(ctxLimit)T")
+                    .font(.system(size: 9, weight: .bold, design: .monospaced))
+                    .foregroundColor(ctxFraction >= 0.9 ? .orange : Theme.textSecondary)
+            }
+
+            // Shows live generated-token progress against the cap while streaming, so the
+            // max-response-size setting is directly observable being enforced in the UI.
+            if llmManager.isGenerating {
+                Text("GEN: \(llmManager.currentResponseTokenCount)/\(llmManager.maxTokens)T")
+                    .font(.system(size: 9, weight: .bold, design: .monospaced))
+                    .foregroundColor(Theme.accentCyan)
+            } else {
+                Text("MAX: \(llmManager.maxTokens)T")
+                    .font(.system(size: 9, weight: .bold, design: .monospaced))
+                    .foregroundColor(Theme.textSecondary)
+            }
+        }
+        // Each pill keeps its ideal width. Without this the scroll view would still be free to
+        // compress a `Text` that has somewhere to truncate to, which is the behaviour being fixed.
+        .fixedSize(horizontal: true, vertical: false)
+    }
+}
+
+// MARK: - Input area
+
+private struct InputAreaView: View {
+    @Binding var pendingAttachmentName: String?
+    @Binding var pendingAttachmentText: String?
+    @Binding var showFileImporter: Bool
+    @Binding var privateMode: Bool
+    @Binding var inputText: String
+    let isModelActive: Bool
+    let isGenerating: Bool
+    let sendAction: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+
+            if let attName = pendingAttachmentName {
+                HStack {
+                    Image(systemName: "doc.text.image")
+                        .foregroundColor(Theme.accentCyan)
+                    Text(attName)
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundColor(Theme.textPrimary)
+                        .lineLimit(1)
+                    Spacer()
+                    Button(action: {
+                        pendingAttachmentName = nil
+                        pendingAttachmentText = nil
+                    }) {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundColor(.gray)
+                    }
+                    .accessibilityLabel("Remove attachment")
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(Theme.cardBackground)
+                .cornerRadius(12)
+                .overlay(RoundedRectangle(cornerRadius: 12).stroke(Theme.border, lineWidth: 1))
+            }
+
+            HStack(spacing: 10) {
+
+            // Universal OCR / Vision Upload Button (Always available for all models via iOS Native Vision)
+            Button(action: { showFileImporter = true }) {
+                Image(systemName: "paperclip")
+                    .foregroundColor(Theme.accentCyan)
+                    .font(.system(size: 18))
+                    .frame(width: 40, height: 40)
+                    .background(Theme.accentCyan.opacity(0.15))
+                    .clipShape(Circle())
+                    .overlay(Circle().stroke(Theme.accentCyan.opacity(0.4), lineWidth: 1))
+            }
+            .accessibilityLabel("Attach file")
+
+            // Private-chat toggle — this conversation is kept in memory only
+            Button(action: {
+                privateMode.toggle()
+            }) {
+                Image(systemName: privateMode ? "eye.slash.fill" : "eye.fill")
+                    .foregroundColor(privateMode ? Theme.accent : Theme.textSecondary)
+                    .font(.system(size: 18))
+                    .frame(width: 40, height: 40)
+                    .background(Theme.border.opacity(0.3))
+                    .clipShape(Circle())
+                    .overlay(
+                        Circle()
+                            .stroke(privateMode ? Theme.accent : Color.clear, lineWidth: 1.5)
+                    )
+            }
+            .accessibilityLabel(privateMode ? "Private chat on" : "Private chat off")
+
+            TextField(isModelActive ? "Execute prompt..." : "Model unloaded...", text: $inputText, axis: .vertical)
+                .lineLimit(1...8)
+                .font(.system(size: 14))
+                .foregroundColor(Theme.textPrimary)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .background(Theme.background)
+                .cornerRadius(20)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 20)
+                        .stroke(Theme.border, lineWidth: 1.5)
+                )
+                .disabled(!isModelActive)
+
+            Button(action: sendAction) {
+                Image(systemName: isGenerating ? "stop.fill" : "arrow.up")
+                    .foregroundColor(isModelActive ? Theme.onAccent : Theme.textSecondary)
+                    .font(.system(size: 14, weight: .bold))
+                    .padding(10)
+                    .background(
+                        Circle()
+                            .fill(isModelActive ? Theme.accent : Theme.border)
+                    )
+                    .neonGlow(color: isModelActive ? Theme.accent : .clear, radius: 4)
+            }
+            .disabled(!isModelActive && !isGenerating)
+            .accessibilityLabel(isGenerating ? "Stop generating" : "Send message")
+            }
+        }
+        .padding()
+        // Matches the message column so the field lines up with the conversation above it rather
+        // than running the full width of an iPad while the text stops well short of it.
+        .frame(maxWidth: Layout.contentMaxWidth)
+        .frame(maxWidth: .infinity)
+        .background(Theme.chrome)
+        .overlay(
+            Rectangle()
+                .frame(height: 1)
+                .foregroundColor(Theme.border),
+            alignment: .top
+        )
+    }
+}
+
+// MARK: - Conversations drawer
+
+/// The conversations drawer. Split out from `ContentView.body` because as a computed property it
+/// rebuilt a `ForEach` over every conversation — full row layout included — on every streamed
+/// token, even while the drawer was closed and entirely off-screen. As its own `View` observing
+/// only `conversationManager`, it now re-evaluates when the conversation list itself changes,
+/// not when the chat model or diffusion pipeline publish unrelated updates.
+private struct SidebarDrawerView: View {
+    @ObservedObject var conversationManager: ConversationManager
+    @Binding var showDrawer: Bool
+    @Binding var conversationToExport: Conversation?
+    @Binding var conversationToDelete: Conversation?
+    let onNewConversation: () -> Void
+
+    /// Local to the drawer on purpose — nothing about an in-progress search needs to survive
+    /// past the drawer closing, let alone live in `ContentView`.
+    @State private var drawerSearchText: String = ""
+
+    private var filteredConversations: [Conversation] {
+        let query = drawerSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return conversationManager.conversations }
+        return conversationManager.conversations.filter { $0.title.localizedCaseInsensitiveContains(query) }
+    }
+
+    var body: some View {
+        HStack(spacing: 0) {
+            VStack(alignment: .leading, spacing: 20) {
+
+                HStack {
+                    Text("CHATS")
+                        .font(.system(size: 13, weight: .black))
+                        .foregroundColor(Theme.textPrimary)
+                        .kerning(2.0)
+
+                    Spacer()
+
+                    Button(action: {
+                        onNewConversation()
+                        withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
+                            showDrawer = false
+                        }
+                    }) {
+                        Image(systemName: "plus")
+                            .foregroundColor(Theme.accent)
+                            .font(.system(size: 16, weight: .bold))
+                            .frame(width: 44, height: 44)
+                            .contentShape(Rectangle())
+                    }
+                    .accessibilityLabel("New chat")
+
+                    Button(action: {
+                        withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
+                            showDrawer = false
+                        }
+                    }) {
+                        Image(systemName: "xmark")
+                            .foregroundColor(Theme.textSecondary)
+                            .font(.system(size: 14, weight: .bold))
+                            .frame(width: 44, height: 44)
+                            .contentShape(Rectangle())
+                    }
+                    .accessibilityLabel("Close chat list")
+                }
+                .padding(.top, Layout.barTopPadding + 14)
+                .padding(.horizontal)
+
+                searchField
+                    .padding(.horizontal)
+
+                ScrollView {
+                    LazyVStack(spacing: 12) {
+                        if filteredConversations.isEmpty {
+                            Text(drawerSearchText.isEmpty ? "No conversations yet." : "No chats match \u{201c}\(drawerSearchText)\u{201d}.")
+                                .font(.system(size: 13))
+                                .foregroundColor(Theme.textMuted)
+                                .padding(.top, 24)
+                        } else {
+                            ForEach(filteredConversations) { conversation in
+                                row(for: conversation)
+                            }
+                        }
+                    }
+                    .padding(.horizontal)
+                }
+
+                Spacer()
+            }
+            .frame(width: Layout.drawerWidth)
+            .background(Theme.background)
+            .overlay(
+                Rectangle()
+                    .frame(width: 1)
+                    .foregroundColor(Theme.border),
+                alignment: .trailing
+            )
+            .offset(x: showDrawer ? 0 : -Layout.drawerWidth)
+
+            Spacer()
+        }
+        .ignoresSafeArea(.container, edges: [.leading, .trailing])
+        .alert(
+            "Delete Conversation?",
+            isPresented: Binding(get: { conversationToDelete != nil }, set: { if !$0 { conversationToDelete = nil } }),
+            presenting: conversationToDelete
+        ) { conversation in
+            Button("Cancel", role: .cancel) { conversationToDelete = nil }
+            Button("Delete", role: .destructive) {
+                UINotificationFeedbackGenerator().notificationOccurred(.success)
+                conversationManager.deleteConversation(id: conversation.id)
+                conversationToDelete = nil
+            }
+        } message: { _ in
+            Text("Delete this conversation? This can't be undone.")
+        }
+    }
+
+    private var searchField: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+                .foregroundColor(Theme.textMuted)
+                .font(.system(size: 12))
+            TextField("Search chats", text: $drawerSearchText)
+                .font(.system(size: 13))
+                .foregroundColor(Theme.textPrimary)
+            if !drawerSearchText.isEmpty {
+                Button {
+                    drawerSearchText = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundColor(Theme.textMuted)
+                        .font(.system(size: 13))
+                }
+                .accessibilityLabel("Clear search")
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(Theme.cardBackground)
+        .cornerRadius(10)
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Theme.border, lineWidth: 1))
+    }
+
+    @ViewBuilder
+    private func row(for conversation: Conversation) -> some View {
+        HStack {
+            Button(action: {
+                conversationManager.selectConversation(id: conversation.id)
+                withAnimation(.spring()) {
+                    showDrawer = false
+                }
+            }) {
+                HStack(spacing: 10) {
+                    Image(systemName: "chevron.right.square.fill")
+                        .foregroundColor(conversationManager.activeConversationId == conversation.id ? Theme.accent : Theme.textMuted)
+                    Text(conversation.title)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundColor(conversationManager.activeConversationId == conversation.id ? Theme.textPrimary : Theme.textSecondary)
+                        .lineLimit(1)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            // Export conversation. Sits next to Delete on purpose: this is the
+            // one place a chat can leave the device, and it should be as easy
+            // to find as the action that destroys it. Tap targets are 44x44 —
+            // up from a 26x26 hit area — while the glyph itself stays small.
+            Button(action: {
+                conversationToExport = conversation
+            }) {
+                Image(systemName: "square.and.arrow.up")
+                    .foregroundColor(Theme.textMuted)
+                    .font(.system(size: 12))
+                    .frame(width: 44, height: 44)
+                    .contentShape(Rectangle())
+            }
+            .accessibilityLabel("Export \(conversation.title)")
+            .disabled(conversation.messages.isEmpty)
+            .opacity(conversation.messages.isEmpty ? 0.35 : 1)
+
+            Button(action: {
+                conversationToDelete = conversation
+            }) {
+                Image(systemName: "trash")
+                    .foregroundColor(Theme.textMuted)
+                    .font(.system(size: 12))
+                    .frame(width: 44, height: 44)
+                    .contentShape(Rectangle())
+            }
+            .accessibilityLabel("Delete \(conversation.title)")
+        }
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(conversationManager.activeConversationId == conversation.id ? Theme.border.opacity(0.3) : Color.clear)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(conversationManager.activeConversationId == conversation.id ? Theme.border : Color.clear, lineWidth: 1)
+        )
+    }
+}
+
+// MARK: - Chat message list
+
+/// Reports how far the chat's bottom anchor sits below the visible scroll viewport, in points —
+/// zero or negative means the conversation's end is already on screen. Used by
+/// `ChatMessagesScrollView` to decide whether new content should auto-scroll into view or merely
+/// surface the "Jump to latest" pill, without diffing the message list itself to find out.
+private struct ChatBottomOffsetKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
+
+/// The scrolling message list for the active conversation, split out from `ContentView.body` so
+/// its updates — which legitimately happen on every streamed token — don't force sibling
+/// sections (header, drawer, input bar) that don't depend on generation state to re-evaluate too.
+///
+/// Also owns the "stay pinned to the bottom while streaming, but stop the instant the user scrolls
+/// away" behavior. The previous version force-scrolled to the bottom on every change to the
+/// `messages` array with no regard for where the user had scrolled to, making it impossible to
+/// read back through a long streaming reply. `isNearBottom` — driven by the bottom anchor's
+/// reported position via `ChatBottomOffsetKey` rather than by inspecting message content — is
+/// what makes that conditional; see the `onChange` calls below for why the triggers that pin to
+/// the bottom are deliberately cheap ones instead of watching `messages` itself.
+private struct ChatMessagesScrollView: View {
+    @ObservedObject var conversationManager: ConversationManager
+    @ObservedObject var llmManager: LLMManager
+    @ObservedObject var diffusionManager: DiffusionManager
+    @ObservedObject var feedbackManager: FeedbackManager
+    let messages: [ChatMessage]
+    let stripMarkdown: Bool
+    let imageGenerationConversationId: UUID?
+    @Binding var reportTarget: ChatMessage?
+    let onSaveToPhotos: (UIImage) -> Void
+    let onCancelImageGeneration: () -> Void
+    let onSearchOfferResponse: (Bool, String, UUID) -> Void
+    let onRegenerate: (ChatMessage) -> Void
+    let onRateUp: (ChatMessage) -> Void
+    let onRateDown: (ChatMessage) -> Void
+
+    /// True while the bottom of the conversation is visible (or nearly so). Drives both whether a
+    /// new token auto-scrolls and whether the "Jump to latest" pill shows.
+    @State private var isNearBottom = true
+
+    private static let bottomAnchorID = "chat-bottom-anchor"
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            ZStack(alignment: .bottom) {
+                GeometryReader { outerGeo in
+                    ScrollView {
+                        LazyVStack(spacing: 16) {
+                            ForEach(messages) { message in
+                                bubble(for: message)
+                                    .id(message.id)
+                            }
+                            Color.clear
+                                .frame(height: 1)
+                                .id(Self.bottomAnchorID)
+                                .background(
+                                    GeometryReader { anchorGeo in
+                                        Color.clear.preference(
+                                            key: ChatBottomOffsetKey.self,
+                                            value: anchorGeo.frame(in: .named("chatScrollSpace")).maxY - outerGeo.size.height
+                                        )
+                                    }
+                                )
+                        }
+                        .padding()
+                        // Centred column on wide layouts. See `Layout.contentMaxWidth` — this
+                        // is a no-op on every iPhone and on an 11-inch iPad in portrait, and
+                        // stops a reply being set as one line per sentence across a landscape
+                        // iPad.
+                        .frame(maxWidth: Layout.contentMaxWidth)
+                        .frame(maxWidth: .infinity)
+                    }
+                    .coordinateSpace(name: "chatScrollSpace")
+                    .onTapGesture { endEditing() }
+                    // Lets the keyboard follow a scroll drag the way the empty-state scroll view
+                    // already did — see `WelcomePanelView`'s sibling, `EmptyStateView`, for the
+                    // matching comment. This also covers what the previous `DragGesture` here
+                    // did (dismiss on the very first pixel of a drag), just smoothly instead of
+                    // abruptly, so that gesture was removed rather than left stacked with this
+                    // one. Tap-to-dismiss is kept as its own gesture below since this modifier
+                    // only covers a scroll *drag*, not a tap on empty space in the list.
+                    .scrollDismissesKeyboard(.interactively)
+                }
+
+                if !isNearBottom {
+                    jumpToLatestPill { jumpToBottomNow(proxy: proxy) }
+                        .padding(.bottom, 10)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                }
+            }
+            .animation(.spring(response: 0.3, dampingFraction: 0.8), value: isNearBottom)
+            .onPreferenceChange(ChatBottomOffsetKey.self) { offset in
+                let near = offset < 120
+                if near != isNearBottom { isNearBottom = near }
+            }
+            // Deliberately NOT `.onChange(of: messages)` — `ChatMessage` equality compares full
+            // message text, so watching the whole array re-diffs every message's text on every
+            // streamed token (see the doc comment on `ChatMessage` in ConversationManager.swift),
+            // which is roughly quadratic cost over a long reply. `count` and `last?.id` are both
+            // cheap identity/integer comparisons that still catch every case that actually adds a
+            // new bubble; `currentResponseTokenCount` is an `Int` that already ticks once per
+            // streamed token, so it's what keeps the *growing* last bubble pinned to the bottom
+            // without re-diffing anything, and `generationProgress` covers the same for an
+            // in-progress image.
+            .onChange(of: messages.count) { pinToBottom(proxy: proxy) }
+            .onChange(of: messages.last?.id) { pinToBottom(proxy: proxy, animated: true) }
+            .onChange(of: llmManager.currentResponseTokenCount) { pinToBottom(proxy: proxy) }
+            .onChange(of: diffusionManager.generationProgress) { pinToBottom(proxy: proxy) }
+            .onAppear {
+                guard let last = messages.last else { return }
+                proxy.scrollTo(last.id, anchor: .bottom)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func bubble(for message: ChatMessage) -> some View {
+        let isLastMessage = message.id == messages.last?.id
+        let isImageGeneratingHere = isLastMessage && !message.isImageMessage && !message.isUser
+            && diffusionManager.isGenerating
+            && imageGenerationConversationId == conversationManager.activeConversationId
+        let canRegenerate = isLastMessage && !message.isUser
+            && !llmManager.isGenerating && !diffusionManager.isGenerating
+
+        MessageBubbleView(
+            message: message,
+            stripMarkdown: stripMarkdown,
+            isGenerating: llmManager.isGenerating,
+            isLastMessage: isLastMessage,
+            thinkingTokensUsed: isLastMessage ? llmManager.thinkingTokensUsed : 0,
+            isImageGeneratingForThisMessage: isImageGeneratingHere,
+            diffusionStage: isImageGeneratingHere ? diffusionManager.generationStage : "",
+            diffusionProgress: isImageGeneratingHere ? diffusionManager.generationProgress : 0,
+            diffusionPreviewImage: isImageGeneratingHere ? diffusionManager.previewImage : nil,
+            currentRating: feedbackManager.rating(for: message.id),
+            reportTarget: $reportTarget,
+            onSaveToPhotos: onSaveToPhotos,
+            onCancelImageGeneration: onCancelImageGeneration,
+            onSearchOfferResponse: onSearchOfferResponse,
+            onRegenerate: canRegenerate ? { onRegenerate(message) } : nil,
+            // Tapping the rating you already have clears it instead of re-submitting — resolved
+            // here, not in `MessageBubbleView`, since only this scope has `feedbackManager` to
+            // check the current rating against.
+            onRateUp: {
+                if feedbackManager.rating(for: message.id) == .up {
+                    feedbackManager.clearRating(for: message.id)
+                } else {
+                    onRateUp(message)
+                }
+            },
+            onRateDown: {
+                if feedbackManager.rating(for: message.id) == .down {
+                    feedbackManager.clearRating(for: message.id)
+                } else {
+                    onRateDown(message)
+                }
+            }
+        )
+    }
+
+    private func pinToBottom(proxy: ScrollViewProxy, animated: Bool = false) {
+        guard isNearBottom, let last = messages.last else { return }
+        if animated {
+            withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
+        } else {
+            proxy.scrollTo(last.id, anchor: .bottom)
+        }
+    }
+
+    private func jumpToBottomNow(proxy: ScrollViewProxy) {
+        guard let last = messages.last else { return }
+        isNearBottom = true
+        withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
+    }
+
+    private func jumpToLatestPill(action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                Image(systemName: "arrow.down")
+                    .font(.system(size: 10, weight: .bold))
+                Text("Jump to latest")
+                    .font(.system(size: 12, weight: .bold))
+            }
+            .foregroundColor(Theme.onAccent)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            .background(Capsule().fill(Theme.accent))
+            .shadow(color: Theme.glowColor, radius: 8, y: 2)
+        }
+    }
+}
+
+// MARK: - Message bubble
+
+/// Decoded `UIImage`s for AI-generated images, keyed by message id (chat bubbles) or filename
+/// (`MindscapeDocumentRow` in SettingsView.swift, which shares this cache). `UIImage(data:)` used
+/// to run inline in each view's body, re-decoding the same JPEG bytes on every unrelated
+/// re-render; this cache means the decode happens once per image for the life of the process
+/// instead of once per redraw. Not `private` so both call sites can share one cache/key space
+/// rather than keeping two separate ones for what's often the literal same generated image.
+final class DecodedImageCache {
+    static let shared = NSCache<NSString, UIImage>()
+}
+
+private struct MessageBubbleView: View {
+    let message: ChatMessage
+    let stripMarkdown: Bool
+    let isGenerating: Bool
+    let isLastMessage: Bool
+    let thinkingTokensUsed: Int
+    let isImageGeneratingForThisMessage: Bool
+    let diffusionStage: String
+    let diffusionProgress: Double
+    let diffusionPreviewImage: UIImage?
+    /// This message's current rating, if any — drives the small indicator on the bubble and which
+    /// of Rate Up/Rate Down reads as "already selected" in the context menu. `nil` for user
+    /// messages and image messages; rating only applies to `textBubble`.
+    let currentRating: ResponseFeedback.Rating?
+    @Binding var reportTarget: ChatMessage?
+    let onSaveToPhotos: (UIImage) -> Void
+    let onCancelImageGeneration: () -> Void
+    let onSearchOfferResponse: (Bool, String, UUID) -> Void
+    /// `nil` hides the Regenerate menu item entirely — the caller (`ChatMessagesScrollView`)
+    /// only supplies one for the last assistant message, and only while nothing is generating.
+    let onRegenerate: (() -> Void)?
+    let onRateUp: () -> Void
+    let onRateDown: () -> Void
+
+    /// Decoded once via `.task(id:)` below and cached — see `DecodedImageCache`.
+    @State private var decodedImage: UIImage? = nil
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            if message.isUser {
+                userBubble
+            } else if message.isImageMessage {
+                imageBubble
+            } else if isImageGeneratingForThisMessage {
+                generatingImageBubble
+            } else {
+                textBubble
+            }
+        }
+        // Keyed on `imageFileName`, not `message.id`: the placeholder message this bubble first
+        // renders for isn't an image message yet, so the task exits immediately below without
+        // decoding anything. `message.id` never changes, so a bare `.task(id: message.id)` would
+        // never re-run once the image actually lands — this bubble would be stuck on its
+        // "generating" state's absence forever. `imageFileName` going from nil to a real value is
+        // exactly the transition that should trigger a decode.
+        .task(id: message.imageFileName ?? message.id.uuidString) {
+            guard message.isImageMessage, decodedImage == nil else { return }
+            let key = message.id.uuidString as NSString
+            if let cached = DecodedImageCache.shared.object(forKey: key) {
+                decodedImage = cached
+                return
+            }
+            guard let data = message.resolvedImageData, let image = UIImage(data: data) else { return }
+            DecodedImageCache.shared.setObject(image, forKey: key)
+            decodedImage = image
+        }
+    }
+
+    // MARK: User bubble
+
+    @ViewBuilder
+    private var userBubble: some View {
+        Spacer()
+        Text(message.text)
+            .font(.system(size: 14))
+            .foregroundColor(Theme.onAccent)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(
+                RoundedRectangle(cornerRadius: 14)
+                    .fill(LinearGradient(colors: [Theme.accent, Theme.accentRose], startPoint: .topLeading, endPoint: .bottomTrailing))
+            )
+            .contextMenu {
+                Button {
+                    UIPasteboard.general.string = message.text
+                } label: {
+                    Label("Copy", systemImage: "doc.on.doc")
+                }
+                ShareLink(item: ConversationExport.shareText(for: message)) {
+                    Label("Share", systemImage: "square.and.arrow.up")
+                }
+            }
+    }
+
+    // MARK: AI-generated image bubble
+
+    @ViewBuilder
+    private var imageBubble: some View {
+        Image(systemName: "sparkles")
+            .foregroundColor(Color.purple)
+            .font(.system(size: 12))
+            .padding(8)
+            .background(Theme.border.opacity(0.4))
+            .clipShape(Circle())
+
+        VStack(alignment: .leading, spacing: 8) {
+            if let uiImg = decodedImage {
+                Image(uiImage: uiImg)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(maxWidth: Layout.chatImageMaxWidth)
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                    .overlay(RoundedRectangle(cornerRadius: 12)
+                        .stroke(Color.purple.opacity(0.35), lineWidth: 1))
+                    .contextMenu {
+                        Button {
+                            onSaveToPhotos(uiImg)
+                        } label: {
+                            Label("Save to Photos", systemImage: "square.and.arrow.down")
+                        }
+                        Button {
+                            UIPasteboard.general.image = uiImg
+                        } label: {
+                            Label("Copy Image", systemImage: "doc.on.doc")
+                        }
+                        Divider()
+                        Button(role: .destructive) {
+                            reportTarget = message
+                        } label: {
+                            Label("Report a Concern", systemImage: "flag")
+                        }
+                    }
+
+                // Always-visible action row
+                HStack(spacing: 10) {
+                    Button {
+                        onSaveToPhotos(uiImg)
+                    } label: {
+                        Label("Save", systemImage: "square.and.arrow.down")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundColor(Theme.onAccent)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 5)
+                            .background(
+                                RoundedRectangle(cornerRadius: 7)
+                                    .fill(Color.purple.opacity(0.75))
+                            )
+                    }
+
+                    Button {
+                        UIPasteboard.general.image = uiImg
+                    } label: {
+                        Label("Copy", systemImage: "doc.on.doc")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundColor(Theme.textSecondary)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 5)
+                            .background(
+                                RoundedRectangle(cornerRadius: 7)
+                                    .fill(Theme.border.opacity(0.5))
+                            )
+                    }
+
+                    // Report button — a visible, one-tap path to flag generated imagery,
+                    // not just a hidden long-press affordance.
+                    Button {
+                        reportTarget = message
+                    } label: {
+                        Label("Report", systemImage: "flag")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundColor(Theme.textSecondary)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 5)
+                            .background(
+                                RoundedRectangle(cornerRadius: 7)
+                                    .fill(Theme.border.opacity(0.5))
+                            )
+                    }
+
+                    Spacer(minLength: 0)
+                }
+            } else {
+                // The one-time gap between this bubble appearing and `.task` above finishing the
+                // decode (or hitting the cache) — every subsequent render of this same message
+                // skips straight to the image.
+                ProgressView()
+                    .frame(maxWidth: Layout.chatImageMaxWidth, minHeight: 120)
+            }
+
+            if !message.text.isEmpty {
+                Text(message.text)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundColor(Theme.textSecondary)
+                    .lineLimit(2)
+            }
+        }
+        Spacer()
+    }
+
+    // MARK: In-progress image generation
+
+    @ViewBuilder
+    private var generatingImageBubble: some View {
+        Image(systemName: "sparkles")
+            .foregroundColor(Color.purple)
+            .font(.system(size: 12))
+            .padding(8)
+            .background(Theme.border.opacity(0.4))
+            .clipShape(Circle())
+
+        VStack(alignment: .leading, spacing: 7) {
+            // Naming the stage matters here: loading a 3 GB checkpoint shows no sampler
+            // progress at all, so a bare "0%" for two minutes reads as a frozen app.
+            Text(diffusionStage.isEmpty ? "Working…" : diffusionStage)
+                .font(.system(size: 13, design: .monospaced))
+                .foregroundColor(Theme.textPrimary)
+
+            // Live decoded frame from the sampler, once one has arrived — lets the user watch
+            // the image actually forming instead of staring at a bare progress bar.
+            if let preview = diffusionPreviewImage {
+                Image(uiImage: preview)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(maxWidth: 170)
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                    .overlay(RoundedRectangle(cornerRadius: 10)
+                        .stroke(Color.purple.opacity(0.35), lineWidth: 1))
+            }
+
+            if diffusionProgress > 0 {
+                ProgressView(value: diffusionProgress)
+                    .progressViewStyle(LinearProgressViewStyle(tint: Color.purple))
+                    .frame(width: 170)
+                Text("\(Int(diffusionProgress * 100))%")
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundColor(Theme.textSecondary)
+            } else {
+                ProgressView()
+                    .progressViewStyle(CircularProgressViewStyle(tint: Color.purple))
+                    .scaleEffect(0.7)
+                    .frame(height: 18, alignment: .leading)
+            }
+
+            // An escape hatch that always works. Generation itself can't be aborted, but
+            // the user should never be stuck staring at a bar with no way back.
+            Button {
+                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                onCancelImageGeneration()
+            } label: {
+                Text("Cancel")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(Theme.accent)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(Theme.cardBackground)
+        .cornerRadius(14)
+        .overlay(RoundedRectangle(cornerRadius: 14)
+            .stroke(Color.purple.opacity(0.3), lineWidth: 1))
+        Spacer()
+    }
+
+    // MARK: Standard text bubble
+
+    @ViewBuilder
+    private var textBubble: some View {
+        let filteredText = ModelOutput.filterThoughts(from: message.text, stripMarkdown: stripMarkdown)
+        // Suppressed thinking/preamble tokens are never streamed as visible text, so
+        // without this the bubble would show a bare "Thinking..." with no indication
+        // whether it's actively working or has stalled — indistinguishable from a hang.
+        let isThinking = isLastMessage && isGenerating && filteredText.isEmpty
+        let thinkingLabel = thinkingTokensUsed > 0
+            ? "Thinking... (\(thinkingTokensUsed)T)"
+            : "Thinking..."
+
+        Image(systemName: "terminal.fill")
+            .foregroundColor(Theme.accentCyan)
+            .font(.system(size: 12))
+            .padding(8)
+            .background(Theme.border.opacity(0.4))
+            .clipShape(Circle())
+
+        VStack(alignment: .leading, spacing: 8) {
+            Text(isThinking ? thinkingLabel : filteredText)
+                .font(.system(size: 14, design: .monospaced))
+                .foregroundColor(isThinking ? Theme.textSecondary : Theme.textPrimary)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .background(Theme.cardBackground)
+                .cornerRadius(14)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 14)
+                        .stroke(Theme.border, lineWidth: 1)
+                )
+                .contextMenu {
+                    Button {
+                        UIPasteboard.general.string = isThinking ? message.text : filteredText
+                    } label: {
+                        Label("Copy", systemImage: "doc.on.doc")
+                    }
+                    // Sharing a still-generating message previously opened the share sheet
+                    // with nothing in it yet — disabled until there's real content to hand off.
+                    ShareLink(item: filteredText) {
+                        Label("Share", systemImage: "square.and.arrow.up")
+                    }
+                    .disabled(isThinking)
+                    if let onRegenerate {
+                        Divider()
+                        Button {
+                            onRegenerate()
+                        } label: {
+                            Label("Regenerate", systemImage: "arrow.clockwise")
+                        }
+                    }
+                    if !isThinking {
+                        Divider()
+                        // Tapping a rating a second time clears it instead of re-submitting —
+                        // `onRateUp`/`onRateDown` already resolve to a clear when this message is
+                        // currently rated that way (see `bubble(for:)` in `ChatMessagesScrollView`),
+                        // so this menu doesn't need its own toggle logic beyond the label/icon.
+                        Button {
+                            onRateUp()
+                        } label: {
+                            Label(currentRating == .up ? "Remove Rating" : "Rate Up",
+                                  systemImage: currentRating == .up ? "hand.thumbsup.fill" : "hand.thumbsup")
+                        }
+                        Button {
+                            onRateDown()
+                        } label: {
+                            Label(currentRating == .down ? "Remove Rating" : "Rate Down",
+                                  systemImage: currentRating == .down ? "hand.thumbsdown.fill" : "hand.thumbsdown")
+                        }
+                    }
+                    Divider()
+                    Button(role: .destructive) {
+                        reportTarget = message
+                    } label: {
+                        Label("Report a Concern", systemImage: "flag")
+                    }
+                }
+
+            // Visible echo of the context-menu rating, so it reads at a glance without opening
+            // the menu. Long-press again on the same item to remove it.
+            if let currentRating {
+                HStack(spacing: 4) {
+                    Image(systemName: currentRating == .up ? "hand.thumbsup.fill" : "hand.thumbsdown.fill")
+                        .font(.system(size: 10))
+                    Text(currentRating == .up ? "Rated helpful" : "Rated down")
+                        .font(.system(size: 11, weight: .semibold))
+                }
+                .foregroundColor(currentRating == .up ? Color.green.opacity(0.85) : Color.red.opacity(0.8))
+            }
+
+            // Web search offer buttons.
+            // Only ever set on an assistant message asking whether to search — see
+            // `ContentView.respondToSearchOffer`. Cleared the moment either button is tapped, so
+            // this never lingers once the user has answered.
+            if let query = message.pendingSearchQuery {
+                HStack(spacing: 8) {
+                    Button {
+                        onSearchOfferResponse(true, query, message.id)
+                    } label: {
+                        Label("Search", systemImage: "magnifyingglass")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundColor(Theme.onAccent)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 6)
+                            .background(RoundedRectangle(cornerRadius: 8).fill(Theme.accentCyan))
+                    }
+                    Button {
+                        onSearchOfferResponse(false, query, message.id)
+                    } label: {
+                        Text("No, just answer")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundColor(Theme.textSecondary)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 6)
+                            .background(RoundedRectangle(cornerRadius: 8).fill(Theme.border.opacity(0.5)))
+                    }
+                }
+            }
+        }
+        Spacer()
     }
 }
 

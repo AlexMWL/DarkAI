@@ -91,10 +91,11 @@ struct GlitchBackgroundView: View {
             // bounding box and drew a visible rectangle on screen. Plain `.opacity` dims the real
             // artwork, works regardless of rendering mode, and leaves no box.
 
-            // Glitching element 1 (red shift). Both glitch layers now use the alpha-keyed asset,
-            // so they work in either appearance — no screen blending, which was the thing that
-            // restricted them to a dark page (over a light one it lightens toward white and
-            // exposes the layer's bounding box as a grey rectangle).
+            // Glitching element 1. Its tint is randomized per flicker between red and purple (see
+            // `glitchColor`'s assignment below) rather than fixed. Both glitch layers now use the
+            // alpha-keyed asset, so they work in either appearance — no screen blending, which was
+            // the thing that restricted them to a dark page (over a light one it lightens toward
+            // white and exposes the layer's bounding box as a grey rectangle).
             Image("circuit_traces")
                 .renderingMode(.template)
                 .resizable()

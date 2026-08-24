@@ -43,22 +43,8 @@ nonisolated struct ModelProfile {
     /// mixed local/global attention layers, in particular) is represented as it actually is rather
     /// than blurred into a flat per-layer figure.
     ///
-    /// Populated for every block the tensor directory names, dense or MoE alike — unlike
-    /// `expertGBByLayer`, which only tracks the routed-expert portion.
+    /// Populated for every block the tensor directory names, dense or MoE alike.
     let blockGBByLayer: [Int: Double]
-
-    /// Routed-expert FFN bytes in each block, keyed by block index. Empty for a dense model.
-    let expertGBByLayer: [Int: Double]
-
-    /// Share of each block's experts a single token actually routes to — `expert_used_count`
-    /// over `expert_count`. Both models this was built against use 1/8.
-    ///
-    /// This is the honest estimate of how much of a pinned expert stack is hot at any moment,
-    /// and so of how much of it the page cache is really holding. Bounded at both ends: never
-    /// below a tenth, because routing spreads across experts as a reply goes on and the cache
-    /// keeps more than one token's worth, and never above a quarter, which was the flat figure
-    /// used before this was read from the file.
-    let routedFraction: Double
 
 }
 
@@ -106,7 +92,6 @@ nonisolated enum ModelProfiler {
         guard let ctx = gguf_init_from_file(path, params) else { return nil }
         defer { gguf_free(ctx) }
 
-        var expertBytesByLayer: [Int: Double] = [:]
         var blockBytesByLayer: [Int: Double] = [:]
         var tensorBytes = 0.0
         for index in 0..<gguf_get_n_tensors(ctx) {
@@ -117,8 +102,6 @@ nonisolated enum ModelProfiler {
             if let layer = blockLayerIndex(in: name) {
                 blockBytesByLayer[layer, default: 0] += size
             }
-            guard let layer = expertLayerIndex(in: name) else { continue }
-            expertBytesByLayer[layer, default: 0] += size
         }
 
         // A GGUF header describes the whole model even when the file holding it is a partial
@@ -150,9 +133,7 @@ nonisolated enum ModelProfiler {
             headDimV: headDimV,
             trainedContext: Int(uintValue(ctx, "\(arch).context_length") ?? 0),
             vocabSize: vocabSize(ctx, arch: arch),
-            blockGBByLayer: blockBytesByLayer.mapValues { $0 / bytesPerGB },
-            expertGBByLayer: expertBytesByLayer.mapValues { $0 / bytesPerGB },
-            routedFraction: routedFraction(ctx, arch: arch)
+            blockGBByLayer: blockBytesByLayer.mapValues { $0 / bytesPerGB }
         )
     }
 
@@ -167,14 +148,6 @@ nonisolated enum ModelProfiler {
             return Int(gguf_get_arr_n(ctx, tokens))
         }
         return Int(uintValue(ctx, "\(arch).vocab_size") ?? 0)
-    }
-
-    /// `expert_used_count / expert_count`, clamped. Falls back to the flat quarter if either key
-    /// is missing, which is the conservative direction — it charges more memory, not less.
-    private static func routedFraction(_ ctx: OpaquePointer, arch: String) -> Double {
-        guard let total = uintValue(ctx, "\(arch).expert_count"), total > 0,
-              let used = uintValue(ctx, "\(arch).expert_used_count") else { return 0.25 }
-        return min(0.25, max(0.10, Double(used) / Double(total)))
     }
 
     /// Reads a scalar unsigned key, tolerating the several widths GGUF allows for one.
@@ -216,30 +189,6 @@ nonisolated enum ModelProfiler {
         return layer
     }
 
-    /// Block index for a routed-expert FFN tensor, e.g. `blk.12.ffn_up_exps.weight` → 12.
-    ///
-    /// Matched against an explicit list rather than by looking for `exps` anywhere in the name,
-    /// because several neighbouring tensors are *not* streamable and misreading one as an expert
-    /// would under-report what the model needs resident on every single forward pass:
-    /// `ffn_up` is a dense FFN, `ffn_up_shexp` is a shared expert every token passes through,
-    /// `ffn_gate_inp` is the router that decides which experts a token wants, and
-    /// `ffn_norm_exps` is a normalisation weight. `ffn_gate_up_exps` is the fused gate+up form
-    /// some architectures use, and does belong here.
-    ///
-    /// `ffn_*_chexps` is deliberately left out. It appears in the tensor-name table but its
-    /// routing semantics aren't established here, and the cost of the two mistakes is
-    /// asymmetric: omitting a genuine expert only forgoes some memory that could have been
-    /// streamed, while including a tensor every token needs would silently under-budget the
-    /// load. If a model using that form ever needs support, confirm what it is first.
-    private static func expertLayerIndex(in name: String) -> Int? {
-        guard name.hasPrefix("blk.") else { return nil }
-        let parts = name.split(separator: ".")
-        guard parts.count >= 3, let layer = Int(parts[1]) else { return nil }
-        switch parts[2] {
-        case "ffn_up_exps", "ffn_down_exps", "ffn_gate_exps", "ffn_gate_up_exps": return layer
-        default: return nil
-        }
-    }
 }
 
 private nonisolated extension Int {

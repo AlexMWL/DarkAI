@@ -53,26 +53,39 @@ actor CoreMLTokenizer {
     private let vocabulary: Vocabulary
     private var model: OpaquePointer?
     private var vocab: OpaquePointer?
+    /// Set the first time `ensureLoaded()` fails, and returned again on every later call instead
+    /// of re-attempting the load — see `ensureLoaded()`'s doc comment.
+    private var loadError: Error?
 
     init(vocabulary: Vocabulary = .llama2SentencePiece) {
         self.vocabulary = vocabulary
     }
 
     /// Loads the bundled vocab-only GGUF on first use. Idempotent — a second call after a
-    /// successful load is a no-op, and a failed attempt is not silently retried forever (the
-    /// bundled resource is static; if it's missing once, it's missing every time).
+    /// successful load is a no-op. A failed attempt is cached too, in `loadError`: the same
+    /// error is re-thrown on every later call instead of re-attempting the full
+    /// `Bundle.main.url(forResource:)` + `llama_model_load_from_file` sequence, since the bundled
+    /// resource is static — if it's missing or fails to load once, it will fail identically every
+    /// time, and retrying it on every `encode`/`decode`/`isEndOfGeneration` call would just repeat
+    /// the same expensive, doomed work.
     private func ensureLoaded() throws {
         guard model == nil else { return }
-        guard let url = Bundle.main.url(forResource: vocabulary.resourceName, withExtension: "gguf") else {
-            throw TokenizerError.bundledVocabMissing
+        if let loadError { throw loadError }
+        do {
+            guard let url = Bundle.main.url(forResource: vocabulary.resourceName, withExtension: "gguf") else {
+                throw TokenizerError.bundledVocabMissing
+            }
+            var params = llama_model_default_params()
+            params.vocab_only = true
+            guard let mdl = llama_model_load_from_file(url.path, params) else {
+                throw TokenizerError.loadFailed
+            }
+            model = mdl
+            vocab = llama_model_get_vocab(mdl)
+        } catch {
+            loadError = error
+            throw error
         }
-        var params = llama_model_default_params()
-        params.vocab_only = true
-        guard let mdl = llama_model_load_from_file(url.path, params) else {
-            throw TokenizerError.loadFailed
-        }
-        model = mdl
-        vocab = llama_model_get_vocab(mdl)
     }
 
     /// Tokenizes `text`. `addBOS` should be `true` for the start of a prompt — OpenELM's model

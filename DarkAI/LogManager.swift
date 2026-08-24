@@ -51,7 +51,6 @@ nonisolated final class LogManager: ObservableObject, @unchecked Sendable {
             let timestamp = self.formatter.string(from: Date())
             let logLine = "[\(timestamp)] \(message)"
 
-            // Console echo, so the same line is visible in Xcode while debugging.
             print(logLine)
 
             self.appendToFile(logLine)
@@ -81,9 +80,21 @@ nonisolated final class LogManager: ObservableObject, @unchecked Sendable {
         let data = (line + "\n").data(using: .utf8) ?? Data()
         if FileManager.default.fileExists(atPath: logFileURL.path) {
             if let fileHandle = try? FileHandle(forWritingTo: logFileURL) {
-                fileHandle.seekToEndOfFile()
-                fileHandle.write(data)
-                fileHandle.closeFile()
+                defer { try? fileHandle.close() }
+                do {
+                    // `seekToEndOfFile()`/`write(_:)` (the legacy pre-iOS 13.4 API) raise an
+                    // Objective-C exception on failure rather than a catchable Swift error — a
+                    // shipped TestFlight build crashed on exactly this: EXC_CRASH (SIGABRT) in
+                    // `-[NSConcreteFileHandle writeData:]`, called from this function, for what
+                    // was presumably a transient write failure (disk pressure, a stale descriptor)
+                    // on the least important I/O in the app. `seekToEnd()`/`write(contentsOf:)`
+                    // (available since iOS 13.4) surface the same failure as an ordinary,
+                    // catchable Swift error instead.
+                    try fileHandle.seekToEnd()
+                    try fileHandle.write(contentsOf: data)
+                } catch {
+                    print("LogManager: failed to append to log file — \(error.localizedDescription)")
+                }
             }
             rotateIfNeeded()
         } else {

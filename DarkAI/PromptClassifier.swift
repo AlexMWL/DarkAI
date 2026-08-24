@@ -96,6 +96,29 @@ struct PromptClassifier {
 
     // MARK: Classification
 
+    /// Whether `needle` occurs in `haystack` at a word boundary — not merely as a substring.
+    /// Mirrors `ContentSafety.wordBoundaryMatch`: a bare `.contains` check matches "art" inside
+    /// "chart" and "render" inside "surrender", which is not what a short, common noun in
+    /// `generateVisualNouns` should do. Treats any non-letter/non-number — punctuation included,
+    /// not just whitespace — as a boundary, so "generate art." at the end of a sentence still
+    /// matches.
+    private static func wordBoundaryContains(_ needle: String, in haystack: String) -> Bool {
+        sharedWordBoundaryContains(needle, in: haystack)
+    }
+
+    /// Whether `lower` contains one of `generateVisualNouns` as a whole word. Checks a trailing
+    /// "s"/"es" alongside the bare form — not just the bare form — so "generate images of a
+    /// dragon" still matches "image" and "generate sketches" still matches "sketch", the same
+    /// plurals the old unanchored `.contains` matched by accident.
+    private static func containsVisualNoun(_ lower: String) -> Bool {
+        for noun in generateVisualNouns {
+            if wordBoundaryContains(noun, in: lower) { return true }
+            if wordBoundaryContains(noun + "s", in: lower) { return true }
+            if wordBoundaryContains(noun + "es", in: lower) { return true }
+        }
+        return false
+    }
+
     static func classify(_ input: String) -> PromptIntent {
         let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return .text }
@@ -109,7 +132,7 @@ struct PromptClassifier {
 
         // 2. Bare "generate " — handled separately from the strong triggers below because it
         // needs the visual-noun gate; see `generateVisualNouns`'s doc comment.
-        if lower.hasPrefix("generate "), generateVisualNouns.contains(where: { lower.contains($0) }) {
+        if lower.hasPrefix("generate "), containsVisualNoun(lower) {
             let refined = stripLeadingTrigger("generate ", from: trimmed)
             return .imageGeneration(refinedPrompt: refined.isEmpty ? trimmed : refined)
         }
@@ -132,13 +155,17 @@ struct PromptClassifier {
             let refined = stripLeadingTrigger(trigger, from: trimmed)
             return .imageGeneration(refinedPrompt: refined.isEmpty ? trimmed : refined)
         }
-        for trigger in strongTriggersLongestFirst where lower.contains(trigger) {
+        // Word-boundary, not a bare `.contains` — otherwise "draw the " misfires inside
+        // "withdraw the offer", "render a " inside "surrender a hostage", "generate art" inside
+        // "a degenerate artist". Same bug class `wordBoundaryContains` was built for above; it
+        // just hadn't been applied to these three tiers yet.
+        for trigger in strongTriggersLongestFirst where wordBoundaryContains(trigger, in: lower) {
             return .imageGeneration(refinedPrompt: trimmed)
         }
 
         // 4. Pattern triggers (medium confidence)
         for trigger in patternTriggers {
-            if lower.contains(trigger) {
+            if wordBoundaryContains(trigger, in: lower) {
                 return .imageGeneration(refinedPrompt: trimmed)
             }
         }
@@ -146,7 +173,7 @@ struct PromptClassifier {
         // 5. Style keyword triggers (lower confidence — only for short descriptive prompts)
         if trimmed.count < 250 {
             for trigger in styleTriggers {
-                if lower.contains(trigger) {
+                if wordBoundaryContains(trigger, in: lower) {
                     return .imageGeneration(refinedPrompt: trimmed)
                 }
             }

@@ -4,20 +4,11 @@ import UIKit
 
 // MARK: - Diffusion Load State
 
-enum DiffusionLoadState: Equatable {
+enum DiffusionLoadState {
     case unloaded
     case loading(progress: Double, status: String)
     case loaded(modelName: String, sizeGB: Double)
     case failed(error: String)
-
-    static func == (lhs: DiffusionLoadState, rhs: DiffusionLoadState) -> Bool {
-        switch (lhs, rhs) {
-        case (.unloaded, .unloaded):                          return true
-        case (.loaded(let a, let b), .loaded(let c, let d)): return a == c && b == d
-        case (.failed(let a), .failed(let b)):                return a == b
-        default:                                              return false
-        }
-    }
 
     var isLoaded: Bool {
         if case .loaded = self { return true }
@@ -49,14 +40,18 @@ actor DiffusionRunner {
         loadedPath = path
     }
 
-    func generate(prompt: String, steps: Int, cfgScale: Float, width: Int, height: Int, seed: Int, progressHandler: @escaping (Double) -> Void) async throws -> Data {
+    func generate(
+        prompt: String, steps: Int, cfgScale: Float, width: Int, height: Int, seed: Int,
+        progressHandler: @escaping (Double) -> Void,
+        previewHandler: ((UIImage) -> Void)? = nil
+    ) async throws -> Data {
         guard loadedPath != nil else {
             throw NSError(domain: "DiffusionRunner", code: 2,
                           userInfo: [NSLocalizedDescriptionKey: "No model loaded"])
         }
-        
+
         let wrapper = sdWrapper  // Capture before leaving actor context
-        let p = prompt, s = steps, cfg = cfgScale, w = width, h = height, sd = seed, ph = progressHandler
+        let p = prompt, s = steps, cfg = cfgScale, w = width, h = height, sd = seed, ph = progressHandler, prevH = previewHandler
 
         // Run the blocking denoising loop on a background thread.
         return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
@@ -76,7 +71,8 @@ actor DiffusionRunner {
                         width: w,
                         height: h,
                         seed: sd,
-                        progressHandler: ph
+                        progressHandler: ph,
+                        previewHandler: prevH
                     )
                     continuation.resume(returning: data)
                 } catch {
@@ -93,6 +89,15 @@ actor DiffusionRunner {
         guard sdWrapper.unload() else { return false }
         loadedPath = nil
         return true
+    }
+
+    /// Requests that whatever `generate_image` call is currently running on the background
+    /// dispatch queue stop as soon as possible. The actor is reentrant while `generate` is
+    /// suspended on its continuation (see `stateLock`'s doc comment in `SDWrapper`), so this
+    /// runs immediately rather than queuing behind the in-flight generation. See
+    /// `SDWrapper.cancel()` for why this is best-effort rather than instantaneous.
+    func cancel() {
+        sdWrapper.cancel()
     }
 }
 
@@ -123,9 +128,17 @@ class DiffusionManager: ObservableObject {
     @Published var generationProgress: Double = 0.0
     @Published var activeDiffusionURL: URL? = nil
 
-    /// Set when the user backs out. Generation itself can't be interrupted — stable-diffusion.cpp
-    /// offers no abort hook — so this releases the UI immediately and the result is discarded
-    /// when the sampler eventually finishes.
+    /// Most recent intermediate decoded frame from the sampler, for a live preview while
+    /// denoising is still in progress. `nil` whenever no generation is running — see
+    /// `beginGenerationSession`/`endGenerationSession`/`cancelGeneration`, which all clear it —
+    /// so a stale frame from a previous run never lingers on screen for the next one.
+    @Published var previewImage: UIImage? = nil
+
+    /// Set when the user backs out. `cancelGeneration()` also asks the C++ side to stop via
+    /// `SDWrapper.cancel()` (`sd_cancel_generation`), but that only takes effect at the sampler's
+    /// next step boundary, not instantly — the step already running when the user cancels still
+    /// has to finish. This flag is what releases the UI immediately regardless of when the
+    /// in-flight call actually returns; the result is discarded once it does.
     private(set) var isCancelled = false
 
     // MARK: Persisted Settings
@@ -185,9 +198,18 @@ class DiffusionManager: ObservableObject {
 
     private let runner = DiffusionRunner()
 
+    /// Token for the memory-warning observer registered below, so `deinit` can remove it.
+    /// `NotificationCenter` does not deregister a block-based observer on its own when the
+    /// observing object deallocates (only the older target/selector API did that automatically);
+    /// without holding and removing this token, every `DiffusionManager` instance would leave its
+    /// closure registered on `NotificationCenter.default` for the process's entire lifetime,
+    /// keeping that closure (and its captured `self`, held here via `[weak self]` — so `self`
+    /// itself isn't strictly leaked, but the observer registration and closure allocation are).
+    private var memoryWarningObserver: NSObjectProtocol?
+
     // MARK: Init
     init() {
-        NotificationCenter.default.addObserver(
+        memoryWarningObserver = NotificationCenter.default.addObserver(
             forName: UIApplication.didReceiveMemoryWarningNotification,
             object: nil, queue: .main
         ) { [weak self] _ in
@@ -211,6 +233,12 @@ class DiffusionManager: ObservableObject {
         }
     }
 
+    deinit {
+        if let memoryWarningObserver {
+            NotificationCenter.default.removeObserver(memoryWarningObserver)
+        }
+    }
+
     // MARK: Generation session
 
     /// Opens the user-visible operation. Pair with `endGenerationSession()` from a `defer` in the
@@ -220,6 +248,7 @@ class DiffusionManager: ObservableObject {
         isCancelled = false
         generationProgress = 0
         generationStage = stage
+        previewImage = nil
     }
 
     func updateGenerationStage(_ stage: String) {
@@ -231,20 +260,23 @@ class DiffusionManager: ObservableObject {
         isGenerating = false
         generationProgress = 0
         generationStage = ""
+        previewImage = nil
         // Reached via the caller's `defer`, i.e. once the run has genuinely unwound — including
         // a cancelled one, which is the point at which the chat model has been restored.
         isFinishingCancelledRun = false
     }
 
-    /// Releases the UI now. The in-flight sampler keeps running to completion on its background
-    /// thread — there's no safe way to tear its context down mid-loop — but its output is thrown
-    /// away and the user gets their input back immediately.
+    /// Releases the UI now. The in-flight sampler keeps running on its background thread until it
+    /// reaches its next checkpoint — there's no safe way to tear its context down mid-step — but
+    /// its output is thrown away and the user gets their input back immediately.
     /// True from the moment the user cancels until the in-flight run actually unwinds.
     ///
-    /// stable-diffusion.cpp has no abort hook, so a cancellation during denoising can't stop the
-    /// sampler — the task stays parked on that call until it returns, and only then can the
-    /// checkpoint be freed and the chat model reloaded. Without this the app looked broken in
-    /// that window: input was released, but the model bar read "No model loaded" with nothing
+    /// `cancelGeneration()` below does call into `SDWrapper.cancel()` (`sd_cancel_generation`),
+    /// so the sampler genuinely does stop early rather than running every requested step to
+    /// completion — but that check only happens between steps, not inside one, so the step
+    /// already running when the user cancels still has to finish, and only then can the
+    /// checkpoint be freed and the chat model reloaded. Without this flag the app looked broken
+    /// in that window: input was released, but the model bar read "No model loaded" with nothing
     /// indicating the chat model was on its way back.
     @Published private(set) var isFinishingCancelledRun = false
 
@@ -253,12 +285,19 @@ class DiffusionManager: ObservableObject {
         isCancelled = true
         LogManager.shared.log("DiffusionManager: generation cancelled by user")
 
+        // Best-effort: ask the C++ sampler to stop at its next checkpoint (see
+        // `SDWrapper.cancel()`/`isFinishingCancelledRun` above for why this isn't instantaneous).
+        // Fire-and-forget — the actor call is cheap and there's nothing useful to await here; the
+        // in-flight task's own `defer` is what actually observes and reports the eventual outcome.
+        Task { await runner.cancel() }
+
         // Release the UI immediately, but don't run the full session teardown here — the task's
         // own `defer` does that when it finally unwinds, which is also when the chat model is
         // back. Clearing everything now would erase the only signal that work is still pending.
         isGenerating = false
         generationProgress = 0
         generationStage = ""
+        previewImage = nil
         isFinishingCancelledRun = true
     }
 
@@ -298,8 +337,11 @@ class DiffusionManager: ObservableObject {
     ///   step that both scale with pixel count. A flat compute-overhead constant here was
     ///   blind to that: it judged a 768×768 generation exactly as safe as a 256×256 one from
     ///   the same checkpoint, when the former needs meaningfully more headroom to actually
-    ///   finish without the OS reclaiming memory mid-sampler — a kill this library has no way
-    ///   to recover from (`generate_image` has no abort hook).
+    ///   finish without the OS reclaiming memory mid-sampler — a kill this pre-flight check is
+    ///   still the only real defense against. `sd_cancel_generation` (see `SDWrapper.cancel()`)
+    ///   now gives the app a real way to abort a generation early, but only when the app itself
+    ///   decides to call it; a jetsam kill is the OS terminating the process outright, with no
+    ///   warning beforehand to call cancel *against* — there's no event to react to in time.
     func checkMemorySafety(modelSizeGB: Double, outputSize: Int) -> MemorySafetyStatus {
         let availableNowGB = getAvailableMemoryGB()
         // Compute overhead for CLIP text encoders, VAE, and UNet activation buffers — not
@@ -338,6 +380,12 @@ class DiffusionManager: ObservableObject {
     }
 
     func loadDiffusionModelAsync(at url: URL) async throws {
+        // `lastDiffusionModelPath` is what gets auto-reloaded on the next launch — set
+        // optimistically below before validation/memory-check/load even run, so every failure
+        // path has to restore it, or a checkpoint that fails validation (or is simply too big for
+        // this device) becomes "the" model this app keeps trying to auto-load on every future
+        // launch, forever, since nothing else ever overwrites it back to a real one.
+        let previousLastDiffusionModelPath = lastDiffusionModelPath
         await MainActor.run {
             diffusionLoadState = .loading(progress: 0.1, status: "Validating GGUF...")
             activeDiffusionURL = url
@@ -354,6 +402,7 @@ class DiffusionManager: ObservableObject {
             await MainActor.run {
                 self.diffusionLoadState = .failed(error: error.localizedDescription)
                 self.activeDiffusionURL = nil
+                self.lastDiffusionModelPath = previousLastDiffusionModelPath
             }
             LogManager.shared.log("Diffusion checkpoint rejected: \(error.localizedDescription)")
             throw error
@@ -397,6 +446,7 @@ class DiffusionManager: ObservableObject {
             await MainActor.run {
                 self.diffusionLoadState = .failed(error: error.localizedDescription)
                 self.activeDiffusionURL = nil
+                self.lastDiffusionModelPath = previousLastDiffusionModelPath
             }
             throw error
         }
@@ -416,17 +466,12 @@ class DiffusionManager: ObservableObject {
             await MainActor.run {
                 self.diffusionLoadState = .failed(error: error.localizedDescription)
                 self.activeDiffusionURL = nil
+                self.lastDiffusionModelPath = previousLastDiffusionModelPath
             }
             throw error
         }
     }
 
-    func unloadDiffusionModel() {
-        Task {
-            await unloadDiffusionModelAsync()
-        }
-    }
-    
     /// Returns `false` when the teardown was refused because the sampler still owns the context.
     /// The recovery flow needs that answer — telling the user everything was freed when several
     /// gigabytes are still resident is exactly the kind of wrong reassurance it exists to replace.
@@ -479,6 +524,14 @@ class DiffusionManager: ObservableObject {
                     // Creating Task{@MainActor} from a background GCD thread is safe.
                     Task { @MainActor [weak self] in
                         self?.generationProgress = p
+                    }
+                },
+                previewHandler: { [weak self] image in
+                    // Same hop as the progress handler above — `SDWrapper` already throttles how
+                    // often this actually fires (see `PreviewContext` there), so there's no need
+                    // to throttle again on this side.
+                    Task { @MainActor [weak self] in
+                        self?.previewImage = image
                     }
                 }
             )

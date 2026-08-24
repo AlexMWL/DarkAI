@@ -161,7 +161,9 @@ nonisolated final class PipelineArrayStore {
         let inputDescriptions = model.modelDescription.inputDescriptionsByName
         if let inputIDsConstraint = inputDescriptions["input_ids"]?.multiArrayConstraint {
             let inputShape = inputIDsConstraint.shape.map(\.intValue)
-            let inputLength = inputShape.last!
+            guard let inputLength = inputShape.last else {
+                throw CacheFeatureMissing(name: "input_ids (empty shape)")
+            }
 
             let suffixLength = tokens.isEmpty ? 0 : (tokens.count - 1) % inputLength + 1
             let inputTokens = tokens.suffix(suffixLength).map { Int32($0) }

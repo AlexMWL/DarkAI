@@ -89,6 +89,16 @@ final class ModelInventory: ObservableObject {
         // A model that is back is no longer missing, however it got here.
         missing.removeAll { $0.id == entry.id }
         persist()
+
+        // `ModelDownloadManager.isInstalled` caches its result per catalog model ID. The catalog
+        // download path already invalidates it via `finish(...)` (this call is a harmless no-op
+        // redundant with that one there), but the manual-import call sites — Settings' chat and
+        // diffusion importers, and onboarding's own `.gguf` importer — never did, so a catalog
+        // entry a user had already browsed (caching "not installed") could keep showing as
+        // downloadable, and offering to re-download, after they side-loaded the same file.
+        if let catalogID {
+            ModelDownloadManager.shared.invalidateInstalledCache(for: catalogID)
+        }
     }
 
     /// Called when the user deletes a model themselves. Distinct from it going missing: a
@@ -114,7 +124,18 @@ final class ModelInventory: ObservableObject {
         var newlyMissing: [InstalledModel] = []
 
         for entry in installed {
-            if FileManager.default.fileExists(atPath: entry.url.path) {
+            let isPresent: Bool
+            if entry.kind == .coreML, let catalogModel = entry.catalogModel {
+                // A bare directory-exists check only confirms a Core ML model's root directory
+                // survived, not that every file inside it did — exactly the storage-pressure
+                // scenario this type's own doc comment calls out. `isInstalled` validates against
+                // the catalog's full manifest instead; `adoptUntrackedFiles` above already uses it
+                // for the same reason.
+                isPresent = ModelDownloadManager.shared.isInstalled(catalogModel)
+            } else {
+                isPresent = FileManager.default.fileExists(atPath: entry.url.path)
+            }
+            if isPresent {
                 stillInstalled.append(entry)
             } else {
                 newlyMissing.append(entry)
@@ -173,6 +194,16 @@ final class ModelInventory: ObservableObject {
             } else {
                 size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init) ?? 0
             }
+
+            // The manifest check above only runs when `catalogModel` resolves — an orphaned
+            // directory whose catalog entry has since been removed (the doc comment above
+            // mentions this happened once, for OpenELM) has no manifest left to validate against
+            // at all. A completely empty directory is at least an unambiguous signal something's
+            // wrong; skip adopting that rather than recording a model with nothing to load.
+            if kind == .coreML, catalogModel == nil, size == 0 {
+                continue
+            }
+
             record(
                 fileName: url.lastPathComponent,
                 kind: kind,

@@ -30,7 +30,10 @@ enum ModelKind: String, Codable {
 /// is the complete, ordered manifest for one catalog model — see
 /// `ModelDownloadManager.downloadCoreMLFiles` for how it's fetched (a queue of background
 /// download tasks, one file at a time, not the single-task path every other model kind uses).
-struct CoreMLPackageFile: Hashable {
+/// `nonisolated`: same reasoning as `CatalogModel` right below — a plain value type with no
+/// shared mutable state, whose synthesized `Hashable`/`Equatable` conformance otherwise defaults
+/// to main-actor-isolated and can't be used from `verify(fileAt:against:)`'s nonisolated context.
+nonisolated struct CoreMLPackageFile: Hashable {
     let url: URL
     /// Path relative to the installed model's root directory, e.g. `"Manifest.json"` or
     /// `"Llama-3.2-1B-Instruct_chunk1.mlmodelc/weights/weight.bin"`.
@@ -38,7 +41,11 @@ struct CoreMLPackageFile: Hashable {
     let byteSize: Int64
 }
 
-struct CatalogModel: Identifiable, Hashable {
+/// `nonisolated`: a plain value type describing static catalog metadata, with no shared mutable
+/// state — `verify(fileAt:against:)` (deliberately `nonisolated` so download verification runs
+/// off the main actor) reads `fileName`/`sizeDescription` on this type, which default to
+/// main-actor-isolated like everything else in this module otherwise.
+nonisolated struct CatalogModel: Identifiable, Hashable {
     let id: String
     let kind: ModelKind
     let displayName: String
@@ -229,7 +236,7 @@ enum ModelCatalog {
             // size. That speed does NOT come with a smaller memory footprint, though: per-expert
             // GPU/CPU splitting was tried for a mixture-of-experts model on this engine and found
             // to not work reliably on Metal (see the comment on expert pinning in
-            // `LLMManager.planOffload`), so this is still sized as needing its full file size
+            // `LlamaRunner.planOffload`), so this is still sized as needing its full file size
             // resident, exactly like every other model here.
             summary: "A mixture-of-experts model that only routes each word through a fraction of its weights; the power of an 8B model without the memory demand but replies come noticeably slower than other models.",
             url: URL(string: "https://huggingface.co/LiquidAI/LFM2.5-8B-A1B-GGUF/resolve/main/LFM2.5-8B-A1B-Q4_K_M.gguf")!,
@@ -276,33 +283,12 @@ enum ModelCatalog {
         )
     ]
 
-    /// Core ML models, executed via `CoreMLRunner` rather than llama.cpp. Currently one entry: a
-    /// community Core ML conversion of Apple's own OpenELM-270M-Instruct, the only ready-made
-    /// `.mlpackage` build of it available (Apple's own `apple/OpenELM-270M-Instruct` repo ships
-    /// PyTorch weights only). It is a **fixed 128-token window, non-stateful** export — no
-    /// KV-cache reuse across steps — so total conversation length (prompt + reply) tops out at
-    /// 128 tokens. That is a hard ceiling of this specific artifact, not a setting; it is offered
-    /// as a small, on-device ANE demo rather than a general-purpose chat model.
+    /// Core ML models, executed via `CoreMLRunner` rather than llama.cpp — both entries below are
+    /// real, stateful, sliding-window chat models (`ChunkedPipelineCoreMLEngine`), not the fixed
+    /// 128-token demo export this catalog used to also offer (OpenELM-270M-Instruct, removed:
+    /// too short a context window and too small a model to be useful for anything beyond proving
+    /// the ANE pipeline worked at all).
     static let coreMLModels: [CatalogModel] = {
-        let openELMBase = "https://huggingface.co/corenet-community/coreml-OpenELM-270M-Instruct/resolve/main/OpenELM-270M-Instruct-128-float32.mlpackage"
-        let openELMFiles: [CoreMLPackageFile] = [
-            CoreMLPackageFile(
-                url: URL(string: "\(openELMBase)/Data/com.apple.CoreML/weights/weight.bin")!,
-                relativePath: "Data/com.apple.CoreML/weights/weight.bin",
-                byteSize: 1_086_767_744
-            ),
-            CoreMLPackageFile(
-                url: URL(string: "\(openELMBase)/Manifest.json")!,
-                relativePath: "Manifest.json",
-                byteSize: 617
-            ),
-            CoreMLPackageFile(
-                url: URL(string: "\(openELMBase)/Data/com.apple.CoreML/model.mlmodel")!,
-                relativePath: "Data/com.apple.CoreML/model.mlmodel",
-                byteSize: 270_654
-            )
-        ]
-
         // Llama 3.2 1B Instruct, converted for the ANE by the coreml-llm-cli project (see
         // ChunkedPipelineCoreMLEngine's doc comment). Six chunked, already-*compiled* `.mlmodelc`
         // transformer blocks plus a small KV-cache-shift model — deliberately excludes the
@@ -347,25 +333,103 @@ enum ModelCatalog {
             CoreMLPackageFile(url: URL(string: llamaBase + "cache-processor.mlmodelc/model.mil")!, relativePath: "cache-processor.mlmodelc/model.mil", byteSize: 3429)
         ]
 
+        // Llama 3.2 3B Instruct, same conversion project and same 512-token sliding context as
+        // the 1B build above, just 16 chunks instead of 6 (`ChunkedPipelineCoreMLEngine` discovers
+        // chunk files by scanning for the `_chunk<N>` suffix, so it needs no code changes to run a
+        // model split into more pieces). Same `logit-processor.mlmodelc` exclusion as the 1B, for
+        // the same reason. Byte sizes fetched directly from the Hugging Face tree API, not
+        // estimated. The upstream repo's own README warns this will "likely run slowly or not at
+        // all on M1 Macs and phones" other than the newest, highest-RAM ones — reflected below in
+        // a deliberately high `minimumRAMGB` rather than smoothed over.
+        let llama3bBase = "https://huggingface.co/smpanaro/Llama-3.2-3B-Instruct-CoreML/resolve/main/"
+        let llama3bFiles: [CoreMLPackageFile] = [
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk1.mlmodelc/analytics/coremldata.bin")!, relativePath: "Llama-3.2-3B-Instruct_chunk1.mlmodelc/analytics/coremldata.bin", byteSize: 243),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk1.mlmodelc/coremldata.bin")!, relativePath: "Llama-3.2-3B-Instruct_chunk1.mlmodelc/coremldata.bin", byteSize: 409),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk1.mlmodelc/metadata.json")!, relativePath: "Llama-3.2-3B-Instruct_chunk1.mlmodelc/metadata.json", byteSize: 2895),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk1.mlmodelc/model.mil")!, relativePath: "Llama-3.2-3B-Instruct_chunk1.mlmodelc/model.mil", byteSize: 10350),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk1.mlmodelc/weights/weight.bin")!, relativePath: "Llama-3.2-3B-Instruct_chunk1.mlmodelc/weights/weight.bin", byteSize: 788398464),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk2.mlmodelc/analytics/coremldata.bin")!, relativePath: "Llama-3.2-3B-Instruct_chunk2.mlmodelc/analytics/coremldata.bin", byteSize: 243),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk2.mlmodelc/coremldata.bin")!, relativePath: "Llama-3.2-3B-Instruct_chunk2.mlmodelc/coremldata.bin", byteSize: 653),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk2.mlmodelc/metadata.json")!, relativePath: "Llama-3.2-3B-Instruct_chunk2.mlmodelc/metadata.json", byteSize: 5278),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk2.mlmodelc/model.mil")!, relativePath: "Llama-3.2-3B-Instruct_chunk2.mlmodelc/model.mil", byteSize: 160189),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk2.mlmodelc/weights/weight.bin")!, relativePath: "Llama-3.2-3B-Instruct_chunk2.mlmodelc/weights/weight.bin", byteSize: 402679744),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk3.mlmodelc/analytics/coremldata.bin")!, relativePath: "Llama-3.2-3B-Instruct_chunk3.mlmodelc/analytics/coremldata.bin", byteSize: 243),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk3.mlmodelc/coremldata.bin")!, relativePath: "Llama-3.2-3B-Instruct_chunk3.mlmodelc/coremldata.bin", byteSize: 653),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk3.mlmodelc/metadata.json")!, relativePath: "Llama-3.2-3B-Instruct_chunk3.mlmodelc/metadata.json", byteSize: 5278),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk3.mlmodelc/model.mil")!, relativePath: "Llama-3.2-3B-Instruct_chunk3.mlmodelc/model.mil", byteSize: 160189),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk3.mlmodelc/weights/weight.bin")!, relativePath: "Llama-3.2-3B-Instruct_chunk3.mlmodelc/weights/weight.bin", byteSize: 402679744),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk4.mlmodelc/analytics/coremldata.bin")!, relativePath: "Llama-3.2-3B-Instruct_chunk4.mlmodelc/analytics/coremldata.bin", byteSize: 243),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk4.mlmodelc/coremldata.bin")!, relativePath: "Llama-3.2-3B-Instruct_chunk4.mlmodelc/coremldata.bin", byteSize: 653),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk4.mlmodelc/metadata.json")!, relativePath: "Llama-3.2-3B-Instruct_chunk4.mlmodelc/metadata.json", byteSize: 5278),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk4.mlmodelc/model.mil")!, relativePath: "Llama-3.2-3B-Instruct_chunk4.mlmodelc/model.mil", byteSize: 160189),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk4.mlmodelc/weights/weight.bin")!, relativePath: "Llama-3.2-3B-Instruct_chunk4.mlmodelc/weights/weight.bin", byteSize: 402679744),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk5.mlmodelc/analytics/coremldata.bin")!, relativePath: "Llama-3.2-3B-Instruct_chunk5.mlmodelc/analytics/coremldata.bin", byteSize: 243),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk5.mlmodelc/coremldata.bin")!, relativePath: "Llama-3.2-3B-Instruct_chunk5.mlmodelc/coremldata.bin", byteSize: 653),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk5.mlmodelc/metadata.json")!, relativePath: "Llama-3.2-3B-Instruct_chunk5.mlmodelc/metadata.json", byteSize: 5278),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk5.mlmodelc/model.mil")!, relativePath: "Llama-3.2-3B-Instruct_chunk5.mlmodelc/model.mil", byteSize: 160189),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk5.mlmodelc/weights/weight.bin")!, relativePath: "Llama-3.2-3B-Instruct_chunk5.mlmodelc/weights/weight.bin", byteSize: 402679744),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk6.mlmodelc/analytics/coremldata.bin")!, relativePath: "Llama-3.2-3B-Instruct_chunk6.mlmodelc/analytics/coremldata.bin", byteSize: 243),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk6.mlmodelc/coremldata.bin")!, relativePath: "Llama-3.2-3B-Instruct_chunk6.mlmodelc/coremldata.bin", byteSize: 653),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk6.mlmodelc/metadata.json")!, relativePath: "Llama-3.2-3B-Instruct_chunk6.mlmodelc/metadata.json", byteSize: 5278),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk6.mlmodelc/model.mil")!, relativePath: "Llama-3.2-3B-Instruct_chunk6.mlmodelc/model.mil", byteSize: 160189),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk6.mlmodelc/weights/weight.bin")!, relativePath: "Llama-3.2-3B-Instruct_chunk6.mlmodelc/weights/weight.bin", byteSize: 402679744),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk7.mlmodelc/analytics/coremldata.bin")!, relativePath: "Llama-3.2-3B-Instruct_chunk7.mlmodelc/analytics/coremldata.bin", byteSize: 243),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk7.mlmodelc/coremldata.bin")!, relativePath: "Llama-3.2-3B-Instruct_chunk7.mlmodelc/coremldata.bin", byteSize: 653),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk7.mlmodelc/metadata.json")!, relativePath: "Llama-3.2-3B-Instruct_chunk7.mlmodelc/metadata.json", byteSize: 5278),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk7.mlmodelc/model.mil")!, relativePath: "Llama-3.2-3B-Instruct_chunk7.mlmodelc/model.mil", byteSize: 160189),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk7.mlmodelc/weights/weight.bin")!, relativePath: "Llama-3.2-3B-Instruct_chunk7.mlmodelc/weights/weight.bin", byteSize: 402679744),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk8.mlmodelc/analytics/coremldata.bin")!, relativePath: "Llama-3.2-3B-Instruct_chunk8.mlmodelc/analytics/coremldata.bin", byteSize: 243),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk8.mlmodelc/coremldata.bin")!, relativePath: "Llama-3.2-3B-Instruct_chunk8.mlmodelc/coremldata.bin", byteSize: 653),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk8.mlmodelc/metadata.json")!, relativePath: "Llama-3.2-3B-Instruct_chunk8.mlmodelc/metadata.json", byteSize: 5278),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk8.mlmodelc/model.mil")!, relativePath: "Llama-3.2-3B-Instruct_chunk8.mlmodelc/model.mil", byteSize: 160189),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk8.mlmodelc/weights/weight.bin")!, relativePath: "Llama-3.2-3B-Instruct_chunk8.mlmodelc/weights/weight.bin", byteSize: 402679744),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk9.mlmodelc/analytics/coremldata.bin")!, relativePath: "Llama-3.2-3B-Instruct_chunk9.mlmodelc/analytics/coremldata.bin", byteSize: 243),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk9.mlmodelc/coremldata.bin")!, relativePath: "Llama-3.2-3B-Instruct_chunk9.mlmodelc/coremldata.bin", byteSize: 653),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk9.mlmodelc/metadata.json")!, relativePath: "Llama-3.2-3B-Instruct_chunk9.mlmodelc/metadata.json", byteSize: 5278),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk9.mlmodelc/model.mil")!, relativePath: "Llama-3.2-3B-Instruct_chunk9.mlmodelc/model.mil", byteSize: 160189),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk9.mlmodelc/weights/weight.bin")!, relativePath: "Llama-3.2-3B-Instruct_chunk9.mlmodelc/weights/weight.bin", byteSize: 402679744),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk10.mlmodelc/analytics/coremldata.bin")!, relativePath: "Llama-3.2-3B-Instruct_chunk10.mlmodelc/analytics/coremldata.bin", byteSize: 243),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk10.mlmodelc/coremldata.bin")!, relativePath: "Llama-3.2-3B-Instruct_chunk10.mlmodelc/coremldata.bin", byteSize: 653),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk10.mlmodelc/metadata.json")!, relativePath: "Llama-3.2-3B-Instruct_chunk10.mlmodelc/metadata.json", byteSize: 5279),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk10.mlmodelc/model.mil")!, relativePath: "Llama-3.2-3B-Instruct_chunk10.mlmodelc/model.mil", byteSize: 160189),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk10.mlmodelc/weights/weight.bin")!, relativePath: "Llama-3.2-3B-Instruct_chunk10.mlmodelc/weights/weight.bin", byteSize: 402679744),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk11.mlmodelc/analytics/coremldata.bin")!, relativePath: "Llama-3.2-3B-Instruct_chunk11.mlmodelc/analytics/coremldata.bin", byteSize: 243),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk11.mlmodelc/coremldata.bin")!, relativePath: "Llama-3.2-3B-Instruct_chunk11.mlmodelc/coremldata.bin", byteSize: 653),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk11.mlmodelc/metadata.json")!, relativePath: "Llama-3.2-3B-Instruct_chunk11.mlmodelc/metadata.json", byteSize: 5279),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk11.mlmodelc/model.mil")!, relativePath: "Llama-3.2-3B-Instruct_chunk11.mlmodelc/model.mil", byteSize: 160189),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk11.mlmodelc/weights/weight.bin")!, relativePath: "Llama-3.2-3B-Instruct_chunk11.mlmodelc/weights/weight.bin", byteSize: 402679744),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk12.mlmodelc/analytics/coremldata.bin")!, relativePath: "Llama-3.2-3B-Instruct_chunk12.mlmodelc/analytics/coremldata.bin", byteSize: 243),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk12.mlmodelc/coremldata.bin")!, relativePath: "Llama-3.2-3B-Instruct_chunk12.mlmodelc/coremldata.bin", byteSize: 653),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk12.mlmodelc/metadata.json")!, relativePath: "Llama-3.2-3B-Instruct_chunk12.mlmodelc/metadata.json", byteSize: 5279),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk12.mlmodelc/model.mil")!, relativePath: "Llama-3.2-3B-Instruct_chunk12.mlmodelc/model.mil", byteSize: 160189),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk12.mlmodelc/weights/weight.bin")!, relativePath: "Llama-3.2-3B-Instruct_chunk12.mlmodelc/weights/weight.bin", byteSize: 402679744),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk13.mlmodelc/analytics/coremldata.bin")!, relativePath: "Llama-3.2-3B-Instruct_chunk13.mlmodelc/analytics/coremldata.bin", byteSize: 243),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk13.mlmodelc/coremldata.bin")!, relativePath: "Llama-3.2-3B-Instruct_chunk13.mlmodelc/coremldata.bin", byteSize: 653),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk13.mlmodelc/metadata.json")!, relativePath: "Llama-3.2-3B-Instruct_chunk13.mlmodelc/metadata.json", byteSize: 5279),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk13.mlmodelc/model.mil")!, relativePath: "Llama-3.2-3B-Instruct_chunk13.mlmodelc/model.mil", byteSize: 160189),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk13.mlmodelc/weights/weight.bin")!, relativePath: "Llama-3.2-3B-Instruct_chunk13.mlmodelc/weights/weight.bin", byteSize: 402679744),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk14.mlmodelc/analytics/coremldata.bin")!, relativePath: "Llama-3.2-3B-Instruct_chunk14.mlmodelc/analytics/coremldata.bin", byteSize: 243),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk14.mlmodelc/coremldata.bin")!, relativePath: "Llama-3.2-3B-Instruct_chunk14.mlmodelc/coremldata.bin", byteSize: 653),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk14.mlmodelc/metadata.json")!, relativePath: "Llama-3.2-3B-Instruct_chunk14.mlmodelc/metadata.json", byteSize: 5279),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk14.mlmodelc/model.mil")!, relativePath: "Llama-3.2-3B-Instruct_chunk14.mlmodelc/model.mil", byteSize: 160189),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk14.mlmodelc/weights/weight.bin")!, relativePath: "Llama-3.2-3B-Instruct_chunk14.mlmodelc/weights/weight.bin", byteSize: 402679744),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk15.mlmodelc/analytics/coremldata.bin")!, relativePath: "Llama-3.2-3B-Instruct_chunk15.mlmodelc/analytics/coremldata.bin", byteSize: 243),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk15.mlmodelc/coremldata.bin")!, relativePath: "Llama-3.2-3B-Instruct_chunk15.mlmodelc/coremldata.bin", byteSize: 653),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk15.mlmodelc/metadata.json")!, relativePath: "Llama-3.2-3B-Instruct_chunk15.mlmodelc/metadata.json", byteSize: 5279),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk15.mlmodelc/model.mil")!, relativePath: "Llama-3.2-3B-Instruct_chunk15.mlmodelc/model.mil", byteSize: 160189),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk15.mlmodelc/weights/weight.bin")!, relativePath: "Llama-3.2-3B-Instruct_chunk15.mlmodelc/weights/weight.bin", byteSize: 402679744),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk16.mlmodelc/analytics/coremldata.bin")!, relativePath: "Llama-3.2-3B-Instruct_chunk16.mlmodelc/analytics/coremldata.bin", byteSize: 243),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk16.mlmodelc/coremldata.bin")!, relativePath: "Llama-3.2-3B-Instruct_chunk16.mlmodelc/coremldata.bin", byteSize: 501),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk16.mlmodelc/metadata.json")!, relativePath: "Llama-3.2-3B-Instruct_chunk16.mlmodelc/metadata.json", byteSize: 3882),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk16.mlmodelc/model.mil")!, relativePath: "Llama-3.2-3B-Instruct_chunk16.mlmodelc/model.mil", byteSize: 12290),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "Llama-3.2-3B-Instruct_chunk16.mlmodelc/weights/weight.bin")!, relativePath: "Llama-3.2-3B-Instruct_chunk16.mlmodelc/weights/weight.bin", byteSize: 788011840),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "cache-processor.mlmodelc/analytics/coremldata.bin")!, relativePath: "cache-processor.mlmodelc/analytics/coremldata.bin", byteSize: 243),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "cache-processor.mlmodelc/coremldata.bin")!, relativePath: "cache-processor.mlmodelc/coremldata.bin", byteSize: 516),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "cache-processor.mlmodelc/metadata.json")!, relativePath: "cache-processor.mlmodelc/metadata.json", byteSize: 3182),
+            CoreMLPackageFile(url: URL(string: llama3bBase + "cache-processor.mlmodelc/model.mil")!, relativePath: "cache-processor.mlmodelc/model.mil", byteSize: 3442)
+        ]
+
         return [
-            CatalogModel(
-                id: "openelm-270m-instruct-coreml-128-f32",
-                kind: .coreML,
-                displayName: "OpenELM 270M Instruct (ANE)",
-                publisher: "Apple (Core ML build by corenet-community)",
-                byteSize: openELMFiles.reduce(0) { $0 + $1.byteSize },
-                parameterCount: "270M",
-                quantization: "Float32",
-                license: "Apple Sample Code License",
-                attribution: "OpenELM by Apple Inc. Core ML conversion by the corenet-community project.",
-                summary: "Runs on the Apple Neural Engine instead of the CPU/GPU path the other models use. Very small and very fast, but limited to short exchanges — about 128 tokens total between your prompt and its reply, with no memory of anything beyond that window.",
-                url: openELMFiles[0].url,
-                approxRuntimeGB: 1.1,
-                minimumRAMGB: 4.0,
-                minimumDevice: "minimum iPhone 11 / SE 3rd gen or newer",
-                fileNameOverride: "OpenELM-270M-Instruct-128-float32.mlpackage",
-                coreMLFiles: openELMFiles
-            ),
             CatalogModel(
                 id: "llama-3.2-1b-instruct-coreml-ane",
                 kind: .coreML,
@@ -383,6 +447,24 @@ enum ModelCatalog {
                 minimumDevice: "minimum iPhone 12 Pro / 14 or newer",
                 fileNameOverride: "Llama-3.2-1B-Instruct-CoreML",
                 coreMLFiles: llamaFiles
+            ),
+            CatalogModel(
+                id: "llama-3.2-3b-instruct-coreml-ane",
+                kind: .coreML,
+                displayName: "Llama 3.2 3B Instruct (ANE)",
+                publisher: "Meta (Core ML build by smpanaro)",
+                byteSize: llama3bFiles.reduce(0) { $0 + $1.byteSize },
+                parameterCount: "3B",
+                quantization: "Float16",
+                license: "Llama 3.2 Community License",
+                attribution: "Built with Llama. Llama 3.2 is licensed under the Llama 3.2 Community License, Copyright © Meta Platforms, Inc. All Rights Reserved. Core ML conversion by smpanaro (coreml-llm-cli).",
+                summary: "The largest model this app can run on the Apple Neural Engine — noticeably better replies than the 1B build, same 512-token sliding context. A ~7 GB download split across 16 chunk files, and meaningfully slower per token than the 1B model even where it does fit; the conversion's own authors note it may run slowly or not at all on older or lower-RAM devices. Try the 1B model first if this one struggles.",
+                url: llama3bFiles[0].url,
+                approxRuntimeGB: 7.7,
+                minimumRAMGB: 12.0,
+                minimumDevice: "minimum iPhone 16 Pro or newer, 12GB+ RAM strongly recommended",
+                fileNameOverride: "Llama-3.2-3B-Instruct-CoreML",
+                coreMLFiles: llama3bFiles
             )
         ]
     }()
@@ -445,6 +527,16 @@ final class ModelDownloadManager: NSObject, ObservableObject {
     @Published private(set) var lastError: String?
     /// Set when a download finishes so the UI can advance without polling the filesystem.
     @Published private(set) var lastCompletedModelID: String?
+
+    /// Memoizes `isInstalled(_:)` by model ID. `catalogRow`/`downloadCatalogButton` in
+    /// `SettingsView` call `isInstalled` directly from their view bodies, and those bodies observe
+    /// `activeDownloads`, which republishes many times per second while any download is running —
+    /// without this, an unrelated in-progress download would re-run a `.coreML` model's full
+    /// manifest stat sweep (30+ `FileManager` calls) on every progress tick, for every visible row.
+    /// Invalidated at `finish(_:with:producedResumeData:)` (covers every download completion, success
+    /// or failure) and wherever a model is deleted from disk — the two events that can actually
+    /// change what this returns.
+    private var installedCache: [String: Bool] = [:]
 
     /// Catalog IDs with a partial transfer saved on disk that can be picked up where it stopped.
     ///
@@ -531,6 +623,15 @@ final class ModelDownloadManager: NSObject, ObservableObject {
 
             tasksByModelID[model.id] = downloadTask
             modelsByTaskID[downloadTask.taskIdentifier] = model
+            // `start(_:resuming:)`/`startNextCoreMLFile` are the only other places that insert
+            // into `resumedTaskIDs`, and neither runs for a task recovered here — so without this,
+            // `finish(_:with:producedResumeData:)`'s `wasResumed` always reads `false` for a
+            // reattached task, and its stale-resume-blob cleanup never runs if this task goes on
+            // to fail. Marking every reattached task as "resumed" is safe even when no resume blob
+            // actually exists for it: the cleanup this enables is a `try?`-guarded delete (a no-op
+            // if there's nothing to remove) plus clearing `resumableModelIDs`, which is the right
+            // outcome either way if the task fails.
+            resumedTaskIDs.insert(downloadTask.taskIdentifier)
 
             let received = max(0, downloadTask.countOfBytesReceived)
             let expected = downloadTask.countOfBytesExpectedToReceive
@@ -548,7 +649,7 @@ final class ModelDownloadManager: NSObject, ObservableObject {
                 var pending: [CoreMLPackageFile] = []
                 for candidate in model.coreMLFiles where candidate.relativePath != relativePath {
                     let path = installedPath.appendingPathComponent(candidate.relativePath).path
-                    let size = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int64) ?? nil
+                    let size = try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int64
                     if let size, size == candidate.byteSize {
                         completedBytes += candidate.byteSize
                     } else {
@@ -602,7 +703,9 @@ final class ModelDownloadManager: NSObject, ObservableObject {
 
     /// Chat weights, diffusion checkpoints, and Core ML packages are consumed by different
     /// engines and listed by different screens, so they have to land in different directories.
-    static func installDirectory(for kind: ModelKind) -> URL {
+    /// `nonisolated`: a pure switch over `AppFiles`'s own (also nonisolated) static directories,
+    /// touching no instance state — called from `verify(fileAt:against:)`'s off-main-actor path.
+    nonisolated static func installDirectory(for kind: ModelKind) -> URL {
         switch kind {
         case .chat: return AppFiles.models
         case .diffusion: return AppFiles.diffusionModels
@@ -611,6 +714,19 @@ final class ModelDownloadManager: NSObject, ObservableObject {
     }
 
     func isInstalled(_ model: CatalogModel) -> Bool {
+        if let cached = installedCache[model.id] { return cached }
+        let result = computeIsInstalled(model)
+        installedCache[model.id] = result
+        return result
+    }
+
+    /// Drops the cached result for one model, so the next `isInstalled` call recomputes it from
+    /// disk. Called wherever install state actually changes — see `installedCache`'s doc comment.
+    func invalidateInstalledCache(for modelID: String) {
+        installedCache.removeValue(forKey: modelID)
+    }
+
+    private func computeIsInstalled(_ model: CatalogModel) -> Bool {
         let installedPath = Self.installDirectory(for: model.kind)
             .appendingPathComponent(model.fileName)
         guard model.kind == .coreML else {
@@ -621,7 +737,7 @@ final class ModelDownloadManager: NSObject, ObservableObject {
         // `MLModel` will refuse to load.
         return model.coreMLFiles.allSatisfy { file in
             let path = installedPath.appendingPathComponent(file.relativePath).path
-            let size = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int64) ?? nil
+            let size = try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int64
             return size == file.byteSize
         }
     }
@@ -641,7 +757,17 @@ final class ModelDownloadManager: NSObject, ObservableObject {
         let remainingForOthersGB = activeDownloads.values.reduce(0.0) { partial, progress in
             partial + Double(max(0, progress.totalBytes - progress.bytesWritten)) / 1_073_741_824.0
         }
-        let requiredGB = model.sizeGB + 0.5 + remainingForOthersGB
+        // For a `.coreML` model that's resuming, bytes already verified on disk (see
+        // `coreMLDownloadState`) don't need to be fetched again — without this, a large,
+        // nearly-complete download could be refused on a storage-tight device that has ample
+        // room for what's actually left. Every other model kind resumes via saved `resumeData`
+        // rather than partial files sitting at their final path, so this only applies here.
+        // Computed once here and threaded through to `downloadCoreMLFiles` below, rather than
+        // scanning the install directory a second time immediately after — both used to call
+        // `coreMLDownloadState` independently for the same model on the same download start.
+        let coreMLState = model.kind == .coreML ? coreMLDownloadState(for: model) : nil
+        let alreadyOnDiskGB = Double(coreMLState?.completedBytes ?? 0) / 1_073_741_824.0
+        let requiredGB = max(0, model.sizeGB - alreadyOnDiskGB) + 0.5 + remainingForOthersGB
         let availableGB = AppFiles.availableDiskGB()
         guard availableGB > requiredGB else {
             lastError = activeDownloads.isEmpty
@@ -653,8 +779,8 @@ final class ModelDownloadManager: NSObject, ObservableObject {
         }
 
         AppFiles.prepare()
-        if model.kind == .coreML {
-            downloadCoreMLFiles(model)
+        if model.kind == .coreML, let coreMLState {
+            downloadCoreMLFiles(model, state: coreMLState)
         } else {
             start(model, resuming: Self.savedResumeData(forKey: model.id))
         }
@@ -671,22 +797,31 @@ final class ModelDownloadManager: NSObject, ObservableObject {
     /// mid-download — or tapping Resume after a failure — only re-fetches what's actually missing.
     /// Only a file that was *mid-transfer* when interrupted needs the saved-resume-data path,
     /// exactly like the single-file case, just keyed per file instead of per model.
-    private func downloadCoreMLFiles(_ model: CatalogModel) {
+    /// Scans `model`'s install directory for `.coreML` files already verified complete on disk —
+    /// shared by the disk-space pre-flight in `download(_:)` (so a resumed download isn't refused
+    /// for space it doesn't actually need) and `downloadCoreMLFiles` below (which does the same
+    /// scan to decide what's actually left to fetch).
+    private func coreMLDownloadState(for model: CatalogModel) -> (completedBytes: Int64, pending: [CoreMLPackageFile]) {
         let installedPath = Self.installDirectory(for: model.kind).appendingPathComponent(model.fileName)
-        AppFiles.createIfNeeded(installedPath)
-
         var completedBytes: Int64 = 0
         var pending: [CoreMLPackageFile] = []
         for file in model.coreMLFiles {
             let path = installedPath.appendingPathComponent(file.relativePath).path
-            let size = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int64) ?? nil
+            let size = try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int64
             if let size, size == file.byteSize {
                 completedBytes += file.byteSize
             } else {
                 pending.append(file)
             }
         }
+        return (completedBytes, pending)
+    }
 
+    private func downloadCoreMLFiles(_ model: CatalogModel, state: (completedBytes: Int64, pending: [CoreMLPackageFile])) {
+        let installedPath = Self.installDirectory(for: model.kind).appendingPathComponent(model.fileName)
+        AppFiles.createIfNeeded(installedPath)
+
+        let (completedBytes, pending) = state
         pendingCoreMLFiles[model.id] = pending
         completedCoreMLBytes[model.id] = completedBytes
         // Resuming either because some files already verified complete on disk, or the next file
@@ -897,7 +1032,9 @@ final class ModelDownloadManager: NSObject, ObservableObject {
     /// Confirms the bytes on disk are the model we asked for before it is ever handed to
     /// llama.cpp. A truncated or redirected download is otherwise indistinguishable from a
     /// corrupt model, and llama.cpp's failure mode for that is a crash rather than an error.
-    private func verify(fileAt url: URL, against model: CatalogModel) throws {
+    /// `nonisolated`: pure file I/O over its two parameters, touching no instance state — the
+    /// `didFinishDownloadingTo` delegate call relies on that to run this off the main actor.
+    private nonisolated func verify(fileAt url: URL, against model: CatalogModel) throws {
         let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int64) ?? 0
         guard size == model.byteSize else {
             throw NSError(domain: "ModelDownload", code: 1, userInfo: [
@@ -930,6 +1067,24 @@ final class ModelDownloadManager: NSObject, ObservableObject {
             guard let magic = try handle.read(upToCount: 4), magic == Data("GGUF".utf8) else {
                 throw corruptError
             }
+        }
+
+        // Beyond the magic-byte/JSON-parses sanity check above, run the same structural
+        // validation a manually-imported file already gets (`GGUFValidator.validate` for chat
+        // models via `SettingsView.copyModelToAppDocuments`/`OnboardingView.handleImport`;
+        // `validateDiffusionCheckpoint` for diffusion checkpoints via `SettingsView`'s diffusion
+        // importer) — a catalog entry is curated and low-risk in practice, but a byte-size match
+        // with genuinely wrong content at the same size (a bad catalog edit, or a host silently
+        // re-serving different bytes) would otherwise sail through this path when the exact same
+        // file would have been caught on the import path. Both validators are header-only and
+        // documented to cost milliseconds regardless of file size.
+        switch model.kind {
+        case .chat:
+            try GGUFValidator.validate(path: url.path)
+        case .diffusion:
+            try GGUFValidator.validateDiffusionCheckpoint(path: url.path)
+        case .coreML:
+            break
         }
     }
 }
@@ -985,15 +1140,27 @@ extension ModelDownloadManager: URLSessionDownloadDelegate {
             return
         }
 
-        Task { @MainActor in
-            guard let model = self.modelsByTaskID[taskID] else {
+        Task {
+            // Only the bookkeeping-dictionary lookup needs the main actor — everything after it
+            // (`verify`, the install-directory move) is real file I/O on what can be a
+            // multi-gigabyte file, and used to run entirely inside one `@MainActor` hop, blocking
+            // the main thread for however long that took.
+            let lookup: (model: CatalogModel, coreMLFile: CoreMLPackageFile?)? = await MainActor.run {
+                guard let model = self.modelsByTaskID[taskID] else { return nil }
+                let file = self.currentCoreMLFile[taskID]
+                if file != nil { self.currentCoreMLFile.removeValue(forKey: taskID) }
+                return (model, file)
+            }
+
+            guard let (model, coreMLFile) = lookup else {
                 try? FileManager.default.removeItem(at: temporaryCopy)
                 return
             }
 
-            if let file = self.currentCoreMLFile[taskID] {
-                self.currentCoreMLFile.removeValue(forKey: taskID)
-                self.finishCoreMLFile(file, tempFile: temporaryCopy, model: model)
+            if let coreMLFile {
+                await MainActor.run {
+                    self.finishCoreMLFile(coreMLFile, tempFile: temporaryCopy, model: model)
+                }
                 return
             }
 
@@ -1009,23 +1176,28 @@ extension ModelDownloadManager: URLSessionDownloadDelegate {
                 try FileManager.default.moveItem(at: temporaryCopy, to: destination)
                 AppFiles.excludeFromBackup(destination)
 
-                // The partial is worthless now, and the ledger entry is what lets the app tell the
-                // user *which* model vanished if this device is ever restored without it.
-                Self.deleteResumeData(forKey: model.id)
-                self.resumableModelIDs.remove(model.id)
-                ModelInventory.shared.record(
-                    fileName: model.fileName,
-                    kind: model.kind,
-                    catalogID: model.id,
-                    byteSize: model.byteSize
-                )
+                await MainActor.run {
+                    // The partial is worthless now, and the ledger entry is what lets the app
+                    // tell the user *which* model vanished if this device is ever restored
+                    // without it.
+                    Self.deleteResumeData(forKey: model.id)
+                    self.resumableModelIDs.remove(model.id)
+                    ModelInventory.shared.record(
+                        fileName: model.fileName,
+                        kind: model.kind,
+                        catalogID: model.id,
+                        byteSize: model.byteSize
+                    )
 
-                LogManager.shared.log("ModelDownload: installed \(model.fileName)")
-                self.lastCompletedModelID = model.id
-                self.finish(model, with: nil)
+                    LogManager.shared.log("ModelDownload: installed \(model.fileName)")
+                    self.lastCompletedModelID = model.id
+                    self.finish(model, with: nil)
+                }
             } catch {
                 try? FileManager.default.removeItem(at: temporaryCopy)
-                self.finish(model, with: error)
+                await MainActor.run {
+                    self.finish(model, with: error)
+                }
             }
         }
     }
@@ -1100,6 +1272,11 @@ extension ModelDownloadManager: URLSessionDownloadDelegate {
 
     @MainActor
     private func finish(_ model: CatalogModel, with error: Error?, producedResumeData: Bool = false) {
+        // Every completion path — this model's own success, another file of a multi-file coreML
+        // download finishing, or a failure — runs through here, so this is the one place that has
+        // to invalidate `installedCache` for every route that can change what's on disk for it.
+        invalidateInstalledCache(for: model.id)
+
         let bytesWritten = activeDownloads[model.id]?.bytesWritten ?? 0
         let taskID = tasksByModelID[model.id]?.taskIdentifier
         let wasResumed = taskID.map { resumedTaskIDs.contains($0) } ?? false
@@ -1135,12 +1312,23 @@ extension ModelDownloadManager: URLSessionDownloadDelegate {
                 Self.deleteResumeData(forKey: Self.coreMLFileResumeKey(model: model, file: coreMLFile))
                 resumableModelIDs.remove(model.id)
                 LogManager.shared.log("ModelDownload: saved partial for \(coreMLFile.relativePath) (\(model.displayName)) was no longer usable — it'll restart fresh next attempt")
-            } else if bytesWritten == 0 {
+            } else {
+                // Whether or not this attempt took on any new bytes before failing, the old
+                // resume blob is dead the moment the system declines to hand back fresh resume
+                // data — clearing it (and `resumableModelIDs`) always, not just when
+                // `bytesWritten == 0`, is what stops "Resume" from replaying the same dead
+                // partial forever. Only the *inline auto-restart* below stays gated on
+                // `bytesWritten == 0`: that's specifically the "nothing came in this attempt"
+                // case, where silently starting over is unambiguously the right move rather than
+                // surfacing an error for an attempt that never really got going.
                 Self.deleteResumeData(forKey: model.id)
                 resumableModelIDs.remove(model.id)
-                LogManager.shared.log("ModelDownload: saved partial for \(model.displayName) was no longer usable — restarting from the beginning")
-                start(model, resuming: nil)
-                return
+                if bytesWritten == 0 {
+                    LogManager.shared.log("ModelDownload: saved partial for \(model.displayName) was no longer usable — restarting from the beginning")
+                    start(model, resuming: nil)
+                    return
+                }
+                LogManager.shared.log("ModelDownload: saved partial for \(model.displayName) was no longer usable — this attempt will need to restart fresh next time")
             }
         }
 

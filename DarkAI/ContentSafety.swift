@@ -82,7 +82,15 @@ nonisolated enum ContentSafety {
         let compact = compacted(normalized)
         guard !normalized.isEmpty else { return .allowed }
 
+        // `minorTerms` only recognizes spaced-out ages ("13 year old") and "yo girl"/"yo boy"
+        // compounds — a bare numeric shorthand with no space and no trailing gender word
+        // ("13yo", "13 y/o", "15yrs old") matches nothing in that list, which is a real bypass
+        // of the one gate in this file that must never miss. `hasNumericMinorAgeShorthand` closes
+        // that specific hole; it's OR'd into `hasMinor` itself so it's evaluated everywhere the
+        // rest of this file already treats `hasMinor` as "a minor is being described," not bolted
+        // on as a separate, skippable check.
         let hasMinor = matchesAny(minorTerms, normalized: normalized, compact: compact, useCompact: true)
+            || hasNumericMinorAgeShorthand(text)
         let hasSexual = matchesAny(sexualTerms, normalized: normalized, compact: compact, useCompact: true)
         let hasExplicitSexual = matchesAny(explicitSexualTerms, normalized: normalized, compact: compact, useCompact: true)
 
@@ -130,13 +138,38 @@ nonisolated enum ContentSafety {
             // is a bedroom, "woman" is a portrait — so both are required before refusing, which
             // keeps ordinary portrait and fashion prompts working while catching the phrasing
             // explicit prompts actually use.
-            if matchesAny(suggestiveImageTerms, normalized: normalized, compact: compact, useCompact: false),
-               matchesAny(personTerms, normalized: normalized, compact: compact, useCompact: false) {
-                return Decision(
-                    isAllowed: false,
-                    category: .sexualContent,
-                    message: "\(AppInfo.displayName) doesn't generate sexualized images of people. Try describing the subject without the suggestive framing."
-                )
+            if matchesAny(suggestiveImageTerms, normalized: normalized, compact: compact, useCompact: false) {
+                // A numeric age shorthand ("13yo") is the person half on its own — it has no
+                // spelled-out gender word for `personTerms` to catch, but "13yo, in bed" is
+                // unambiguously a person, and pairing it with suggestive styling is child
+                // sexualization rather than merely suggestive content. Checked, and refused,
+                // before `personTerms` is even consulted.
+                if hasMinor {
+                    return Decision(
+                        isAllowed: false,
+                        category: .childSafety,
+                        message: "This request was blocked. \(AppInfo.displayName) does not process any request that sexualizes a minor, and this rule cannot be turned off."
+                    )
+                }
+                if matchesAny(personTerms, normalized: normalized, compact: compact, useCompact: false) {
+                    // "babe"/"beauty" are used as plain terms of address or compliments at least
+                    // as often as they name a sexualized subject, and "in bed"/"on the bed"/
+                    // "shower scene"/"bathtub scene" describe an ordinary photo on their own.
+                    // Pairing only these ambiguous entries on both sides ("a portrait of my babe
+                    // in bed") is exactly the mundane-prompt false positive worth narrowing —
+                    // any other person word, or any stronger suggestive term alongside either of
+                    // these two, still refuses exactly as before.
+                    let onlyAmbiguousBothSides =
+                        !matchesAny(strongPersonTerms, normalized: normalized, compact: compact, useCompact: false)
+                        && !matchesAny(strongSuggestiveImageTerms, normalized: normalized, compact: compact, useCompact: false)
+                    if !onlyAmbiguousBothSides {
+                        return Decision(
+                            isAllowed: false,
+                            category: .sexualContent,
+                            message: "\(AppInfo.displayName) doesn't generate sexualized images of people. Try describing the subject without the suggestive framing."
+                        )
+                    }
+                }
             }
             if matchesAny(goreTerms, normalized: normalized, compact: compact, useCompact: false) {
                 return Decision(
@@ -222,7 +255,12 @@ nonisolated enum ContentSafety {
         if matchesAny(childExploitationTerms, normalized: normalized, compact: compact, useCompact: true, minCompactLength: 4) {
             return .childSafety
         }
+        // Same `hasNumericMinorAgeShorthand` addition as `review` above, and for the same
+        // reason — this is the other place `minorTerms` alone is evaluated as "is a minor being
+        // described," so it needs the same numeric-shorthand coverage or a streaming response
+        // could slip the exact phrasing `review` would have caught before the first token.
         let hasMinor = matchesAny(minorTerms, normalized: normalized, compact: compact, useCompact: true)
+            || hasNumericMinorAgeShorthand(partialText)
         if hasMinor && matchesAny(explicitSexualTerms, normalized: normalized, compact: compact, useCompact: true) {
             return .childSafety
         }
@@ -314,24 +352,68 @@ nonisolated enum ContentSafety {
     /// runs on every keystroke-sized buffer during streaming, and building regexes there showed
     /// up as measurable overhead.
     private static func wordBoundaryMatch(_ term: String, in haystack: String) -> Bool {
-        guard !term.isEmpty else { return false }
-        var searchStart = haystack.startIndex
-        while searchStart < haystack.endIndex,
-              let range = haystack.range(of: term, range: searchStart..<haystack.endIndex) {
-            let beforeOK: Bool = {
-                guard range.lowerBound > haystack.startIndex else { return true }
-                let prev = haystack[haystack.index(before: range.lowerBound)]
-                return !prev.isLetter && !prev.isNumber
-            }()
-            let afterOK: Bool = {
-                guard range.upperBound < haystack.endIndex else { return true }
-                let next = haystack[range.upperBound]
-                return !next.isLetter && !next.isNumber
-            }()
-            if beforeOK && afterOK { return true }
-            searchStart = haystack.index(after: range.lowerBound)
+        sharedWordBoundaryContains(term, in: haystack)
+    }
+
+    /// Suffixes that turn a bare 1–2 digit number into an age shorthand, checked longest-first
+    /// where one is a prefix of another so a match on the shorter form doesn't pre-empt the
+    /// longer, more specific one.
+    private static let numericAgeSuffixes = ["yrs old", "yr old", "y/o", "yrs", "yr", "yo"]
+
+    /// A 1–2 digit number sitting directly against "yo"/"y/o"/"yr"/"yrs"/"yrs old" — "13yo",
+    /// "13 y/o", "15yrs old" — with no space required and, deliberately, no requirement that a
+    /// spelled-out gender word appear anywhere nearby. `minorTerms` below only has the spaced
+    /// "13 year old" form and "yo girl"/"yo boy" compounds, so this specific shorthand — the
+    /// phrasing this kind of request actually tends to use — matched nothing at all before this.
+    ///
+    /// Runs against `rawText`, not `normalize()`'s output: `normalize()`'s leetspeak pass maps
+    /// most digits to letters ("1"→"i", "3"→"e", "4"→"a", "5"→"s", "7"→"t", "8"→"b", "9"→"g", so
+    /// it can recognize "s3xy" as "sexy") and would erase the very digits this needs to see —
+    /// "13" would already have become "ie" by the time this ran. Case/diacritic/width folding
+    /// alone is enough for this check, so that's all that's applied here.
+    ///
+    /// Deliberately loose, on purpose: this also matches a stray "2 yo-yo tricks" or "5 yoyos for
+    /// sale", which have nothing to do with age. That is an accepted trade, not an oversight — see
+    /// this file's header ("tuned to favour false positives on child-safety terms and false
+    /// negatives everywhere else") — and the practical cost is close to zero regardless, since
+    /// every call site pairs this with an actual sexual signal elsewhere in the same text before
+    /// it can refuse anything; a coincidental "yo" hit next to nothing else sexual never blocks.
+    private static func hasNumericMinorAgeShorthand(_ rawText: String) -> Bool {
+        let folded = rawText.folding(options: [.diacriticInsensitive, .widthInsensitive, .caseInsensitive],
+                                     locale: Locale(identifier: "en_US_POSIX"))
+        let chars = Array(folded)
+        var i = 0
+        while i < chars.count {
+            guard chars[i].isNumber else { i += 1; continue }
+            var digitsEnd = i
+            while digitsEnd < chars.count, chars[digitsEnd].isNumber { digitsEnd += 1 }
+            // Only 1–2 digit ages ("13yo") — a longer run ("2013yo") reads as a year or other
+            // unrelated number, not a plausible age shorthand.
+            if digitsEnd - i <= 2 {
+                var suffixStart = digitsEnd
+                while suffixStart < chars.count, chars[suffixStart] == " " { suffixStart += 1 }
+                for suffix in numericAgeSuffixes
+                where matchesSuffix(chars, at: suffixStart, suffix) { return true }
+            }
+            i = digitsEnd
         }
         return false
+    }
+
+    /// Whether `suffix` occurs in `chars` starting exactly at `index`, with a word boundary right
+    /// after it — so "16yo" matches but "16yodel" does not.
+    private static func matchesSuffix(_ chars: [Character], at index: Int, _ suffix: String) -> Bool {
+        let suffixChars = Array(suffix)
+        guard index + suffixChars.count <= chars.count else { return false }
+        for offset in 0..<suffixChars.count where chars[index + offset] != suffixChars[offset] {
+            return false
+        }
+        let afterIndex = index + suffixChars.count
+        if afterIndex < chars.count {
+            let next = chars[afterIndex]
+            if next.isLetter || next.isNumber { return false }
+        }
+        return true
     }
 
     // MARK: - Term lists
@@ -354,7 +436,7 @@ nonisolated enum ContentSafety {
 
     private static let sexualTerms = [
         "sex", "sexy", "sexual", "sexually", "seduce", "seductive", "erotic", "erotica",
-        "aroused", "arousal", "fetish", "lewd", "provocative", "suggestive", "intimate",
+        "aroused", "arousal", "fetish", "lewd", "provocative", "suggestive",
         "lingerie", "bikini", "undressed", "undressing", "stripping", "strip tease"
     ]
 
@@ -362,8 +444,8 @@ nonisolated enum ContentSafety {
         "porn", "porno", "pornographic", "pornography", "hardcore", "xxx", "nsfw",
         "explicit sex", "sex act", "sex acts", "sexual act", "intercourse", "penetration",
         "masturbate", "masturbation", "orgasm", "climax sexually", "genitals", "genitalia",
-        "aroused nude", "hentai", "rule 34", "smut", "cum", "orgy", "blowjob", "handjob",
-        "anal sex", "oral sex", "bdsm", "bondage sexual"
+        "aroused nude", "hentai", "rule 34", "smut", "cumshot", "cum shot", "cumming",
+        "orgy", "blowjob", "handjob", "anal sex", "oral sex", "bdsm", "bondage sexual"
     ]
 
     private static let nudityTerms = [
@@ -402,6 +484,23 @@ nonisolated enum ContentSafety {
         "waifu", "character", "portrait", "selfie", "goddess", "nymph", "maiden",
         "babe", "beauty", "bombshell", "seductress"
     ]
+
+    /// The subset of `personTerms` used as a plain term of address or compliment at least as
+    /// often as it actually names a sexualized subject in an image prompt. See the
+    /// suggestive+person gate in `review` — pairing one of these with nothing stronger than an
+    /// `ambiguousSceneTerms` entry is the specific mundane-prompt false positive that gate exists
+    /// to avoid, without weakening it for any other combination.
+    private static let ambiguousPersonTerms: Set<String> = ["babe", "beauty"]
+
+    /// The subset of `suggestiveImageTerms` that describes an ordinary scene with no suggestive
+    /// content of its own — "in bed" is a bedroom photo, "shower scene" is someone showering.
+    /// Paired with an unambiguous `personTerms` word ("woman in bed") this is still the classic
+    /// explicit-prompt phrasing the gate exists to catch; paired only with an
+    /// `ambiguousPersonTerms` casual noun, it isn't enough on its own. See `review`.
+    private static let ambiguousSceneTerms: Set<String> = ["in bed", "on the bed", "shower scene", "bathtub scene"]
+
+    private static let strongPersonTerms = personTerms.filter { !ambiguousPersonTerms.contains($0) }
+    private static let strongSuggestiveImageTerms = suggestiveImageTerms.filter { !ambiguousSceneTerms.contains($0) }
 
     /// Terms whose presence alone is disqualifying — no second signal required.
     private static let childExploitationTerms = [

@@ -187,6 +187,11 @@ class PersonalityManager: ObservableObject {
     private let legacyProfilesKey = "DarkAI_ModelPersonalities"
     private let legacyMetricsKey = "DarkAI_StyleMetrics"
     private var messageBatch: [String] = []
+    /// Guards the background style-analysis `Task` below from overlapping itself — without it,
+    /// two batches landing close together could both fire a `generateBackgroundAnalysis` call at
+    /// once, competing with each other and with the user's own foreground generation for the same
+    /// model instance.
+    private var isAnalyzingStyleInBackground = false
 
     @Published private(set) var styleMetrics = StyleMetrics()
 
@@ -229,8 +234,12 @@ class PersonalityManager: ObservableObject {
     }
 
     private func saveMetrics() {
-        guard let encoded = try? JSONEncoder().encode(styleMetrics) else { return }
-        UserDefaults.standard.set(encoded, forKey: metricsKey)
+        do {
+            let encoded = try JSONEncoder().encode(styleMetrics)
+            UserDefaults.standard.set(encoded, forKey: metricsKey)
+        } catch {
+            LogManager.shared.log("PersonalityManager: failed to encode style metrics for save — \(error.localizedDescription)")
+        }
     }
 
     private func loadPersonalities() {
@@ -319,6 +328,25 @@ class PersonalityManager: ObservableObject {
         """
     }
     
+    /// Commits `newProfile` as the personality profile: caps it to the first line plus the most
+    /// recent 99 lines (the growth limit every call site below enforces identically), assigns
+    /// it, bumps `maturityScore`, updates `isMature`, and persists both. The "truncate, bump
+    /// maturity, save" sequence that was duplicated at every place something gets added to the
+    /// profile — `analyzeUserMessage`'s aggressive-trigger pass, its background style-analysis
+    /// closure, and `analyzeAssistantMessage` — leaving only how each site builds the *new*
+    /// profile text (which differs enough between them to stay separate) at the call site.
+    private func commitProfile(_ newProfile: String, maturityBump: Double) {
+        var capped = newProfile
+        let lines = capped.components(separatedBy: "\n")
+        if lines.count > 100 {
+            capped = ([lines[0]] + lines.suffix(99)).joined(separator: "\n")
+        }
+        personality = capped
+        maturityScore = min(1.0, maturityScore + maturityBump)
+        isMature = maturityScore >= 0.7
+        savePersonalities()
+    }
+
     func analyzeUserMessage(_ message: String, llmManager: LLMManager?) {
 
         // 1. Style measurement (every message, no keyword required).
@@ -351,9 +379,21 @@ class PersonalityManager: ObservableObject {
 
             for trigger in aggressiveTriggers {
                 if lowerSentence.hasPrefix(trigger) && cleanSentence.count > trigger.count + 2 {
-                    let fact = "The user stated: '\(cleanSentence)'."
-                    if !currentProfile.contains(fact) {
-                        newTraits.append("Remember: \(fact)")
+                    // Same screening every other user-content path in the app applies before text
+                    // becomes part of what a model sees — this path is different only in that the
+                    // sentence is stored once and then re-injected into every future system prompt,
+                    // indefinitely, rather than sent through a single time.
+                    if ContentSafety.review(cleanSentence, surface: .chatPrompt).isAllowed {
+                        let fact = "The user stated: '\(cleanSentence)'."
+                        let line = "Remember: \(fact)"
+                        // Checked against both the pre-message profile AND whatever this same
+                        // pass already staged — a repeated/copy-pasted sentence within one
+                        // message would otherwise pass the `currentProfile`-only check twice and
+                        // add the identical line to `newTraits` twice, wasting the 100-line cap
+                        // and double-counting the maturity bump below.
+                        if !currentProfile.contains(fact) && !newTraits.contains(line) {
+                            newTraits.append(line)
+                        }
                     }
                     break
                 }
@@ -366,30 +406,24 @@ class PersonalityManager: ObservableObject {
             } else {
                 currentProfile += "\n" + newTraits.joined(separator: "\n")
             }
-
-            // Cap growth the same way `analyzeAssistantMessage` and the style-analysis pass below
-            // both already do.
-            let lines = currentProfile.components(separatedBy: "\n")
-            if lines.count > 100 {
-                currentProfile = ([lines[0]] + lines.suffix(99)).joined(separator: "\n")
-            }
-            personality = currentProfile
-
-            maturityScore = min(1.0, maturityScore + (Double(newTraits.count) * 0.08))
-            isMature = maturityScore >= 0.7
-
-            savePersonalities()
+            commitProfile(currentProfile, maturityBump: Double(newTraits.count) * 0.08)
         }
-        
+
         // 2. Batching & background style analysis.
         messageBatch.append(message)
-        
-        if messageBatch.count >= 2 {
+
+        // Every 5 messages rather than every 2 — this triggers a background LLM generation call
+        // (`generateBackgroundAnalysis`) on the same model instance the foreground chat is using,
+        // and firing it more than twice as often as necessary competed with the user's own
+        // in-flight generation for no proportional benefit: the style profile it produces only
+        // meaningfully changes over many more messages than that.
+        if messageBatch.count >= 5 {
             let batchedText = messageBatch.joined(separator: "\n\n")
             messageBatch.removeAll() // Always clear batch to prevent unbounded growth
-            
-            guard let llm = llmManager else { return }
-            
+
+            guard let llm = llmManager, !isAnalyzingStyleInBackground else { return }
+            isAnalyzingStyleInBackground = true
+
             Task {
                 let analysisPrompt = """
                 Analyze the following user messages strictly for their communication style. Look specifically for:
@@ -425,21 +459,12 @@ class PersonalityManager: ObservableObject {
                         var updatedProfile = self.personality
                         if !analysis.isEmpty && !updatedProfile.contains(analysis) {
                             updatedProfile += "\n\n[STYLE ANALYSIS]\n" + analysis
-                            
-                            // Limit size to prevent unbounded growth
-                            let lines = updatedProfile.components(separatedBy: "\n")
-                            if lines.count > 100 {
-                                updatedProfile = ([lines[0]] + lines.suffix(99)).joined(separator: "\n")
-                            }
-                            
-                            self.personality = updatedProfile
-                            
-                            self.maturityScore = min(1.0, self.maturityScore + 0.15)
-                            self.isMature = self.maturityScore >= 0.7
-                            
-                            self.savePersonalities()
+                            self.commitProfile(updatedProfile, maturityBump: 0.15)
                         }
+                        self.isAnalyzingStyleInBackground = false
                     }
+                } else {
+                    await MainActor.run { self.isAnalyzingStyleInBackground = false }
                 }
             }
         }
@@ -458,7 +483,10 @@ class PersonalityManager: ObservableObject {
         var newTraits: [String] = []
 
         func addFact(_ fact: String) {
-            guard !fact.isEmpty, fact.count < 140, !currentProfile.contains(fact) else { return }
+            // Checked against `newTraits` too, not just `currentProfile` — see the identical fix
+            // in `analyzeUserMessage` for why a duplicate/repeated sentence within one message
+            // could otherwise add the same line twice in a single pass.
+            guard !fact.isEmpty, fact.count < 140, !currentProfile.contains(fact), !newTraits.contains(fact) else { return }
             newTraits.append(fact)
         }
 
@@ -485,10 +513,10 @@ class PersonalityManager: ObservableObject {
             let lowerSentence = cleanSentence.lowercased()
 
             for (prefix, format) in likeTriggers + dislikeTriggers {
-                guard lowerSentence.hasPrefix(prefix), cleanSentence.count > prefix.count + 2 else { continue }
-                let value = String(cleanSentence.dropFirst(prefix.count))
-                    .trimmingCharacters(in: CharacterSet(charactersIn: " .!?,;"))
-                guard !value.isEmpty, value.count < 100 else { continue }
+                // Same "prefix matched, extract and trim what's left" step `MemoryManager.match`
+                // uses for the user's own facts — see `remainderAfterPrefix`'s doc comment for
+                // why only this inner step, not the whole surrounding extraction, is shared.
+                guard let value = MemoryManager.remainderAfterPrefix(lowerSentence, cleanSentence, prefix: prefix, maxLength: 100) else { continue }
                 addFact(format(value))
                 break
             }
@@ -514,17 +542,6 @@ class PersonalityManager: ObservableObject {
         } else {
             currentProfile += "\n" + newTraits.joined(separator: "\n")
         }
-
-        // Cap growth the same way the background style-analysis pass does.
-        let lines = currentProfile.components(separatedBy: "\n")
-        if lines.count > 100 {
-            currentProfile = ([lines[0]] + lines.suffix(99)).joined(separator: "\n")
-        }
-        personality = currentProfile
-
-        maturityScore = min(1.0, maturityScore + (Double(newTraits.count) * 0.08))
-        isMature = maturityScore >= 0.7
-
-        savePersonalities()
+        commitProfile(currentProfile, maturityBump: Double(newTraits.count) * 0.08)
     }
 }

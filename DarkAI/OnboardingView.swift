@@ -27,6 +27,10 @@ struct OnboardingView: View {
     @State private var confirmedAge = false
     @State private var showModelImporter = false
     @State private var installedAModel = false
+    /// Status line for the "import a .gguf I already have" path — `nil` when idle, an in-progress
+    /// message while `handleImport` runs off the main actor, or an error left visible on failure.
+    @State private var importStatus: String? = nil
+    @State private var isImportingModel = false
 
     /// Skips straight to the agreement page when the only reason we're here is a policy update —
     /// re-running the whole introduction for an existing user would be noise.
@@ -74,6 +78,16 @@ struct OnboardingView: View {
             // should be ready when they reach the chat, not gated behind a prompt.
             if let model = ModelCatalog.all.first(where: { $0.id == id }), model.kind == .chat {
                 OnboardingHandoff.requestAutoLoad(fileName: model.fileName)
+            }
+        }
+        .onChange(of: page) { _, newValue in
+            // The primary "Continue" button already gates page 2 → 3 behind `canAdvance`, but a
+            // `.page`-style `TabView` lets an ordinary swipe land on page 3 directly, bypassing
+            // the age/policy consent gate this screen exists to enforce (Guideline 1.2) — exactly
+            // the kind of interaction App Store review performs when skimming onboarding. Snap
+            // back rather than let an unattended swipe substitute for a real agreement.
+            if newValue == 3, !(confirmedAge && agreedToPolicies) {
+                page = 2
             }
         }
         .onAppear {
@@ -189,13 +203,22 @@ struct OnboardingView: View {
                     .toggleStyle(SwitchToggleStyle(tint: Theme.accent))
 
                     Button {
+                        importStatus = nil
                         showModelImporter = true
                     } label: {
                         Text("Or import a .gguf file I already have")
                             .font(.system(size: 13, weight: .semibold))
                             .foregroundColor(Theme.accentCyan)
                     }
+                    .disabled(isImportingModel)
                     .padding(.top, 4)
+
+                    if let importStatus {
+                        Text(importStatus)
+                            .font(.system(size: 12))
+                            .foregroundColor(Theme.textSecondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
                 }
             }
         }
@@ -399,6 +422,10 @@ struct OnboardingView: View {
     }
 
     private func complete() {
+        // Defense in depth alongside the `onChange(of: page)` swipe guard above: this is the
+        // one gate that actually flips `onboardingCompleted`, so it shouldn't trust that every
+        // path leading here already enforced consent.
+        guard confirmedAge, agreedToPolicies else { return }
         acceptedPolicyVersion = AppInfo.policyVersion
         ageConfirmed = confirmedAge
         onboardingCompleted = true
@@ -408,27 +435,54 @@ struct OnboardingView: View {
         guard let source = try? result.get().first else { return }
         guard source.pathExtension.lowercased() == "gguf" else { return }
         guard source.startAccessingSecurityScopedResource() else { return }
-        defer { source.stopAccessingSecurityScopedResource() }
 
         AppFiles.prepare()
         let destination = AppFiles.models.appendingPathComponent(source.lastPathComponent)
-        do {
-            if FileManager.default.fileExists(atPath: destination.path) {
-                try FileManager.default.removeItem(at: destination)
+
+        isImportingModel = true
+        importStatus = "Checking file…"
+
+        // Backgrounded and validated the same way `SettingsView.copyModelToAppDocuments` is —
+        // this path never got either fix: a multi-GB copy run synchronously on the main thread
+        // (during onboarding specifically, the one screen whose own doc comment says its job is
+        // to avoid looking like a broken app) freezes the UI for the whole copy, and skipping
+        // `GGUFValidator.validate` let a mislabeled/corrupt file install successfully and only
+        // fail later, less diagnostically, inside `LlamaRunner`.
+        Task.detached(priority: .background) {
+            defer { source.stopAccessingSecurityScopedResource() }
+            do {
+                try GGUFValidator.validate(path: source.path)
+
+                await MainActor.run { importStatus = "Copying (keep the app open)…" }
+
+                if FileManager.default.fileExists(atPath: destination.path) {
+                    try FileManager.default.removeItem(at: destination)
+                }
+                try FileManager.default.copyItem(at: source, to: destination)
+                AppFiles.excludeFromBackup(destination)
+
+                await MainActor.run {
+                    ModelInventory.shared.record(
+                        fileName: destination.lastPathComponent,
+                        kind: .chat,
+                        catalogID: ModelCatalog.model(withFileName: destination.lastPathComponent)?.id,
+                        byteSize: (try? destination.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init) ?? 0
+                    )
+                    installedAModel = true
+                    isImportingModel = false
+                    importStatus = nil
+                    OnboardingHandoff.requestAutoLoad(fileName: destination.lastPathComponent)
+                    LogManager.shared.log("Onboarding: imported \(destination.lastPathComponent), queued for auto-load")
+                }
+            } catch {
+                await MainActor.run {
+                    isImportingModel = false
+                    // Left visible rather than cleared, so the failure doesn't vanish before the
+                    // user can read it — mirrors `copyModelToAppDocuments`.
+                    importStatus = "Import failed: \(error.localizedDescription)"
+                }
+                LogManager.shared.log("Onboarding: import failed — \(error.localizedDescription)")
             }
-            try FileManager.default.copyItem(at: source, to: destination)
-            AppFiles.excludeFromBackup(destination)
-            ModelInventory.shared.record(
-                fileName: destination.lastPathComponent,
-                kind: .chat,
-                catalogID: ModelCatalog.model(withFileName: destination.lastPathComponent)?.id,
-                byteSize: (try? destination.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init) ?? 0
-            )
-            installedAModel = true
-            OnboardingHandoff.requestAutoLoad(fileName: destination.lastPathComponent)
-            LogManager.shared.log("Onboarding: imported \(destination.lastPathComponent), queued for auto-load")
-        } catch {
-            LogManager.shared.log("Onboarding: import failed — \(error.localizedDescription)")
         }
     }
 }

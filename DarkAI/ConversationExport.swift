@@ -148,6 +148,22 @@ nonisolated enum ConversationExport {
 
     // MARK: - Renderers
 
+    /// The message body to render for a text-format export: the user's own text verbatim, or the
+    /// assistant's text run through `sanitize` — trimmed either way. Shared between `markdown`
+    /// and `plainText` below, which computed this identically; only how each wraps it (heading
+    /// style, image-message framing) differs, so only this inner step is shared.
+    private static func resolvedBody(for message: ChatMessage, sanitize: (String) -> String) -> String {
+        let body = message.isUser ? message.text : sanitize(message.text)
+        return body.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// The prompt text to show in place of an image's pixels in a text export — the message's
+    /// own text if it recorded one, or a placeholder if not. Shared for the same reason as
+    /// `resolvedBody` above.
+    private static func resolvedPrompt(for message: ChatMessage) -> String {
+        message.text.isEmpty ? "(no prompt recorded)" : message.text
+    }
+
     private static func markdown(for conversation: Conversation, sanitize: (String) -> String) -> String {
         var out = "# \(conversation.title)\n\n"
         out += "*Exported from \(AppInfo.displayName) \(AppInfo.version) on \(readableDate.string(from: Date()))*\n\n"
@@ -166,12 +182,10 @@ nonisolated enum ConversationExport {
             out += "### \(speaker) — \(readableDate.string(from: message.timestamp))\n\n"
 
             if message.isImageMessage {
-                let prompt = message.text.isEmpty ? "(no prompt recorded)" : message.text
                 out += "*[Generated image — not included in this format. Export as JSON to keep the image data.]*\n\n"
-                out += "Prompt: \(prompt)\n\n"
+                out += "Prompt: \(resolvedPrompt(for: message))\n\n"
             } else {
-                let body = message.isUser ? message.text : sanitize(message.text)
-                out += body.trimmingCharacters(in: .whitespacesAndNewlines) + "\n\n"
+                out += resolvedBody(for: message, sanitize: sanitize) + "\n\n"
             }
         }
         return out
@@ -187,11 +201,9 @@ nonisolated enum ConversationExport {
             let speaker = message.isUser ? "YOU" : AppInfo.displayName.uppercased()
             out += "[\(readableDate.string(from: message.timestamp))] \(speaker):\n"
             if message.isImageMessage {
-                let prompt = message.text.isEmpty ? "(no prompt recorded)" : message.text
-                out += "(generated image — prompt: \(prompt))\n\n"
+                out += "(generated image — prompt: \(resolvedPrompt(for: message)))\n\n"
             } else {
-                let body = message.isUser ? message.text : sanitize(message.text)
-                out += body.trimmingCharacters(in: .whitespacesAndNewlines) + "\n\n"
+                out += resolvedBody(for: message, sanitize: sanitize) + "\n\n"
             }
         }
         return out
@@ -274,17 +286,19 @@ nonisolated enum ConversationExport {
 
     // MARK: - Files
 
-    /// Exports land in their own subdirectory of `tmp/`, wiped on every export.
+    /// Exports land in their own uniquely-named subdirectory of `tmp/`, one per call.
     ///
     /// `tmp/` is not backed up and iOS reclaims it under storage pressure, which is the right home
-    /// for a file whose only job is to survive long enough to reach the share sheet. Wiping first
-    /// matters more than it looks: without it, a transcript the user exported once stays readable
-    /// in the container until iOS decides otherwise, which is not what "this app keeps nothing"
-    /// should mean.
+    /// for a file whose only job is to survive long enough to reach the share sheet. This used to
+    /// be a single shared `Exports/` directory wiped at the top of every call — right up until a
+    /// second export prepared while an earlier one's `ShareLink` was still reading its file could
+    /// delete that file out from under the share sheet. A fresh UUID subdirectory per call can't
+    /// collide with an in-flight one; small text/JSON transcripts left behind afterward are cleaned
+    /// up by iOS's own `tmp/` reclamation, the same backstop this directory already relied on.
     private static func exportDirectory() -> URL {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("Exports", isDirectory: true)
-        try? FileManager.default.removeItem(at: directory)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         return directory
     }
@@ -335,6 +349,11 @@ struct ConversationExportSheet: View {
     @State private var includeImages = true
     @State private var preparedFile: URL?
     @State private var failure: String?
+    @State private var isPreparing = false
+    /// Bumped every time the in-flight prepare's inputs change, so a background prepare that's
+    /// still running when the user switches format/`includeImages` can tell its own result is
+    /// stale once it finishes and skip applying it, rather than overwriting the newer selection.
+    @State private var prepareGeneration = 0
     /// Cached result of `ConversationExport.estimatedByteCount`, recomputed only when `format`/
     /// `includeImages` actually change (see the `onChange` handlers below) rather than read as a
     /// computed property from `header`'s body. For a conversation with several generated images,
@@ -409,9 +428,21 @@ struct ConversationExportSheet: View {
                 }
             }
         }
-        .onChange(of: format) { _, _ in preparedFile = nil; failure = nil; recomputeSizeDescription() }
-        .onChange(of: includeImages) { _, _ in preparedFile = nil; failure = nil; recomputeSizeDescription() }
+        .onChange(of: format) { _, _ in invalidatePreparedFile() }
+        .onChange(of: includeImages) { _, _ in invalidatePreparedFile() }
         .onAppear { recomputeSizeDescription() }
+    }
+
+    /// Clears whatever `prepare()` has produced (or is producing) and recomputes the size
+    /// estimate for the newly-selected options. Bumping `prepareGeneration` is what keeps a
+    /// still-running background prepare from a moment ago from applying its result after the
+    /// user has already moved on to a different format.
+    private func invalidatePreparedFile() {
+        prepareGeneration += 1
+        preparedFile = nil
+        failure = nil
+        isPreparing = false
+        recomputeSizeDescription()
     }
 
     private func recomputeSizeDescription() {
@@ -476,6 +507,17 @@ struct ConversationExportSheet: View {
             ShareLink(item: preparedFile) {
                 actionLabel("Share \(preparedFile.lastPathComponent)", icon: "square.and.arrow.up")
             }
+        } else if isPreparing {
+            HStack(spacing: 8) {
+                ProgressView()
+                    .tint(Theme.onAccent)
+                Text("Preparing \(format.displayName) File…")
+                    .font(.system(size: 15, weight: .bold))
+                    .foregroundColor(Theme.onAccent)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 14)
+            .background(RoundedRectangle(cornerRadius: 14).fill(Theme.accent.opacity(0.6)))
         } else {
             Button {
                 prepare()
@@ -499,19 +541,50 @@ struct ConversationExportSheet: View {
         .background(RoundedRectangle(cornerRadius: 14).fill(Theme.accent))
     }
 
+    /// Builds the export file on a background task rather than inline in the button action.
+    /// `ConversationExport.makeFile` base64-encodes every embedded generated image
+    /// (`resolvedImageData`) synchronously, which for a conversation with several images is real,
+    /// blocking work — exactly what `ConversationExport`'s own `nonisolated` marking exists to
+    /// let run off the main actor, which this call site wasn't previously taking advantage of.
+    /// `Task.detached` is required rather than a plain `Task { }` to actually get off the main
+    /// actor for a synchronous call — see `DocumentProcessor.extractText`'s doc comment for the
+    /// same point made at more length.
     private func prepare() {
+        guard !isPreparing else { return }
         failure = nil
-        do {
-            preparedFile = try ConversationExport.makeFile(
-                for: conversation,
-                format: format,
-                includeImages: includeImages,
-                sanitize: sanitize
-            )
-        } catch {
-            preparedFile = nil
-            failure = error.localizedDescription
-            LogManager.shared.log("Export failed: \(error.localizedDescription)")
+        isPreparing = true
+
+        let generation = prepareGeneration
+        let conversation = self.conversation
+        let format = self.format
+        let includeImages = self.includeImages
+        let sanitize = self.sanitize
+
+        Task.detached(priority: .userInitiated) {
+            do {
+                let url = try ConversationExport.makeFile(
+                    for: conversation,
+                    format: format,
+                    includeImages: includeImages,
+                    sanitize: sanitize
+                )
+                await MainActor.run {
+                    // The user may have changed format/includeImages while this was running —
+                    // `invalidatePreparedFile` bumped `prepareGeneration` when that happened, so a
+                    // stale result here is discarded instead of overwriting the newer selection.
+                    guard generation == self.prepareGeneration else { return }
+                    self.preparedFile = url
+                    self.isPreparing = false
+                }
+            } catch {
+                LogManager.shared.log("Export failed: \(error.localizedDescription)")
+                await MainActor.run {
+                    guard generation == self.prepareGeneration else { return }
+                    self.preparedFile = nil
+                    self.failure = error.localizedDescription
+                    self.isPreparing = false
+                }
+            }
         }
     }
 }

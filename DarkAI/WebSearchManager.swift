@@ -85,7 +85,14 @@ final class WebSearchManager: ObservableObject {
             // No place in the message means there's nothing to look up — a general search for
             // the bare word "weather" returns nothing useful from any provider. Ask instead.
             guard let place, !place.isEmpty else { throw WebSearchError.needsLocation }
-            result = try await openMeteo.search(query: place)
+            // Routed through the same bound as every other provider call below — `resolveLocation`
+            // can issue several sequential geocoding requests before the forecast call itself, so
+            // without this a weather lookup could hang well past the ~9s ceiling the rest of this
+            // file is built around.
+            let provider = openMeteo
+            result = try await Self.withTimeout(seconds: Self.providerTimeoutSeconds) {
+                try await provider.search(query: place)
+            }
         } else {
             result = try await generalSearch(queryText)
         }
@@ -123,15 +130,66 @@ final class WebSearchManager: ObservableObject {
         providers.append(duckDuckGo)
         providers.append(wikipedia)
 
-        var lastError: Error = WebSearchProviderError.noResults
-        for provider in providers {
-            do {
-                return try await provider.search(query: query)
-            } catch {
-                LogManager.shared.log("WebSearch: \(type(of: provider)) returned nothing — \(error.localizedDescription)")
-                lastError = error
+        // Snapshotted into a `let` before capture: `providers` above is a `var`, and Swift 6's
+        // strict concurrency checking rejects capturing a mutable local into the `@Sendable`
+        // closure `withTimeout` takes, even though nothing here mutates it after this point.
+        let providersSnapshot = providers
+
+        // Aggregate cap across every provider tried below, independent of each individual
+        // `providerTimeoutSeconds` bound — without this, up to four providers timing out in
+        // sequence could chain into a ~36s wait before the fastest, keyless provider (often the
+        // one that actually answers, since it's tried last) ever gets a turn.
+        return try await Self.withTimeout(seconds: Self.aggregateSearchTimeoutSeconds) {
+            var lastError: Error = WebSearchProviderError.noResults
+            for provider in providersSnapshot {
+                do {
+                    return try await Self.withTimeout(seconds: Self.providerTimeoutSeconds) {
+                        try await provider.search(query: query)
+                    }
+                } catch {
+                    LogManager.shared.log("WebSearch: \(type(of: provider)) returned nothing — \(error.localizedDescription)")
+                    lastError = error
+                }
             }
+            throw lastError
         }
-        throw lastError
+    }
+
+    /// Bounds a single provider's request. Up to four providers (`generalSearch` above) are tried
+    /// serially per search, and without an explicit bound here, a single slow or hanging request
+    /// would fall back on whatever `URLSession`'s own default timeout is — on the order of a
+    /// minute — meaning a search that should take the user roughly this long could instead take
+    /// four times that before the last, fastest, keyless provider ever gets a chance to answer.
+    private static let providerTimeoutSeconds: Double = 9
+
+    /// Ceiling on the whole `generalSearch` chain, tighter than the theoretical worst case of
+    /// four providers each burning their full `providerTimeoutSeconds` in sequence (~36s). Wide
+    /// enough to let two providers genuinely time out and still leave room for a third to answer,
+    /// which covers the common case (Brave or the news feed stalls, a keyless fallback answers).
+    private static let aggregateSearchTimeoutSeconds: Double = 20
+
+    /// Races `operation` against a `seconds`-long timer and returns whichever finishes first,
+    /// throwing `WebSearchProviderError.timedOut` if the timer wins. The loser is left to the
+    /// task group's own structured-concurrency cleanup, which cancels every child task still
+    /// running when this function returns — for a provider's `URLSession` call, that cancellation
+    /// propagates down to the underlying request.
+    ///
+    /// `static`, not an instance method: it touches no instance state, and being callable without
+    /// capturing `self` is what lets `generalSearch` nest one `withTimeout` call (the aggregate
+    /// cap) around another (the per-provider cap) without either capturing the `@MainActor`
+    /// `WebSearchManager` instance into a `@Sendable` closure.
+    private static func withTimeout<T: Sendable>(seconds: Double, operation: @escaping @Sendable () async throws -> T) async throws -> T {
+        try await withThrowingTaskGroup(of: T.self) { group in
+            group.addTask { try await operation() }
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+                throw WebSearchProviderError.timedOut
+            }
+            guard let result = try await group.next() else {
+                throw WebSearchProviderError.timedOut
+            }
+            group.cancelAll()
+            return result
+        }
     }
 }

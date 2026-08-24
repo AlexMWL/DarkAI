@@ -262,7 +262,14 @@ nonisolated enum StructuredImport {
         for section in objects {
             guard let nested = containerKeys.lazy
                 .compactMap({ matchingValue(in: section, forKey: $0) as? [Any] })
-                .first else { return nil }
+                .first else {
+                // This one section doesn't look like a section wrapper — skip just it rather than
+                // discarding everything successfully flattened from every *other* section in this
+                // file. Only when nothing in the whole file matched the section-wrapper shape
+                // (`flattened` stays empty below) does the caller fall back to treating `objects`
+                // itself as raw entries.
+                continue
+            }
             let sectionTitle = value(in: section, forAnyOf: titleKeys)
             for case let entry as [String: Any] in nested {
                 var carried = entry

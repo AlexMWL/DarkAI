@@ -104,6 +104,18 @@ struct WebSearchClassifier {
         return questionStarters.contains { lower.hasPrefix($0) }
     }
 
+    /// Whether `trigger` occurs in `lower` starting at a word boundary — not merely as a
+    /// substring. `lower.contains(trigger)` alone matches "search for " inside "research for
+    /// ideas", "search online" inside "research online", or "google " inside "i use google
+    /// docs": all real trigger phrases sitting mid-word or mid-phrase in text that was never
+    /// asking to search anything. Requiring the character immediately before the match (if any)
+    /// not be a letter or number is enough to rule those out while still matching at the very
+    /// start of the message and after ordinary punctuation or whitespace. Mirrors
+    /// `ContentSafety.wordBoundaryMatch`, which exists for the same reason.
+    private static func containsAsWord(_ trigger: String, in lower: String) -> Bool {
+        sharedWordBoundaryContains(trigger, in: lower)
+    }
+
     // MARK: Classification
 
     static func classify(_ input: String) -> WebSearchQueryType? {
@@ -112,12 +124,15 @@ struct WebSearchClassifier {
         let lower = trimmed.lowercased()
 
         // 1. Explicit request — always wins, no exclusion check and no question-shape check:
-        // asking outright to search is unambiguous regardless of how it's phrased.
-        for trigger in strongTriggersWithCleanStrip where lower.contains(trigger) {
+        // asking outright to search is unambiguous regardless of how it's phrased. Anchored to
+        // word boundaries (see `containsAsWord`) so this "always wins" tier can't fire on a
+        // trigger phrase that's actually a substring of an unrelated word — "search for " inside
+        // "research for the report", "google " inside "i use google docs".
+        for trigger in strongTriggersWithCleanStrip where containsAsWord(trigger, in: lower) {
             let stripped = strip(trigger, from: trimmed)
             return .general(query: stripped.isEmpty ? trimmed : stripped)
         }
-        for trigger in strongTriggersUseFullText where lower.contains(trigger) {
+        for trigger in strongTriggersUseFullText where containsAsWord(trigger, in: lower) {
             return .general(query: trimmed)
         }
 
@@ -129,8 +144,11 @@ struct WebSearchClassifier {
         guard looksLikeQuestionOrRequest(lower) else { return nil }
 
         // 2. Weather — checked before the exclusion list fires on "how hot is it" style phrasing
-        // that would otherwise look like an excluded "how" question.
-        for trigger in weatherTriggers where lower.contains(trigger) {
+        // that would otherwise look like an excluded "how" question. Word-boundary, not a bare
+        // `.contains`: "forecast" alone matched inside "what's the sales forecast for next
+        // quarter" (which already passed the question-shape check above), routing an unrelated
+        // question to a place-name lookup that was never going to find one.
+        for trigger in weatherTriggers where containsAsWord(trigger, in: lower) {
             return .weather(place: extractPlace(from: lower))
         }
 
@@ -139,8 +157,10 @@ struct WebSearchClassifier {
             return nil
         }
 
-        // 4. General current-info patterns.
-        for trigger in currentInfoTriggers where lower.contains(trigger) {
+        // 4. General current-info patterns. Word-boundary, same reasoning as the weather tier
+        // above: a bare `.contains` matched "who won" inside "who wonders about this stuff",
+        // which already passes the question-shape check via its "who" prefix.
+        for trigger in currentInfoTriggers where containsAsWord(trigger, in: lower) {
             return .general(query: trimmed)
         }
 
@@ -204,7 +224,7 @@ struct WebSearchClassifier {
     /// about what happened there this week.
     static func isNewsQuery(_ query: String) -> Bool {
         let lower = query.lowercased()
-        return newsIndicators.contains { lower.contains($0) }
+        return newsIndicators.contains { containsAsWord($0, in: lower) }
     }
 
     private static let newsIndicators: [String] = [

@@ -25,7 +25,14 @@ import SensitiveContentAnalysis
 ///    left with *no* post-generation check at all.
 ///
 /// A flagged image is discarded, never shown or saved.
-enum ImageSafetyAnalyzer {
+///
+/// `nonisolated`: this module builds with `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`, which
+/// without this would silently pin `screen(imageData:)` to the main actor despite this doc
+/// comment's own claim that it "runs off the main actor" — its only caller (the diffusion
+/// pipeline) is itself main-actor-isolated, so the skin-tone heuristic's pixel scan was actually
+/// running on the main thread. Nothing here holds mutable shared state, so this is safe from any
+/// thread, matching `ContentSafety`'s and `LogManager`'s reasoning for the same annotation.
+nonisolated enum ImageSafetyAnalyzer {
 
     enum Verdict {
         /// Nothing detected by whichever layers were able to run.
@@ -36,14 +43,40 @@ enum ImageSafetyAnalyzer {
 
     // MARK: - Apple's classifier
 
-    /// Whether Apple's analyzer can actually run right now.
+    /// Whether Apple's analyzer can actually run right now. Computed once per process and cached
+    /// — this used to be a plain computed property, constructing a fresh `SCSensitivityAnalyzer()`
+    /// on every access. `SettingsView.imageSafetyWarningBanner` reads this from a `@ViewBuilder`
+    /// property that re-evaluates on every `body` render, which on a screen that also shows Core
+    /// ML model-load progress meant re-constructing `SCSensitivityAnalyzer()` on every single
+    /// progress tick during a load. On at least one device this API is confirmed to crash inside
+    /// its own XPC service initialization (`getMADServiceClass`, filed with Apple separately) —
+    /// hitting it repeatedly, concurrently with an in-flight Core ML load, is what was destabilizing
+    /// (and in one report, silently killing) loads of the 3B model on that device. The device's
+    /// actual capability here can't change mid-session without the app being backgrounded and the
+    /// system settings changed in between, so a per-process cache costs nothing real.
     ///
     /// `.disabled` means the user hasn't turned Sensitive Content Analysis on, or the entitlement
     /// isn't provisioned. Surfaced so Settings can tell the user their strongest layer is off
     /// instead of implying protection that isn't there.
     static var isSystemAnalyzerAvailable: Bool {
-        SCSensitivityAnalyzer().analysisPolicy != .disabled
+        cacheLock.lock()
+        let cached = cachedIsSystemAnalyzerAvailable
+        cacheLock.unlock()
+        if let cached { return cached }
+
+        let value = SCSensitivityAnalyzer().analysisPolicy != .disabled
+
+        cacheLock.lock()
+        cachedIsSystemAnalyzerAvailable = value
+        cacheLock.unlock()
+        return value
     }
+
+    // This type is `nonisolated`, so this cache can genuinely be read/written from multiple
+    // threads at once — an explicit lock, not just a plain `static var`, the same pattern
+    // `ModelProfiler` uses for its cache and for the identical reason.
+    private static let cacheLock = NSLock()
+    private static var cachedIsSystemAnalyzerAvailable: Bool?
 
     // MARK: - Screening
 

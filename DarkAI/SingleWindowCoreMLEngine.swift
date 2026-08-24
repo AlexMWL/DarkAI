@@ -36,6 +36,11 @@ actor SingleWindowCoreMLEngine: CoreMLEngine {
     }
 
     private var model: MLModel?
+    /// Preallocated once per `load()` and reused for every token's prediction via
+    /// `MLPredictionOptions.outputBackings`, instead of a fresh ~15.6 MB `MLMultiArray` (plus an
+    /// ANE→CPU copy into it) on every single generated token — the same zero-copy technique
+    /// `ChunkedPipelineCoreMLEngine`/`PipelineArrayStore` already use.
+    private var outputArray: MLMultiArray?
     private let tokenizer = CoreMLTokenizer()
     private var isCancelledFlag = false
 
@@ -45,7 +50,16 @@ actor SingleWindowCoreMLEngine: CoreMLEngine {
     /// so the same "decline rather than interleave" rule applies.
     private var isBusyGenerating = false
 
-    var isLoaded: Bool { model != nil }
+    /// Set when a prediction fails and the model is torn down as a result — see
+    /// `consumeDecodeFault()` and the catch site in `generateStream`.
+    private var predictionFaulted = false
+
+    /// Read-and-clear, mirroring `LlamaRunner.consumeDecodeFault()`. See `CoreMLEngine`'s doc
+    /// comment on why this exists.
+    func consumeDecodeFault() -> Bool {
+        defer { predictionFaulted = false }
+        return predictionFaulted
+    }
 
     /// The model's own trained/usable context, in the sense `LLMManager` asks `LlamaRunner` for
     /// it — here it's simply the fixed window, since there's no separate "trained vs allocated"
@@ -94,7 +108,30 @@ actor SingleWindowCoreMLEngine: CoreMLEngine {
             throw RunnerError.unexpectedModelShape("expected a \"logits\" output shaped [1, \(Self.fixedSequenceLength), vocabSize]")
         }
 
+        let vocabSize = outputConstraint.shape[2].intValue
+        let logitsArray: MLMultiArray
+        do {
+            logitsArray = try MLMultiArray(
+                shape: [1, NSNumber(value: Self.fixedSequenceLength), NSNumber(value: vocabSize)],
+                dataType: .float32
+            )
+        } catch {
+            throw RunnerError.unexpectedModelShape("could not allocate a reusable logits output buffer: \(error.localizedDescription)")
+        }
+
         model = loaded
+        outputArray = logitsArray
+
+        // Core ML defers real program-load/placement cost to first prediction rather than to
+        // `MLModel(contentsOf:)` — without this, that cost lands on the user's first message
+        // instead of here, behind the loading spinner. Best-effort: a warm-up failure isn't a
+        // load failure, it just means the model behaves as it did before this existed.
+        // `predict` computes `position = tokens.count - 1` to index into the output — an empty
+        // token array would make that `-1` and trap on the buffer read, so this passes one dummy
+        // token rather than none.
+        if let warmupInput = try? MLMultiArray(shape: [1, NSNumber(value: Self.fixedSequenceLength)], dataType: .int32) {
+            _ = try? await predict(model: loaded, tokens: [0], inputArray: warmupInput)
+        }
     }
 
     /// Locates (or produces) the compiled `.mlmodelc` Xcode would normally build automatically
@@ -124,16 +161,28 @@ actor SingleWindowCoreMLEngine: CoreMLEngine {
     }
 
     func unload() {
+        // Mirrors `LlamaRunner.unloadModelOnly()` setting `isCancelled = true` unconditionally:
+        // an in-flight `generateStream` checks this flag at its only suspension point
+        // (`await Task.yield()`) before touching `model`/`outputArray` again, so `unload()` alone
+        // is a complete stop-signal even if a caller forgot to `requestCancel()` first — both
+        // `CoreMLRunner.load()` (loading a replacement model) and the app's terminate handler
+        // call `unload()` directly without one.
+        isCancelledFlag = true
         model = nil
+        outputArray = nil
     }
 
     // MARK: - Generation
 
     /// Same public shape as `LlamaRunner.generateStream` so `LLMManager` can dispatch to either
-    /// backend uniformly. `onContextTruncated`/`onThinkingProgress` are accepted but unused —
-    /// this model isn't a "thinking" model, and hitting the 128-token ceiling is reported
-    /// in-stream as plain text rather than through the truncation-callback UX `LlamaRunner` uses
-    /// for its (much larger, sliding) context window.
+    /// backend uniformly. Only `onThinkingProgress` is accepted but unused — this model isn't a
+    /// "thinking" model, and no Core ML engine currently calls it (see `CoreMLEngine`'s doc
+    /// comment on why it stays part of the protocol anyway). `onContextTruncated` IS used: called
+    /// below when the prompt alone doesn't fit the 128-token window and has to be truncated from
+    /// the front before generation even starts. Hitting the ceiling *during* generation instead
+    /// is reported in-stream as plain text rather than through this callback — there's no
+    /// sliding-window recovery to report for a fixed, non-cached window the way there is for
+    /// `LlamaRunner`'s (much larger) context.
     func generateStream(
         messages: [(role: String, content: String)],
         maxTokens: Int,
@@ -213,6 +262,16 @@ actor SingleWindowCoreMLEngine: CoreMLEngine {
                 Task { @MainActor in
                     LogManager.shared.log("SingleWindowCoreMLEngine: prediction failed — \(error.localizedDescription)")
                 }
+                // Mirrors `LlamaRunner.handleDecodeFailure`: tear the model down and flag the
+                // fault rather than just breaking the loop, so `LLMManager` finds out this backend
+                // can no longer answer instead of continuing to report it as loaded.
+                predictionFaulted = true
+                unload()
+                // Without this the chat bubble just stops mid-thought with no explanation — the
+                // `loadState = .failed(...)` banner (driven by `consumeDecodeFault()`) is a
+                // separate, easy-to-miss signal, not something rendered inline in the transcript
+                // the way `LlamaRunner`'s equivalent failure message is.
+                continuation.yield("\n\n[Generation stopped — this model hit an internal error and was unloaded. Try reloading it, or a different one.]")
                 break
             }
 
@@ -255,8 +314,11 @@ actor SingleWindowCoreMLEngine: CoreMLEngine {
             }
         }
 
+        guard let outputArray else { throw RunnerError.predictionFailed }
         let input = try MLDictionaryFeatureProvider(dictionary: ["input_ids": inputArray])
-        let output = try await model.prediction(from: input, options: MLPredictionOptions())
+        let options = MLPredictionOptions()
+        options.outputBackings = ["logits": outputArray]
+        let output = try await model.prediction(from: input, options: options)
         guard let logits = output.featureValue(for: "logits")?.multiArrayValue else {
             throw RunnerError.predictionFailed
         }

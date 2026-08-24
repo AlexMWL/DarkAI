@@ -63,29 +63,47 @@ enum ModelRecovery {
         if llm.isGenerating { llm.cancelGeneration() }
 
         onStage(.unloading)
-        let diffusionFreed = await diffusion.unloadDiffusionModelAsync()
+        var diffusionFreed = await diffusion.unloadDiffusionModelAsync()
         await llm.unloadModelAsync()
 
-        // The sampler can't be interrupted, so a checkpoint mid-generation stays resident until
-        // the current step finishes. Say so plainly rather than reporting a reset that didn't
-        // happen — the user would otherwise retry into the same wall.
+        // `.stopping` above already called `cancelGeneration()`, which now requests real
+        // cancellation via `SDWrapper.cancel()` (`sd_cancel_generation`) rather than only
+        // flipping Swift-side flags — but the C++ sampler only checks for that request between
+        // steps, not instantly, so the unload attempt right above can easily race a step that
+        // was already underway when cancellation was requested. Give it a few short beats to
+        // actually land before conceding, rather than the single immediate attempt this used to
+        // make back when there was no real cancellation for a retry to wait on.
+        if !diffusionFreed {
+            for _ in 0..<8 where !diffusionFreed {
+                try? await Task.sleep(nanoseconds: 400_000_000)
+                diffusionFreed = await diffusion.unloadDiffusionModelAsync()
+            }
+        }
+
+        // If the sampler still hasn't returned after ~3s of retries, say so plainly rather than
+        // reporting a reset that didn't happen — the user would otherwise retry into the same
+        // wall. This should be rare now that cancellation is real; it mainly covers a very slow
+        // individual step (a large SDXL generation on an older device) rather than the "nothing
+        // we can do but wait" case this message used to describe.
         guard diffusionFreed else {
             LogManager.shared.log("ModelRecovery: aborted — diffusion context still in use by a running generation")
-            onStage(.partial("The image still being generated can't be interrupted. It will finish shortly — try Reset again once it does."))
+            onStage(.partial("The image still being generated is taking a moment to stop — cancellation was requested, but the current step hasn't finished yet. Try Reset again in a few seconds."))
             return
         }
 
-        onStage(.waitingForMemory)
-        let target = llm.lastUsedModelPath.map {
-            llm.memoryHeadroomNeededGB(forModelSizeGB: llm.getModelSizeGB(at: URL(fileURLWithPath: $0)))
-        } ?? 1.0
-        let reclaimed = await MemoryBudget.waitForRelease(atLeastGB: target)
-
+        // Checked before the memory wait, not after: with nothing to reload, there's no reason to
+        // make the user sit through up to `MemoryBudget.waitForRelease`'s ~20s timeout for memory
+        // that was never going to be used, just to delay the same "Everything was unloaded"
+        // message the wait doesn't change.
         guard let path = llm.lastUsedModelPath else {
             LogManager.shared.log("ModelRecovery: reset complete, no chat model to restore")
             onStage(.done("Everything was unloaded. Choose a model in Settings to start again."))
             return
         }
+
+        onStage(.waitingForMemory)
+        let target = llm.memoryHeadroomNeededGB(forModelSizeGB: llm.getModelSizeGB(at: URL(fileURLWithPath: path)))
+        let reclaimed = await MemoryBudget.waitForRelease(atLeastGB: target)
 
         let url = URL(fileURLWithPath: path)
         onStage(.reloading(url.lastPathComponent))

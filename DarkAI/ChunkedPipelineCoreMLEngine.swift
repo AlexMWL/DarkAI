@@ -52,7 +52,16 @@ actor ChunkedPipelineCoreMLEngine: CoreMLEngine {
     private var isBusyGenerating = false
     private var temperature: Float = 0.7
 
-    var isLoaded: Bool { !chunkModels.isEmpty && cacheProcessorModel != nil && config != nil }
+    /// Set when a chunk prediction fails and the pipeline is torn down as a result — see
+    /// `consumeDecodeFault()` and the catch site in `generateStream`.
+    private var predictionFaulted = false
+
+    /// Read-and-clear, mirroring `LlamaRunner.consumeDecodeFault()`. See `CoreMLEngine`'s doc
+    /// comment on why this exists.
+    func consumeDecodeFault() -> Bool {
+        defer { predictionFaulted = false }
+        return predictionFaulted
+    }
 
     /// The sliding window's total live capacity (prompt + reply + cache), not a hard stop — see
     /// the type-level doc comment.
@@ -96,6 +105,9 @@ actor ChunkedPipelineCoreMLEngine: CoreMLEngine {
             throw PipelineError.cacheProcessorNotFound
         }
         let cacheConfiguration = MLModelConfiguration()
+        // Same reasoning as the chunk models above: matches the reference's own compute-unit
+        // assignment for this model rather than relaxing to `.all` — a small shift/concat graph,
+        // not one profiled here to need GPU fallback.
         cacheConfiguration.computeUnits = .cpuAndNeuralEngine
         cacheConfiguration.modelDisplayName = "Cache Processor"
         let loadedCacheProcessor = try MLModel(contentsOf: cacheProcessorURL, configuration: cacheConfiguration)
@@ -107,9 +119,24 @@ actor ChunkedPipelineCoreMLEngine: CoreMLEngine {
         chunkModels = loadedChunks
         cacheProcessorModel = loadedCacheProcessor
         config = inferredConfig
+
+        // A per-chunk warm-up pass (one forward prediction through every chunk right after load,
+        // to move Core ML's first-prediction compile/placement cost behind the loading spinner)
+        // was tried here and reverted: for a model split into many chunks — the 3B build is 16 —
+        // it means 16 sequential `MLModel.prediction` calls, several of them on genuinely large
+        // per-chunk weights, with no timeout anywhere in this call chain. On real ANE hardware
+        // that turned a normal load into one that hangs or takes long enough to look hung, with
+        // nothing to log since nothing had actually failed yet — reported as "loading the 3B
+        // model never completes, no error." Not reattempted without a way to verify a safer
+        // version (e.g. warming only chunk 0, or bounding it with a timeout) on real hardware.
     }
 
     func unload() {
+        // Mirrors `LlamaRunner.unloadModelOnly()` setting `isCancelled = true` unconditionally —
+        // see `SingleWindowCoreMLEngine.unload()`'s identical comment for why this matters:
+        // `unload()` needs to be a complete stop-signal on its own, not dependent on the caller
+        // having already called `requestCancel()`.
+        isCancelledFlag = true
         chunkModels = []
         cacheProcessorModel = nil
         config = nil
@@ -123,6 +150,9 @@ actor ChunkedPipelineCoreMLEngine: CoreMLEngine {
         temperature: Float,
         continuation: AsyncStream<String>.Continuation,
         onContextTruncated: @escaping @Sendable () -> Void = {},
+        // Unused here — this pipeline has no "thinking"/reasoning phase to report progress on.
+        // Kept rather than dropped from the `CoreMLEngine` protocol because `CoreMLRunner`
+        // forwards it by name to whichever engine is loaded; see `CoreMLEngine`'s doc comment.
         onThinkingProgress: @escaping @Sendable (Int) -> Void = { _ in }
     ) async {
         guard let config, let cacheProcessorModel, !chunkModels.isEmpty else {
@@ -176,8 +206,20 @@ actor ChunkedPipelineCoreMLEngine: CoreMLEngine {
             if isCancelledFlag { break }
 
             var logitChunks: [MLMultiArray] = []
+            var cancelledDuringChunks = false
             do {
                 for (chunkIndex, model) in chunkModels.enumerated() {
+                    // Re-checked before every chunk, not just once per generated token: there is
+                    // no public API to abort an `MLModel.prediction` already in flight, so the
+                    // only lever a cancel has is bounding how much *new* ANE work gets queued
+                    // after it's requested. Without this, a cancel arriving mid-pass would still
+                    // let up to five more chunk predictions submit before the outer loop's
+                    // top-of-iteration check ever ran again.
+                    if isCancelledFlag {
+                        cancelledDuringChunks = true
+                        break
+                    }
+
                     // Wait for this chunk's cache to finish any update the *previous* pass
                     // submitted, before reading it as this pass's input.
                     try await cacheProcessor.wait(forChunk: chunkIndex)
@@ -186,6 +228,15 @@ actor ChunkedPipelineCoreMLEngine: CoreMLEngine {
                     let options = MLPredictionOptions()
                     options.outputBackings = store.outputBackings(forChunk: chunkIndex, model: model)
                     let outputs = try await model.prediction(from: inputs, options: options)
+
+                    // The wait or the prediction above may have taken long enough for a cancel to
+                    // land while this chunk was in flight — checked again here so a
+                    // completed-but-now-stale prediction's cache update and eviction callback are
+                    // skipped rather than committed after cancellation was already requested.
+                    if isCancelledFlag {
+                        cancelledDuringChunks = true
+                        break
+                    }
 
                     // Only update the cache once a full input segment has been consumed — matches
                     // the reference exactly: with inputLength 64, that's every 64/128/192/...
@@ -205,8 +256,25 @@ actor ChunkedPipelineCoreMLEngine: CoreMLEngine {
                 Task { @MainActor in
                     LogManager.shared.log("ChunkedPipelineCoreMLEngine: prediction failed — \(error.localizedDescription)")
                 }
+                // Mirrors `LlamaRunner.handleDecodeFailure`: tear the pipeline down and flag the
+                // fault rather than just breaking the loop, so `LLMManager` finds out this backend
+                // can no longer answer instead of continuing to report it as loaded.
+                predictionFaulted = true
+                unload()
+                // Without this the chat bubble just stops mid-thought with no explanation — the
+                // `loadState = .failed(...)` banner (driven by `consumeDecodeFault()`) is a
+                // separate, easy-to-miss signal, not something rendered inline in the transcript
+                // the way `LlamaRunner`'s equivalent failure message is.
+                continuation.yield("\n\n[Generation stopped — this model hit an internal error and was unloaded. Try reloading it, or a different one.]")
                 break
             }
+
+            // A cancellation observed partway through this token's chunk pass means the chunks
+            // gathered above never made it through a complete forward pass — `logitChunks` (if
+            // populated at all) is a stale/partial read, not a real result. Discard it and stop
+            // here rather than sampling from — or publishing — output that cancellation was
+            // already requested against.
+            if cancelledDuringChunks { break }
 
             if !promptChunks.isEmpty {
                 // Prefill: these tokens are already known (they're the rest of the prompt) — this

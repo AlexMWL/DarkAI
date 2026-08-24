@@ -14,10 +14,6 @@ actor CoreMLRunner {
 
     private var engine: (any CoreMLEngine)?
 
-    var isLoaded: Bool {
-        get async { await engine?.isLoaded ?? false }
-    }
-
     /// Whether the currently-loaded model is a real sliding-window cache (`ChunkedPipelineCoreMLEngine`,
     /// e.g. Llama 3.2) rather than a hard-stop fixed window (`SingleWindowCoreMLEngine`, e.g.
     /// OpenELM). `LLMManager` surfaces this so Settings can describe `getContextWindowTokens()`'s
@@ -80,5 +76,9 @@ actor CoreMLRunner {
 
     func getTrainedContextTokens() async -> Int {
         await engine?.getTrainedContextTokens() ?? 0
+    }
+
+    func consumeDecodeFault() async -> Bool {
+        await engine?.consumeDecodeFault() ?? false
     }
 }

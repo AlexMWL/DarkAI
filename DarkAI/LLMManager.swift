@@ -42,6 +42,47 @@ actor LlamaRunner {
     /// the real figure, as opposed to the char-count estimate used for UI budgeting.
     private var lastPromptTokenCount: Int = 0
 
+    /// Tokens currently resident in the KV cache for sequence 0, in cache-position order —
+    /// `residentTokens[i]` is the token actually decoded at position `i`. Kept in lockstep with
+    /// `nPos` in `generateStream`: `residentTokens.count` equals `nPos` after every mutation
+    /// (initial prefill, each per-token decode, each context-shift eviction), and empty whenever
+    /// the cache holds nothing meaningful — before the first load, and after
+    /// `unloadModelOnly`/`unload`.
+    ///
+    /// Exists purely to make cross-turn KV-cache reuse provably safe rather than a heuristic.
+    /// `generateStream` used to call `llama_memory_clear` and redo the full prefill on *every*
+    /// turn, even though most of a multi-turn conversation's prompt (system block plus prior
+    /// history) is byte-identical to what was just decoded a moment ago. At the start of the next
+    /// call, this turn's freshly-tokenized prompt is compared token-ID-for-token-ID against this
+    /// array (see the reuse check in `generateStream`). Causal attention means a cached
+    /// position's K/V entry depends only on the tokens at or before it and never changes once
+    /// written, so as long as every ID in `residentTokens[0..<n]` is *literally* identical to the
+    /// new prompt's first `n` tokens, those cached entries are exactly what a fresh decode would
+    /// have produced — this holds regardless of how either string was tokenized, since it
+    /// compares the resulting token IDs directly rather than reasoning about whether BPE/SPM
+    /// merges are stable across the turn boundary (they are not, in general).
+    ///
+    /// Deliberately narrow: reuse is only attempted when the *entire* current cache passes that
+    /// check — a strict prefix of the new prompt, nothing partial. A mismatch anywhere (edited or
+    /// regenerated history, a truncated prompt, the shared background personality-analysis pass
+    /// using this same actor/cache for an unrelated prompt, or simply the first message) falls
+    /// back to the original full-clear-and-reprefill behaviour rather than attempting to splice
+    /// out a divergent middle section — a partial-reuse "diff to the divergence point" was
+    /// considered and rejected as too easy to get subtly wrong for a path with no way to be
+    /// runtime-verified here.
+    private var residentTokens: [llama_token] = []
+
+    /// Longest run of tokens `a` and `b` agree on from the start. Used only to decide KV-cache
+    /// reuse eligibility (see `residentTokens`) — a plain linear scan is more than fast enough
+    /// against even a full context window, and staying this simple keeps the safety argument
+    /// easy to check by inspection.
+    private static func commonPrefixLength(_ a: [llama_token], _ b: [llama_token]) -> Int {
+        let n = min(a.count, b.count)
+        var i = 0
+        while i < n && a[i] == b[i] { i += 1 }
+        return i
+    }
+
     /// True for the entire duration of an in-flight `generateStream` call.
     ///
     /// `LlamaRunner` being an `actor` serializes calls to it *between* suspension points, but
@@ -64,7 +105,6 @@ actor LlamaRunner {
     /// itself race.
     private var isBusyGenerating = false
 
-    var isLoaded: Bool { model != nil && context != nil }
     /// The context window actually applied to the loaded model, which can differ from the
     /// user's requested setting once `safeContextTokens` clamps it to available RAM.
     func getContextWindowTokens() -> Int { nCtxTokens }
@@ -107,6 +147,18 @@ actor LlamaRunner {
                                availableMemoryGB: availableMemoryGB,
                                contextLimit: contextLimit)
 
+        // `n_batch`/`n_ubatch` tier: prefill throughput scales with batch size, but the
+        // attention/activation scratch buffers scale with `n_ubatch` (see the comment on
+        // `ctxParams.n_ubatch` below), so raising the ceiling has to be paired with
+        // `computeOverheadGB` reserving more for it — not just a bigger number handed to
+        // llama.cpp. Gated on `availableMemoryGB` (this load's real, current headroom, not a
+        // static device tier) and kept at the historical 512 floor whenever the load is already
+        // streaming weights from storage: that path independently halves `n_ubatch` to protect
+        // its much tighter budget (see below), so doubling the *reservation* for a batch size it
+        // doesn't actually use would only shrink an already-constrained context window for
+        // nothing in return.
+        let batchCeiling = (!plan.streamsFromStorage && availableMemoryGB >= 4.0) ? 1024 : 512
+
         var modelParams = llama_model_default_params()
         modelParams.n_gpu_layers = plan.nGpuLayers
         modelParams.use_mmap = true
@@ -125,8 +177,22 @@ actor LlamaRunner {
         // Read during the probe; the loaded model reports the same values.
         let geometry = plan.geometry
 
-        // Optimized for Apple Silicon: Using all cores (including E-cores) degrades performance.
+        // Two different thread counts, because decode and prefill have opposite bottlenecks on
+        // Apple Silicon. Decode (n_threads) runs one token at a time and is memory-bandwidth
+        // bound, not compute bound — optimized for Apple Silicon: using all cores (including
+        // E-cores) degrades performance, since their lower per-core memory bandwidth becomes the
+        // new bottleneck the moment they're added to the pool. Prefill (n_threads_batch)
+        // processes a whole batch of tokens per call and is compute bound, so unlike decode it
+        // genuinely benefits from every core it can get, E-cores included.
+        //
+        // iOS has no public API to ask how many of `activeProcessorCount` are P-cores vs E-cores,
+        // so `optimalThreads` stays this existing conservative estimate (roughly the P-core count
+        // on every current Apple Silicon iPhone SoC) rather than guessing at a split.
+        // `batchThreads` isn't trying to identify P-cores at all — it just allows more
+        // parallelism for the compute-bound phase, capped well under `activeProcessorCount` so it
+        // can't regress into the same all-cores-including-E-cores slowdown decode has to avoid.
         let optimalThreads = Int32(max(2, min(4, ProcessInfo.processInfo.activeProcessorCount / 2)))
+        let batchThreads = Int32(max(Int(optimalThreads), min(ProcessInfo.processInfo.activeProcessorCount, 6)))
 
         // Prefer the quantised cache, but keep f16 as a fallback rather than failing the load.
         // Quantised K/V depends on backend support for this specific architecture's head
@@ -167,7 +233,8 @@ actor LlamaRunner {
                                             availableMemoryGB: availableMemoryGB,
                                             modelSizeGB: modelSizeGB,
                                             requestedLimit: contextLimit,
-                                            trainedCtx: trainedCtx)
+                                            trainedCtx: trainedCtx,
+                                            batchCeiling: batchCeiling)
             if bestCtx < Self.minimumUsableContextTokens {
                 llama_model_free(mdl)
                 self.model = nil
@@ -183,7 +250,8 @@ actor LlamaRunner {
                                                availableMemoryGB: availableMemoryGB,
                                                modelSizeGB: modelSizeGB,
                                                requestedLimit: contextLimit,
-                                               trainedCtx: trainedCtx))
+                                               trainedCtx: trainedCtx,
+                                               batchCeiling: batchCeiling))
 
             // A format later in the list packs tighter than this one — e.g. Q8_0 landing under
             // the usable floor while Q4_0 is still ahead — so it's worth trying that one instead
@@ -200,7 +268,11 @@ actor LlamaRunner {
 
             var ctxParams = llama_context_default_params()
             ctxParams.n_ctx   = UInt32(nCtx)
-            ctxParams.n_batch = UInt32(min(nCtx, 512))
+            // `batchCeiling` (computed once above, before this format loop) raises this past the
+            // historical flat 512 on a load with enough headroom to afford a bigger prefill batch
+            // — see its own comment for the memory tradeoff, and `computeOverheadGB` below for how
+            // the KV budget was told about the larger compute buffer this implies.
+            ctxParams.n_batch = UInt32(min(nCtx, Int32(batchCeiling)))
             // `n_batch` is the logical size a prompt gets chunked into; `n_ubatch` is the physical
             // size actually pushed through the compute graph at once, and it's what the attention/
             // activation scratch buffers scale with (`computeOverheadGB`'s 523 MiB measurement was
@@ -212,7 +284,7 @@ actor LlamaRunner {
                 ? min(ctxParams.n_batch, 256)
                 : ctxParams.n_batch
             ctxParams.n_threads       = optimalThreads
-            ctxParams.n_threads_batch = optimalThreads
+            ctxParams.n_threads_batch = batchThreads
             // Quantised K/V requires flash attention, which is why this is set unconditionally
             // rather than left on AUTO.
             ctxParams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED
@@ -525,8 +597,18 @@ actor LlamaRunner {
     ///
     /// Now essentially flat, with a slight context term for the bookkeeping that genuinely does
     /// grow, and still roughly double the measured figure.
-    private func computeOverheadGB(forContext tokens: Int) -> Double {
-        0.75 + Double(tokens) / 65536.0 * 0.5
+    ///
+    /// `nUbatch` defaults to 512 — the batch size the 523 MiB measurement above was actually
+    /// taken at — so every existing caller keeps exactly today's numbers. `batchCeiling` (see
+    /// `load`) can raise the real `n_ubatch` a fully-resident, high-memory load uses past that,
+    /// and the buffer scales with it (per the `ctxParams.n_ubatch` comment in `load`), so this
+    /// scales its own reservation the same way rather than quietly under-reserving for a bigger
+    /// buffer. `max(1.0, …)` means the ratio only ever pushes the reservation up, never down —
+    /// a smaller `nUbatch` (e.g. a streaming load's halved 256) still reserves the original flat
+    /// amount rather than clawing back margin that was never the risk this guards against.
+    private func computeOverheadGB(forContext tokens: Int, nUbatch: Int = 512) -> Double {
+        let batchGB = 0.5 * max(1.0, Double(nUbatch) / 512.0)
+        return 0.25 + batchGB + Double(tokens) / 65536.0 * 0.5
     }
 
     // MARK: - KV cache sizing
@@ -616,7 +698,8 @@ actor LlamaRunner {
                                    availableMemoryGB: Double,
                                    modelSizeGB: Double,
                                    requestedLimit: Int,
-                                   trainedCtx: Int) -> Int {
+                                   trainedCtx: Int,
+                                   batchCeiling: Int = 512) -> Int {
         let safeRequestedClamp = contextClamp(requestedLimit: requestedLimit,
                                               trainedCtx: trainedCtx,
                                               modelSizeGB: modelSizeGB)
@@ -652,7 +735,7 @@ actor LlamaRunner {
         // `availableMemoryGB`.
         let residentWeightGB = plan.residentWeightGB
 
-        let computeOverheadGB = computeOverheadGB(forContext: safeRequestedClamp)
+        let computeOverheadGB = computeOverheadGB(forContext: safeRequestedClamp, nUbatch: batchCeiling)
 
         var availableForKVGB = availableMemoryGB - safetyMarginGB - residentWeightGB - computeOverheadGB
 
@@ -719,6 +802,8 @@ actor LlamaRunner {
         }
         context = nil
         model   = nil
+        // The cache this described no longer exists — see `residentTokens`'s doc comment.
+        residentTokens = []
     }
 
     /// Full teardown — call only when the actor itself is being destroyed.
@@ -731,6 +816,7 @@ actor LlamaRunner {
         }
         context = nil
         model   = nil
+        residentTokens = []
     }
 
     func requestCancel() {
@@ -742,7 +828,7 @@ actor LlamaRunner {
         guard let mdl = model else { return [] }
         let vocab = llama_model_get_vocab(mdl)
         let utf8 = text.utf8
-        let nTokensMax = Int32(utf8.count + 8)
+        var nTokensMax = Int32(utf8.count + 8)
         var tokens = [llama_token](repeating: 0, count: Int(nTokensMax))
         // parse_special = true: the chat-templated prompt this is called on contains literal
         // turn-delimiter markup (e.g. Llama 3's "<|eot_id|><|start_header_id|>assistant
@@ -753,7 +839,17 @@ actor LlamaRunner {
         // is exactly what it then reproduced verbatim when generating (printing the literal
         // tag text and continuing into hallucinated extra turns instead of using the real
         // stop token, regardless of model or the EOG-detection fix on the output side).
-        let n = llama_tokenize(vocab, text, Int32(utf8.count), &tokens, nTokensMax, addBOS, true)
+        var n = llama_tokenize(vocab, text, Int32(utf8.count), &tokens, nTokensMax, addBOS, true)
+        if n < 0 {
+            // llama.cpp's documented convention: a negative return means the supplied buffer was
+            // too small, and its magnitude is the size actually needed. `utf8.count + 8` is
+            // generous for ordinary BPE/SPM tokenization, but retry once at the reported size
+            // rather than silently dropping the tokenization (and the whole prompt with it) —
+            // mirrors `CoreMLTokenizer.encode`'s identical handling of this same return value.
+            nTokensMax = -n
+            tokens = [llama_token](repeating: 0, count: Int(nTokensMax))
+            n = llama_tokenize(vocab, text, Int32(utf8.count), &tokens, nTokensMax, addBOS, true)
+        }
         guard n > 0 else { return [] }
         return Array(tokens.prefix(Int(n)))
     }
@@ -860,21 +956,34 @@ actor LlamaRunner {
         }
         lastPromptTokenCount = promptTokens.count
 
-        // 2. Clear KV cache to prevent crashes across multiple prompts
-        if let mem = llama_get_memory(ctx) {
+        // 2. Reuse the KV cache across turns when this turn's freshly-tokenized prompt is a
+        // verified, exact extension of exactly what's still resident from the previous turn —
+        // see `residentTokens`'s doc comment for the full correctness argument and why this is
+        // deliberately narrow (all-or-nothing) rather than a general prefix diff. Any other case
+        // — first message, edited/regenerated history, a truncated prompt, or simply no match —
+        // falls back to the original, always-correct full clear.
+        let commonPrefixLen = Self.commonPrefixLength(residentTokens, promptTokens)
+        let reusesCache = commonPrefixLen == residentTokens.count
+            && commonPrefixLen > 0
+            && commonPrefixLen < promptTokens.count
+
+        if reusesCache {
+            LogManager.shared.log("LlamaRunner: reusing \(commonPrefixLen)/\(promptTokens.count) cached prompt tokens from the previous turn")
+        } else if let mem = llama_get_memory(ctx) {
+            // Clear KV cache to prevent crashes across multiple prompts
             llama_memory_clear(mem, true)
         }
 
-        // 3. Prefill (evaluate the prompt) in chunks of n_batch
+        // 3. Prefill (evaluate the prompt, or just the new suffix when reusing) in chunks of n_batch
         let batchSize = Int(llama_n_batch(ctx))
         var batch = llama_batch_init(Int32(batchSize), 0, 1)
         defer { llama_batch_free(batch) }
-        
-        var batchStart = 0
+
+        var batchStart = reusesCache ? commonPrefixLen : 0
         while batchStart < promptTokens.count {
             let chunkEnd = min(promptTokens.count, batchStart + batchSize)
             let chunkLen = chunkEnd - batchStart
-            
+
             for i in 0..<chunkLen {
                 let tokenIdx = batchStart + i
                 batch.token[i] = promptTokens[tokenIdx]
@@ -902,6 +1011,11 @@ actor LlamaRunner {
             }
             batchStart += batchSize
         }
+        // The cache now holds exactly `promptTokens` end-to-end — whether by the full reprefill
+        // above or by keeping the reused prefix and decoding only the new suffix — so this is
+        // what the *next* turn's reuse check compares against. Kept in lockstep with `nPos` from
+        // here on (see the context-shift and per-token decode sections below).
+        residentTokens = promptTokens
 
         // 4. Autoregressive decoding with temperature + top-p sampling to prevent repetition
         let nVocab = Int(llama_vocab_n_tokens(vocab))
@@ -990,8 +1104,23 @@ actor LlamaRunner {
 
             guard let logitsPtr = llama_get_logits_ith(ctx, -1) else { break }
 
-            // Copy logits to a Swift array for manipulation
-            var logits = Array(UnsafeBufferPointer(start: logitsPtr, count: nVocab))
+            // Operate directly on llama.cpp's own logits buffer instead of copying all `nVocab`
+            // floats into a fresh Swift `Array` on every single token — on a large-vocab model
+            // (128K+ tokens for some catalog models) that copy alone was real, measurable
+            // per-token cost. Safe to mutate in place: `llama_get_logits_ith` returns a buffer
+            // owned by the context that's only valid until the *next* `llama_decode` call, which
+            // is exactly this loop iteration's own lifetime for it — nothing else reads it, and
+            // the next decode overwrites it wholesale regardless of what's left here.
+            //
+            // (A native `llama_sampler_chain`/`llama_sampler_init_*` chain was investigated as a
+            // further step — the symbols are genuinely linked and callable here, confirmed against
+            // llama.swift's vendored headers. It wasn't adopted: `llama_sampler_init_penalties`
+            // applies its repeat penalty once per *distinct* token in the window, where this
+            // function's penalty below compounds once per *occurrence* — a real behavioural
+            // difference, not just an implementation detail — and reproducing this function's
+            // exact semantics natively would mean hand-writing a custom `llama_sampler_i` from
+            // Swift, which isn't a change to make with no way to verify actual generations here.)
+            let logits = UnsafeMutableBufferPointer(start: logitsPtr, count: nVocab)
 
             // Reject a distribution that carries no information before sampling from it.
             //
@@ -1079,12 +1208,21 @@ actor LlamaRunner {
             }
 
             // Temperature scaling
+            var tempInvApplied: Float = 1.0
             if temperature > 0 && temperature != 1.0 {
-                let invTemp = 1.0 / Float(temperature)
-                for i in 0..<nVocab { logits[i] *= invTemp }
+                tempInvApplied = 1.0 / Float(temperature)
+                for i in 0..<nVocab { logits[i] *= tempInvApplied }
             }
 
-            let maxLogit = logits.max() ?? 0
+            // `maxRaw` (computed above, before the repeat penalty) is a safe upper bound for the
+            // post-penalty, post-temperature max without a second full-vocabulary scan: the
+            // repeat-penalty loop just above only ever pulls a `recentTokens` logit *down* toward
+            // zero (a positive value divided by `repeatPenalty > 1`, a negative value multiplied
+            // further negative), never up, so nothing anywhere can exceed `maxRaw` afterward, and
+            // scaling by a positive `tempInvApplied` preserves that bound. Softmax only needs *a*
+            // safe upper bound to shift by for numerical stability, not the exact max, so this is
+            // correct rather than approximate — it just avoids re-scanning every logit again.
+            let maxLogit = maxRaw * tempInvApplied
 
             // Optimization: Filter out incredibly improbable logits before expf and sorting (O(N log N) -> O(1))
             let logitThreshold = maxLogit - 12.0
@@ -1098,21 +1236,29 @@ actor LlamaRunner {
                 }
             }
 
-            // Softmax on filtered logits
-            var expLogits = validLogits.map { ($0.0, expf($0.1 - maxLogit)) }
-            let sumExp = expLogits.reduce(0) { $0 + $1.1 }
-            if sumExp > 0 {
-                for i in 0..<expLogits.count { expLogits[i].1 /= sumExp }
-            }
+            // Softmax + top-p nucleus sampling, over the filtered candidates only.
+            //
+            // Sorting by raw logit descending yields the same order as sorting by probability —
+            // `expf` is monotonic and the normalization below is one shared positive scale factor
+            // — so the sort runs once, before softmax, instead of building a full probability
+            // array first and sorting *that*. `sumExp` still has to see every filtered candidate
+            // (top-p is defined against the whole filtered probability mass), but computing each
+            // candidate's actual probability can stop as soon as the nucleus crosses `topP`,
+            // which for a peaked distribution is usually a handful of entries, not the whole
+            // filtered set.
+            validLogits.sort { $0.1 > $1.1 }
+            var sumExp: Float = 0
+            for (_, val) in validLogits { sumExp += expf(val - maxLogit) }
 
-            // Top-p nucleus sampling
-            let sorted = expLogits.sorted { $0.1 > $1.1 }
-            var cumulative: Float = 0
+            var nucleusSum: Float = 0
             var nucleus: [(Int, Float)] = []
-            for item in sorted {
-                nucleus.append(item)
-                cumulative += item.1
-                if cumulative >= topP { break }
+            if sumExp > 0 {
+                for (idx, val) in validLogits {
+                    let prob = expf(val - maxLogit) / sumExp
+                    nucleus.append((idx, prob))
+                    nucleusSum += prob
+                    if nucleusSum >= topP { break }
+                }
             }
 
             // Sample from nucleus.
@@ -1123,8 +1269,9 @@ actor LlamaRunner {
             // notes in `SDWrapper`) — the threshold filter above keeps nothing, the nucleus is
             // empty, and `nucleusSum` is 0. That trapped with "Range requires lowerBound <
             // upperBound" and killed the app mid-answer. A model returning unusable numbers has
-            // to be a survivable state, not an uncatchable crash.
-            let nucleusSum = nucleus.reduce(0) { $0 + $1.1 }
+            // to be a survivable state, not an uncatchable crash. `nucleusSum` already holds the
+            // sum of every probability actually appended to `nucleus` above (accumulated in
+            // lockstep in that same loop), so it's reused here rather than recomputed via reduce.
             var sampledId: Int
             if nucleusSum.isFinite, nucleusSum > 0 {
                 var rand = Float.random(in: 0..<nucleusSum)
@@ -1340,6 +1487,10 @@ actor LlamaRunner {
                    llama_memory_seq_rm(mem, 0, nKeep, nKeep + nDiscard) {
                     llama_memory_seq_add(mem, 0, nKeep + nDiscard, nPos, -nDiscard)
                     nPos -= nDiscard
+                    // Mirror the same eviction into `residentTokens` — see its doc comment. Must
+                    // track `nPos` exactly, since that's what the next turn's prefix-reuse check
+                    // trusts as "what the cache actually contains right now."
+                    residentTokens.removeSubrange(Int(nKeep)..<Int(nKeep + nDiscard))
                     onContextTruncated()
                     Task { @MainActor in LogManager.shared.log("LlamaRunner: Context window full — dropped \(nDiscard) oldest tokens to keep generating.") }
                 } else {
@@ -1374,6 +1525,9 @@ actor LlamaRunner {
             }
 
             nPos += 1
+            // `bestId` is now actually resident in the cache at the position that was just
+            // decoded — mirror it into `residentTokens` in the same lockstep as `nPos` above.
+            residentTokens.append(bestId)
             // Only increment the response budget counter for real (non-thinking) tokens
             if yieldedRealToken { generatedCount += 1 }
         }
@@ -1623,6 +1777,12 @@ class LLMManager: ObservableObject {
     private let runner = LlamaRunner()
     private let coreMLRunner = CoreMLRunner()
 
+    /// Tokens for the lifecycle observers registered below, so `deinit` can remove them —
+    /// `NotificationCenter` does not deregister a block-based observer on its own. Mirrors the
+    /// same fix on `DiffusionManager`'s memory-warning observer.
+    private var willTerminateObserver: NSObjectProtocol?
+    private var memoryWarningObserver: NSObjectProtocol?
+
     init() {
         self.systemMemoryGB = getPhysicalMemory()
         setupAppLifecycleObservers()
@@ -1632,10 +1792,15 @@ class LLMManager: ObservableObject {
         applyContextCeiling()
     }
 
+    deinit {
+        if let willTerminateObserver { NotificationCenter.default.removeObserver(willTerminateObserver) }
+        if let memoryWarningObserver { NotificationCenter.default.removeObserver(memoryWarningObserver) }
+    }
+
     // MARK: - App Lifecycle - Clean unload on background/termination
 
     private func setupAppLifecycleObservers() {
-        NotificationCenter.default.addObserver(
+        willTerminateObserver = NotificationCenter.default.addObserver(
             forName: UIApplication.willTerminateNotification,
             object: nil,
             queue: .main
@@ -1645,7 +1810,7 @@ class LLMManager: ObservableObject {
                 await self?.coreMLRunner.unload()
             }
         }
-        NotificationCenter.default.addObserver(
+        memoryWarningObserver = NotificationCenter.default.addObserver(
             forName: UIApplication.didReceiveMemoryWarningNotification,
             object: nil,
             queue: .main
@@ -2117,6 +2282,11 @@ class LLMManager: ObservableObject {
         }
     }
 
+    /// The Task currently driving `generateStream` on whichever actor is active, if any. Let's
+    /// `generateResponse` wait for a just-cancelled generation to actually finish unwinding
+    /// before starting a new one — see its capture of `previousGenerationTask` below for why.
+    private var currentGenerationTask: Task<Void, Never>?
+
     func cancelGeneration() {
         switch activeBackend {
         case .llamaCpp: Task { await runner.requestCancel() }
@@ -2164,7 +2334,19 @@ class LLMManager: ObservableObject {
         if activeBackend == .llamaCpp {
             let dateFormatter = DateFormatter()
             dateFormatter.dateFormat = "EEEE, MMMM d, yyyy 'at' h:mm a"
-            let currentDateString = dateFormatter.string(from: Date())
+            // Rounded down to the nearest 15 minutes rather than the exact instant. This string
+            // sits at the very front of the system block, which is the very front of the whole
+            // prompt — and `LlamaRunner`'s KV-cache prefix reuse (see `residentTokens`) only
+            // engages when a turn's tokenized prompt is byte-identical to the previous turn's
+            // over its *entire* resident length. At minute precision this changed on essentially
+            // every real turn (any gap of a minute or more between messages), silently defeating
+            // reuse for ordinary back-and-forth chat every single time. Bucketing keeps it stable
+            // across a typical short exchange, which is what actually lets reuse fire, while
+            // staying far more precise than an assistant has any real need for.
+            let bucketSeconds: TimeInterval = 15 * 60
+            let bucketedNow = Date(timeIntervalSinceReferenceDate:
+                (Date().timeIntervalSinceReferenceDate / bucketSeconds).rounded(.down) * bucketSeconds)
+            let currentDateString = dateFormatter.string(from: bucketedNow)
             systemBlock += "Current Date and Time: \(currentDateString)\n\n"
             // This model (and quantization) has a strong, persistent tendency to open every
             // reply with meta-commentary about how it plans to respond — style/tone/vibe
@@ -2249,7 +2431,18 @@ class LLMManager: ObservableObject {
 
         let backend = activeBackend
 
-        Task {
+        // `cancelGeneration()` resets `isGenerating` (and requests actor cancellation) the
+        // instant it's called, but cooperative cancellation on the actor only takes effect at
+        // its next loop checkpoint — not instantly. A message sent in that narrow window used to
+        // reach the actor while it still considered itself busy from the just-cancelled call,
+        // get silently declined by its own `isBusyGenerating` guard, and complete with no
+        // response at all. Waiting for the previous generation's Task to actually finish before
+        // this one touches the actor closes that window without delaying the UI's own "stopped"
+        // state that `cancelGeneration()` already set.
+        let previousGenerationTask = currentGenerationTask
+        currentGenerationTask = Task {
+            await previousGenerationTask?.value
+
             var accumulated = ""
             var realPromptTokenCount = estimatedPromptTokens
 
@@ -2345,13 +2538,15 @@ class LLMManager: ObservableObject {
                 }
             }
 
-            // A decode failure tears the model down inside the actor (see
-            // `handleDecodeFailure`). Without this the app would keep showing a loaded model
-            // that can never answer again — which is exactly how this surfaced: "the model
-            // loaded but does not respond". `CoreMLRunner` has no equivalent fault-tracking —
-            // a Core ML prediction failure is caught and logged in-line in its own generation
-            // loop instead of tearing the model down, so there's nothing to consume here for it.
-            let faulted = backend == .llamaCpp ? await runner.consumeDecodeFault() : false
+            // A decode/prediction failure tears the model down inside its own actor (see
+            // `LlamaRunner.handleDecodeFailure` and both Core ML engines' `consumeDecodeFault()`).
+            // Without this the app would keep showing a loaded model that can never answer again —
+            // which is exactly how this surfaced: "the model loaded but does not respond".
+            let faulted: Bool
+            switch backend {
+            case .llamaCpp: faulted = await runner.consumeDecodeFault()
+            case .coreML:   faulted = await coreMLRunner.consumeDecodeFault()
+            }
 
             await MainActor.run {
                 isGenerating = false

@@ -59,6 +59,7 @@ nonisolated enum AppFiles {
         do {
             try data.write(to: url)
         } catch {
+            LogManager.shared.log("AppFiles: failed to write generated image \(fileName) — \(error.localizedDescription)")
             return nil
         }
         excludeFromBackup(url)

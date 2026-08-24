@@ -12,12 +12,16 @@ import Foundation
 /// - `ChunkedPipelineCoreMLEngine`: several already-compiled `.mlmodelc` models plus a KV-cache
 ///   shift model, orchestrated together (Llama 3.2 1B Instruct).
 protocol CoreMLEngine: Actor {
-    var isLoaded: Bool { get }
-
     func load(path: String) async throws
     func unload()
     func requestCancel()
 
+    /// `onThinkingProgress` mirrors `LlamaRunner`'s reasoning-token callback so `CoreMLRunner` can
+    /// dispatch to either backend family with one uniform call shape. As of this writing neither
+    /// Core ML conformer actually invokes it (confirmed by grepping the whole project — only
+    /// `LlamaRunner`'s llama.cpp path calls it); it stays part of the protocol anyway because
+    /// `CoreMLRunner.generateStream` forwards it by name to whichever engine is loaded, so
+    /// dropping the parameter here would also require changing `CoreMLRunner.swift`.
     func generateStream(
         messages: [(role: String, content: String)],
         maxTokens: Int,
@@ -29,4 +33,10 @@ protocol CoreMLEngine: Actor {
 
     func getContextWindowTokens() -> Int
     func getTrainedContextTokens() -> Int
+
+    /// Read-and-clear: `true` if a prediction failed since the last call, mirroring
+    /// `LlamaRunner.consumeDecodeFault()`. Without this, a Core ML backend that hits a prediction
+    /// failure kept reporting itself as loaded even though it could never produce another token —
+    /// the same "loaded but never responds" symptom `LlamaRunner`'s fault-tracking exists for.
+    func consumeDecodeFault() -> Bool
 }

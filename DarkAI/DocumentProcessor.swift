@@ -79,8 +79,11 @@ nonisolated class DocumentProcessor {
                 }
             }
             if fullText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                // PDF might be image-based, could run OCR on PDF pages here, but for now fallback
-                throw ProcessError.textExtractionFailed
+                // No text layer at all — a scanned/image-only PDF. Render each page to an image
+                // and run it through the same Vision OCR pipeline `performOCR(on:)` already
+                // provides for plain image attachments, rather than failing a document type
+                // Vision can perfectly well read.
+                return try await performOCR(onPDF: document)
             }
             return fullText
 
@@ -93,6 +96,48 @@ nonisolated class DocumentProcessor {
         default:
             throw ProcessError.unsupportedType
         }
+    }
+
+    /// Caps how many pages of a scanned PDF get OCR'd. Vision's `.accurate` recognition level is
+    /// real per-page work, and a long scanned document would otherwise turn one attachment into
+    /// minutes of processing — the same reasoning `RAGManager.maxDocumentCharacters` and
+    /// `StructuredImport.maxDocuments` already apply to other unbounded inputs on this app's
+    /// ingest paths.
+    private static let maxOCRPages = 20
+
+    /// Renders each page of an image-only PDF to a bitmap and runs it through the same
+    /// `performOCR(on:)` pipeline used for plain image attachments.
+    private static func performOCR(onPDF document: PDFDocument) async throws -> String {
+        let pageCount = min(document.pageCount, maxOCRPages)
+        guard pageCount > 0 else { throw ProcessError.textExtractionFailed }
+
+        var pageTexts: [String] = []
+        for i in 0..<pageCount {
+            guard let page = document.page(at: i) else { continue }
+            let bounds = page.bounds(for: .mediaBox)
+            guard bounds.width > 0, bounds.height > 0 else { continue }
+
+            // Rendered at 2x so text that's small relative to the page still OCRs cleanly.
+            let scale: CGFloat = 2
+            let renderSize = CGSize(width: bounds.width * scale, height: bounds.height * scale)
+            let image = UIGraphicsImageRenderer(size: renderSize).image { context in
+                UIColor.white.setFill()
+                context.fill(CGRect(origin: .zero, size: renderSize))
+                context.cgContext.translateBy(x: 0, y: renderSize.height)
+                context.cgContext.scaleBy(x: scale, y: -scale)
+                page.draw(with: .mediaBox, to: context.cgContext)
+            }
+
+            if let text = try? await performOCR(on: image) {
+                pageTexts.append("[Page \(i + 1)]\n" + text)
+            }
+        }
+
+        let combined = pageTexts.joined(separator: "\n\n")
+        guard !combined.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw ProcessError.textExtractionFailed
+        }
+        return combined
     }
 
     private static func performOCR(on image: UIImage) async throws -> String {

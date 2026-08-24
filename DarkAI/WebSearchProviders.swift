@@ -18,18 +18,26 @@ struct WebSearchResult {
 enum WebSearchProviderError: LocalizedError {
     case noResults
     case invalidResponse
+    /// A single provider took longer than `WebSearchManager`'s per-provider timeout to respond.
+    case timedOut
 
     var errorDescription: String? {
         switch self {
         case .noResults:       return "No results were found for that search."
         case .invalidResponse: return "The search provider returned something unexpected."
+        case .timedOut:        return "The search provider took too long to respond."
         }
     }
 }
 
 // MARK: - Provider protocol
 
-protocol WebSearchProvider {
+/// `Sendable` so a provider can be captured into the `@Sendable` closure
+/// `WebSearchManager.withTimeout` hands to `withThrowingTaskGroup` — every conforming type below
+/// is already a plain value type with no non-Sendable state (an empty struct, or one holding only
+/// a `String` API key), so this only formalizes what was already true rather than constraining
+/// anything.
+protocol WebSearchProvider: Sendable {
     /// `query` is a place name for `OpenMeteoProvider`, free text for the others — routing
     /// which provider gets called is `WebSearchManager`'s job, not this protocol's.
     func search(query: String) async throws -> WebSearchResult
@@ -40,7 +48,7 @@ protocol WebSearchProvider {
 /// `XMLParser` without this, so a 4xx/5xx or rate-limited response that happened to decode (or
 /// simply failed to decode) was indistinguishable in the log from an honest "no results," masking
 /// real outages/throttling.
-private func validateHTTPStatus(_ response: URLResponse) throws {
+private nonisolated func validateHTTPStatus(_ response: URLResponse) throws {
     guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
         throw WebSearchProviderError.invalidResponse
     }
@@ -53,7 +61,7 @@ private func validateHTTPStatus(_ response: URLResponse) throws {
 /// current conditions. No API key, no account — but its CC-BY 4.0 data license does require
 /// attribution, which is why the source below always reads "Weather data by Open-Meteo.com"
 /// rather than being omitted like a typical search result would be.
-struct OpenMeteoProvider: WebSearchProvider {
+nonisolated struct OpenMeteoProvider: WebSearchProvider {
 
     private struct GeocodeResponse: Decodable {
         struct Result: Decodable {
@@ -191,7 +199,7 @@ struct OpenMeteoProvider: WebSearchProvider {
 /// not full web search, so it frequently comes back empty for anything past a simple factual
 /// question. That's surfaced as `.noResults` rather than a synthesized-sounding empty answer, so
 /// the caller can be honest with the user about the gap instead of pretending nothing was asked.
-struct DuckDuckGoInstantAnswerProvider: WebSearchProvider {
+nonisolated struct DuckDuckGoInstantAnswerProvider: WebSearchProvider {
 
     private struct Response: Decodable {
         var AbstractText: String?
@@ -365,7 +373,7 @@ nonisolated struct GoogleNewsProvider: WebSearchProvider {
 /// It is an encyclopedia, not a search index: it answers "what/who/where is X" well and cannot
 /// answer "what happened today" at all. That gap is real and is why the optional Brave key
 /// exists — see `WebSearchManager.generalSearch` for the order these are tried in.
-struct WikipediaProvider: WebSearchProvider {
+nonisolated struct WikipediaProvider: WebSearchProvider {
 
     private struct Response: Decodable {
         struct Page: Decodable {
@@ -444,7 +452,7 @@ struct WikipediaProvider: WebSearchProvider {
 /// in Settings — no key is ever bundled with the app; see `KeychainStore`. REST/JSON with a
 /// single header for auth, which is why this is the one "bring your own key" integration this
 /// app ships rather than a provider-agnostic plugin system.
-struct BraveSearchProvider: WebSearchProvider {
+nonisolated struct BraveSearchProvider: WebSearchProvider {
     let apiKey: String
 
     private struct Response: Decodable {
@@ -471,9 +479,7 @@ struct BraveSearchProvider: WebSearchProvider {
         request.setValue(apiKey, forHTTPHeaderField: "X-Subscription-Token")
 
         let (data, response) = try await URLSession.shared.data(for: request)
-        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-            throw WebSearchProviderError.invalidResponse
-        }
+        try validateHTTPStatus(response)
         let decoded = try JSONDecoder().decode(Response.self, from: data)
         guard let results = decoded.web?.results, !results.isEmpty else {
             throw WebSearchProviderError.noResults

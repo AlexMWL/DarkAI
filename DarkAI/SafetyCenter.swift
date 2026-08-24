@@ -51,8 +51,12 @@ final class ContentReportManager: ObservableObject {
     }
 
     private func save() {
-        guard let encoded = try? JSONEncoder().encode(reports) else { return }
-        UserDefaults.standard.set(encoded, forKey: storageKey)
+        do {
+            let encoded = try JSONEncoder().encode(reports)
+            UserDefaults.standard.set(encoded, forKey: storageKey)
+        } catch {
+            LogManager.shared.log("ContentReportManager: failed to encode \(reports.count) reports for save — \(error.localizedDescription)")
+        }
     }
 
     func file(reason: String, note: String, content: String, modelName: String, wasImage: Bool) -> ContentReport {

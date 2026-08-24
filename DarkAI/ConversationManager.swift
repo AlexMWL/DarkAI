@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import UIKit // Background/terminate lifecycle notifications for `flushPendingSave()`.
 
 /// `nonisolated` because these are pure value types that have to be readable away from the UI:
 /// `ConversationExport` encodes a whole transcript — potentially with embedded image data — off
@@ -53,9 +54,32 @@ nonisolated struct Conversation: Identifiable, Codable, Equatable {
     var isPrivate: Bool = false
 }
 
+/// Loads and decodes an array of `T` from `UserDefaults`, logging through `LogManager` and
+/// returning `nil` when the key holds bytes that exist but fail to decode — the shared shape
+/// behind `ConversationManager.loadConversations`, `RAGManager.loadDocuments`, and
+/// `MemoryManager.loadMemories`, which otherwise each hand-rolled the same "try to decode, and if
+/// there's data but it didn't decode, say so instead of silently discarding it" sequence.
+///
+/// Returns `nil` for both "nothing stored yet" and "stored but undecodable" alike. A caller that
+/// needs to tell those two apart — `ConversationManager` picks a different seeding behaviour for
+/// each, `MemoryManager` only attempts its legacy-key migration for the former — checks
+/// `UserDefaults.standard.data(forKey:)` itself for that, same as it would have to either way.
+func loadOrLog<T: Decodable>(key: String, itemDescription: String) -> [T]? {
+    guard let data = UserDefaults.standard.data(forKey: key) else { return nil }
+    guard let decoded = try? JSONDecoder().decode([T].self, from: data) else {
+        LogManager.shared.log("\(itemDescription) (\(data.count) bytes) failed to decode — starting fresh rather than losing it silently")
+        return nil
+    }
+    return decoded
+}
+
 class ConversationManager: ObservableObject {
     @Published var conversations: [Conversation] = []
     @Published var activeConversationId: UUID? = nil
+
+    /// True for exactly one check after a fresh install (or unreadable stored data) seeds the
+    /// Welcome conversation — see `consumeJustSeededWelcome()`.
+    @Published private(set) var justSeededWelcome = false
 
     /// Marks the active conversation as private — it stays in memory and is dropped when the
     /// app quits.
@@ -83,30 +107,73 @@ class ConversationManager: ObservableObject {
 
     private let storageKey = "DarkAI_Conversations"
 
+    /// Serializes conversation-corpus encode+write work off the main actor, in call order, so two
+    /// overlapping `persist()` calls (e.g. a streamed token update followed immediately by another)
+    /// can't race and let a stale snapshot's write land after a fresher one's. Mirrors
+    /// `RAGManager.saveDocuments()`'s `saveQueue`.
+    private static let saveQueue = DispatchQueue(label: "com.darkai.conversationmanager.save", qos: .utility)
+
+    /// Kept alive for the lifetime of `ConversationManager` so `NotificationCenter` doesn't drop
+    /// them. Mirrors `RAGManager.lifecycleObservers`.
+    private var lifecycleObservers: [NSObjectProtocol] = []
+
     init() {
         loadConversations()
+        observeLifecycleForFlush()
+    }
+
+    deinit {
+        let center = NotificationCenter.default
+        lifecycleObservers.forEach { center.removeObserver($0) }
+    }
+
+    /// `persist()` queues its encode+write onto `saveQueue` and returns immediately — right for
+    /// the common case, but a message saved right before the app is suspended or killed could
+    /// have its write silently dropped if suspension lands in the gap between enqueueing it and
+    /// the queue actually running it. Forces any pending write through first in exactly that
+    /// window. Mirrors `RAGManager.observeLifecycleForFlush()`/`flushPendingSave()`, added there
+    /// for the identical reason.
+    private func observeLifecycleForFlush() {
+        let center = NotificationCenter.default
+        for name in [UIApplication.willResignActiveNotification, UIApplication.willTerminateNotification] {
+            let token = center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                // These notifications are documented to always fire on the main thread — the
+                // compiler just has no static way to know that, hence the assist rather than an
+                // `await` hop that could let the app finish suspending before this runs.
+                MainActor.assumeIsolated {
+                    self?.flushPendingSave()
+                }
+            }
+            lifecycleObservers.append(token)
+        }
+    }
+
+    /// Blocks until every `persist()` write already queued has actually run. `saveQueue` is
+    /// serial, so a synchronous no-op submitted after them only returns once they have.
+    private func flushPendingSave() {
+        Self.saveQueue.sync {}
     }
 
     func loadConversations() {
-        if let data = UserDefaults.standard.data(forKey: storageKey) {
-            if let decoded = try? JSONDecoder().decode([Conversation].self, from: data) {
-                self.conversations = decoded
-                if let first = decoded.first {
-                    self.activeConversationId = first.id
-                }
-                return
+        // Checked up front, separately from `loadOrLog`'s own "was there data at all" check,
+        // because the two failure paths below need different seeding behaviour: a fresh install
+        // gets its Welcome chat persisted immediately, but corrupt existing bytes don't, so the
+        // raw data survives on disk in case it's worth inspecting later.
+        let hadStoredData = UserDefaults.standard.data(forKey: storageKey) != nil
+        if let decoded: [Conversation] = loadOrLog(key: storageKey, itemDescription: "ConversationManager: stored conversations") {
+            self.conversations = decoded
+            if let first = decoded.first {
+                self.activeConversationId = first.id
             }
-            // Data existed but couldn't be decoded, e.g. a future non-additive schema change.
-            // Seeding a fresh Welcome conversation below is still the only way to leave the app
-            // in a usable state, but this used to also immediately overwrite the corrupt bytes
-            // via `saveConversations()`, destroying any chance of inspecting or recovering them.
-            // Not persisting here (the in-memory Welcome chat renders fine either way) keeps the
-            // raw data around until the next real save happens naturally.
-            LogManager.shared.log("ConversationManager: found \(data.count) bytes of stored conversations but failed to decode them — starting fresh rather than losing them silently")
-            seedWelcomeConversation(persisting: false)
-        } else {
-            seedWelcomeConversation(persisting: true)
+            return
         }
+        // Data existed but couldn't be decoded (already logged by `loadOrLog`), e.g. a future
+        // non-additive schema change — or there was never any data to begin with. Seeding a
+        // fresh Welcome conversation is the only way to leave the app in a usable state either
+        // way, but only the "never had data" case should persist it immediately; corrupt bytes
+        // used to be overwritten right away by `saveConversations()`, destroying any chance of
+        // recovering them, so that case leaves them on disk until the next real save happens.
+        seedWelcomeConversation(persisting: !hadStoredData)
     }
 
     private func seedWelcomeConversation(persisting: Bool) {
@@ -118,18 +185,44 @@ class ConversationManager: ObservableObject {
         )
         self.conversations = [firstChat]
         self.activeConversationId = firstChat.id
+        justSeededWelcome = true
         if persisting { saveConversations() }
+    }
+
+    /// One-shot read of `justSeededWelcome`, clearing it in the same call. Without this,
+    /// `ContentView.openOrReuseConversation()` — which only ever reuses a conversation with zero
+    /// messages — never recognizes the freshly seeded Welcome chat as reusable, since it always
+    /// has its one welcome message. Left unchecked, that meant the very first thing that happened
+    /// after a clean install was a brand-new blank chat silently replacing Welcome as active,
+    /// before the user ever saw it. Consuming the flag (rather than leaving it `true`) matters
+    /// too: `openOrReuseConversation()` also runs from the drawer's "+" button, which must still
+    /// create a real new chat rather than keep bouncing back to Welcome for the rest of the
+    /// session.
+    func consumeJustSeededWelcome() -> Bool {
+        defer { justSeededWelcome = false }
+        return justSeededWelcome
     }
 
     func saveConversations() {
         persist()
     }
 
-    /// Writes everything except conversations flagged private.
+    /// Writes everything except conversations flagged private. This used to `JSONEncoder().encode`
+    /// the whole filtered array synchronously, inline — called on nearly every message sent or
+    /// streamed, across every saved conversation, with no cap on how large that history grows. A
+    /// snapshot is taken here, on whichever actor called this (always main, since `conversations`
+    /// is `@Published`), and the actual encode+write happens on `saveQueue` — mirrors
+    /// `RAGManager.saveDocuments()`, which got this same treatment for the same reason.
     private func persist() {
         let persistable = conversations.filter { !$0.isPrivate }
-        if let encoded = try? JSONEncoder().encode(persistable) {
-            UserDefaults.standard.set(encoded, forKey: storageKey)
+        let key = storageKey
+        Self.saveQueue.async {
+            do {
+                let encoded = try JSONEncoder().encode(persistable)
+                UserDefaults.standard.set(encoded, forKey: key)
+            } catch {
+                LogManager.shared.log("ConversationManager: failed to encode \(persistable.count) conversations for save — \(error.localizedDescription)")
+            }
         }
     }
 

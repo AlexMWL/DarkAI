@@ -178,7 +178,8 @@ enum CrashReporter {
         // deletion at the bottom of this function.
         var hasSignalFileToClear = false
 
-        if let raw = try? String(contentsOf: signalReportURL, encoding: .utf8), !raw.isEmpty {
+        let rawSignalContents = try? String(contentsOf: signalReportURL, encoding: .utf8)
+        if let raw = rawSignalContents, !raw.isEmpty {
             let lines = raw.components(separatedBy: "\n")
             let header = lines.first ?? "Unknown"
             let parts = header.components(separatedBy: "|")
@@ -197,24 +198,38 @@ enum CrashReporter {
             )
             hasSignalFileToClear = true
 
-        } else if !cleanExit {
-            // No signal, no exception, but the app never shut down cleanly. On iOS that is
-            // overwhelmingly the kernel reclaiming memory.
-            report = Report(
-                date: Date(),
-                kind: "Unexpected termination",
-                reason: lastMemoryMB > 0 && lastMemoryMB < 600
-                    ? "The app was closed by iOS, most likely because it ran out of memory."
-                    : "The app closed without shutting down normally.",
-                stack: [],
-                appVersion: AppInfo.versionString,
-                osVersion: "\(UIDevice.current.systemName) \(UIDevice.current.systemVersion)",
-                deviceModel: deviceIdentifier(),
-                availableMemoryMB: lastMemoryMB,
-                lastActivity: lastActivity,
-                chatModel: chatModel,
-                diffusionModel: diffusionModel
-            )
+        } else {
+            if rawSignalContents != nil {
+                // The file exists (readable, hence non-nil) but came back empty — most likely the
+                // signal handler's `open()` under `O_EXCL` succeeded but the `write()`/
+                // `backtrace_symbols_fd` that followed it didn't (disk-full mid-crash is a
+                // realistic condition for a multi-GB-model app). There's no report to recover
+                // from an empty file, but it still has to go: left in place, it would permanently
+                // block `O_EXCL` on every future crash, silently downgrading every one of them to
+                // the generic "unexpected termination" inference below instead of a real stack
+                // trace.
+                try? FileManager.default.removeItem(at: signalReportURL)
+            }
+
+            if !cleanExit {
+                // No signal, no exception, but the app never shut down cleanly. On iOS that is
+                // overwhelmingly the kernel reclaiming memory.
+                report = Report(
+                    date: Date(),
+                    kind: "Unexpected termination",
+                    reason: lastMemoryMB > 0 && lastMemoryMB < 600
+                        ? "The app was closed by iOS, most likely because it ran out of memory."
+                        : "The app closed without shutting down normally.",
+                    stack: [],
+                    appVersion: AppInfo.versionString,
+                    osVersion: "\(UIDevice.current.systemName) \(UIDevice.current.systemVersion)",
+                    deviceModel: deviceIdentifier(),
+                    availableMemoryMB: lastMemoryMB,
+                    lastActivity: lastActivity,
+                    chatModel: chatModel,
+                    diffusionModel: diffusionModel
+                )
+            }
         }
 
         guard let report else { return }
@@ -274,7 +289,10 @@ enum CrashReporter {
         NSSetUncaughtExceptionHandler { exception in
             // Not in a signal context here, so ordinary Swift is safe to use.
             let name = exception.name.rawValue
-            let reason = exception.reason ?? "No reason given"
+            // `recoverPreviousRun` splits the header on "|" and takes `parts[1]` as the reason —
+            // an exception reason that itself contains a "|" (not implausible: NSException
+            // reasons often embed formatted values) would silently truncate at the first one.
+            let reason = (exception.reason ?? "No reason given").replacingOccurrences(of: "|", with: "/")
             let stack = exception.callStackSymbols.prefix(40).joined(separator: "\n")
             let payload = "Uncaught exception (\(name))|\(reason)\n\(stack)"
             try? payload.write(to: CrashReporter.signalReportURL, atomically: true, encoding: .utf8)
@@ -287,7 +305,13 @@ enum CrashReporter {
         // `backtrace_symbols_fd`, both of which are safe to call from a signal handler.
         let handler: @convention(c) (Int32) -> Void = { signalNumber in
             let path = CrashReporter.signalReportPathBuffer
-            let fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+            // O_EXCL, not O_TRUNC: an uncaught NSException writes its (more specific) report here
+            // via `installExceptionHandler` and then calls `abort()`, which raises exactly the
+            // SIGABRT this handler catches next, in the same crash. O_TRUNC would silently
+            // overwrite that report with this handler's generic "app aborted" message a moment
+            // later. O_EXCL makes `open` fail instead when the file already exists, so whichever
+            // handler runs first keeps its report; this one is simply a no-op for the write below.
+            let fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0o644)
             if fd >= 0 {
                 let name = CrashReporter.signalName(signalNumber)
                 _ = name.withCString { write(fd, $0, strlen($0)) }

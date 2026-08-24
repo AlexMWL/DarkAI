@@ -21,11 +21,14 @@ nonisolated enum AppInfo {
     /// changes materially — version 2 added on-device crash reporting and the opt-in diagnostic
     /// log attachment; version 3 added the opt-in Internet Access feature (`WebSearchManager`),
     /// which is the app's first code path that can send anything — a search query, and only a
-    /// search query — off the device. Both are disclosures a user who agreed to an earlier
-    /// version hasn't seen.
+    /// search query — off the device; version 4 added the opt-in Web Portal (`WebPortalManager`),
+    /// which is the app's first code path that lets another device on the same Wi-Fi network read
+    /// and send conversations, gated by a PIN, and which remembers an unlocked browser with a
+    /// cookie stored on this device. Every version bump here is a disclosure a user who agreed to
+    /// an earlier version hasn't seen.
     /// Users who accepted an older version are re-prompted on next launch — Apple requires an
     /// affirmative agreement to the *current* terms for UGC/AI apps.
-    static let policyVersion = 3
+    static let policyVersion = 4
 
     // MARK: - Support & reporting (REQUIRED)
 
@@ -132,6 +135,8 @@ nonisolated enum LegalText {
     • Model files you download or import.
     • Diagnostic logs.
     • Crash reports (see below).
+    • If you've ever turned on Web Portal, the list of browsers it remembers — an editable name \
+      and a per-browser identifier, described below.
 
     All of the above is stored in this app's private container. It is excluded from iCloud backup \
     to avoid consuming your iCloud storage with multi-gigabyte model files. Deleting the app \
@@ -179,6 +184,40 @@ nonisolated enum LegalText {
       download is between you and its host. Turning Internet Access off, or simply declining an \
       individual search offer, means nothing about that message ever leaves your device.
 
+    WEB PORTAL (off by default)
+
+    Turned on in Settings → Web Portal. When on, \(AppInfo.displayName) serves its interface over \
+    your local Wi-Fi network, so you can keep using it from a browser on another device on that \
+    same network — a laptop, for instance. It only works on your local network: there is no \
+    internet-facing server, and a device on a different network cannot reach it no matter what.
+
+    Beyond chatting, a connected browser can view and change the same settings you'd otherwise \
+    change on your phone: custom system instructions; whether RAG and conversational memories are \
+    on, and the extracted memories themselves, viewable and individually removable; whether \
+    Internet Access is on, and your Brave Search API key; your personality profile's status, and \
+    resetting it; response feedback, viewable and removable; and which installed model is loaded, \
+    including switching or unloading it. It cannot download or import a new model, generate \
+    images, or upload a file — those still require the app itself. None of this is sent to us; it \
+    only lets a browser that already has the PIN do remotely what you could otherwise do by \
+    picking up the phone.
+
+    Access requires the PIN shown in Settings → Web Portal. Once a browser enters that PIN \
+    correctly, the app remembers it using a cookie stored in that browser, so it will not be asked \
+    for the PIN again — this recognition happens entirely between your phone and that browser; \
+    nothing about it is sent to us or to any third party. Every remembered browser is listed in \
+    Settings → Web Portal, where you can rename or remove it at any time; removing one means that \
+    browser needs the PIN again. Regenerating the PIN forgets every remembered browser at once.
+
+    This traffic, including the PIN and the remembered-browser cookie, is plain HTTP rather than \
+    HTTPS — it never leaves your Wi-Fi network, but it is not encrypted in transit. Only use Web \
+    Portal on a Wi-Fi network you trust, keep the PIN to yourself, and turn it off in Settings \
+    when you don't need it running.
+
+    A conversation, memory, or setting reached through Web Portal is the same data described \
+    elsewhere in this policy — using it from a browser does not change where that data lives or \
+    send it anywhere new; it only displays or changes it, on your own network, for whichever \
+    browsers hold that PIN or a remembered cookie.
+
     NO ANALYTICS
 
     The app contains no analytics SDK, no advertising SDK, no third-party crash reporting service, \
@@ -203,7 +242,8 @@ nonisolated enum LegalText {
     YOUR CONTROL
 
     Clear conversations, memories, learned personality data, and diagnostic logs at any time from \
-    Settings. Deleting the app removes everything.
+    Settings. Turn Web Portal off, or remove any remembered browser individually, from Settings → \
+    Web Portal. Deleting the app removes everything.
 
     CONTACT
 

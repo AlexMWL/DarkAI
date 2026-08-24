@@ -62,21 +62,21 @@ class MemoryManager: ObservableObject {
     // MARK: - Persistence
 
     func loadMemories() {
-        if let data = UserDefaults.standard.data(forKey: storageKey) {
-            if let decoded = try? JSONDecoder().decode([Memory].self, from: data) {
-                memories = decoded
-                return
-            }
-            // Data existed but couldn't be decoded, e.g. a future non-additive schema change.
-            // Falling through to an empty list is still the only real option, but doing so with
-            // no trace at all is what turns a legitimate schema change into what reads as
-            // inexplicable, silent data loss. Raw bytes left in place at `storageKey` rather than
-            // cleared, in case they're worth inspecting later — the legacy migration below is
-            // skipped either way, since `data` being present at all means this device has already
-            // migrated past the legacy key once.
-            LogManager.shared.log("MemoryManager: found \(data.count) bytes of stored memories but failed to decode them — starting fresh rather than losing them silently")
+        // Checked separately from `loadOrLog`'s own presence check: the legacy-key migration
+        // below must run only when this key has genuinely never held data, not when it held data
+        // that merely failed to decode (`data` existing at all, even corrupt, proves this device
+        // already migrated past the legacy key once — re-migrating would be wrong).
+        let hadStoredData = UserDefaults.standard.data(forKey: storageKey) != nil
+        if let decoded: [Memory] = loadOrLog(key: storageKey, itemDescription: "MemoryManager: stored memories") {
+            memories = decoded
             return
         }
+        // Data existed but couldn't be decoded (already logged by `loadOrLog`), e.g. a future
+        // non-additive schema change. Falling through to an empty list is still the only real
+        // option, but the legacy migration below must not run in this case — see the comment
+        // above `hadStoredData`.
+        guard !hadStoredData else { return }
+
         // One-time migration from the flat string list. Everything comes across as a preference
         // with no slot — the old format carried no way to tell identity from small talk.
         if let legacy = UserDefaults.standard.stringArray(forKey: legacyStorageKey) {
@@ -87,8 +87,12 @@ class MemoryManager: ObservableObject {
     }
 
     func saveMemories() {
-        guard let encoded = try? JSONEncoder().encode(memories) else { return }
-        UserDefaults.standard.set(encoded, forKey: storageKey)
+        do {
+            let encoded = try JSONEncoder().encode(memories)
+            UserDefaults.standard.set(encoded, forKey: storageKey)
+        } catch {
+            LogManager.shared.log("MemoryManager: failed to encode \(memories.count) memories for save — \(error.localizedDescription)")
+        }
     }
 
     // MARK: - Mutation
@@ -258,7 +262,7 @@ class MemoryManager: ObservableObject {
     private static func clauses(in message: String) -> [String] {
         let sentences = message.components(separatedBy: CharacterSet(charactersIn: ".!?\n"))
         var result: [String] = []
-        for sentence in sentences {
+        sentenceLoop: for sentence in sentences {
             let trimmed = sentence.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { continue }
             result.append(trimmed)
@@ -272,7 +276,12 @@ class MemoryManager: ObservableObject {
                     let tail = trimmed[range.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
                     if tail.count > 5 { result.append(tail) }
                     searchStart = range.upperBound
-                    if result.count > 40 { break }   // pathological input guard
+                    // Pathological input guard — bounds the total clause count across every
+                    // sentence and separator. A bare `break` here only ever exited the innermost
+                    // `while`, leaving the `for separator` and outer `for sentence` loops free to
+                    // keep appending, so the cap this comment describes never actually applied to
+                    // the whole message the way it reads. The label makes it exit all three.
+                    if result.count > 40 { break sentenceLoop }
                 }
             }
         }
@@ -303,16 +312,32 @@ class MemoryManager: ObservableObject {
                        slot: String? = nil,
                        format: (String) -> String?) {
         for prefix in prefixes {
-            guard lower.hasPrefix(prefix) else { continue }
-            let remainder = String(original.dropFirst(prefix.count))
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .trimmingCharacters(in: CharacterSet(charactersIn: ".!?,;"))
-            guard !remainder.isEmpty, remainder.count < 120 else { return }
+            guard let remainder = Self.remainderAfterPrefix(lower, original, prefix: prefix, maxLength: 120) else { continue }
             if let formatted = format(remainder) {
                 addMemory(formatted, kind: kind, slot: slot)
             }
             return
         }
+    }
+
+    /// If `lower` (a lowercased copy of `original`) starts with `prefix`, returns whatever
+    /// follows it in `original`, trimmed of surrounding whitespace and light punctuation — or
+    /// `nil` if `lower` doesn't start with `prefix`, or the remainder is empty or `maxLength` or
+    /// longer.
+    ///
+    /// Shared with `PersonalityManager.analyzeAssistantMessage`, which does the identical
+    /// "prefix matched, extract and trim what's left, hand it to a per-trigger format closure"
+    /// step for the model's own stated likes/dislikes — everything downstream of the remainder
+    /// (what `Memory.Kind`/slot it becomes here, versus a prose line appended to a personality
+    /// profile there) differs enough between the two that only this shared inner step, not the
+    /// whole `match` above, was worth factoring out.
+    static func remainderAfterPrefix(_ lower: String, _ original: String, prefix: String, maxLength: Int) -> String? {
+        guard lower.hasPrefix(prefix) else { return nil }
+        let remainder = String(original.dropFirst(prefix.count))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: ".!?,;"))
+        guard !remainder.isEmpty, remainder.count < maxLength else { return nil }
+        return remainder
     }
 
     // MARK: - Prompt rendering

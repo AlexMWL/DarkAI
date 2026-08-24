@@ -13,6 +13,7 @@ struct SettingsView: View {
     @ObservedObject var personalityManager: PersonalityManager
     @ObservedObject var diffusionManager: DiffusionManager
     @ObservedObject var webSearchManager: WebSearchManager
+    @ObservedObject var feedbackManager: FeedbackManager
 
     @Binding var customInstructions: String
     @Binding var enableRAG: Bool
@@ -24,6 +25,7 @@ struct SettingsView: View {
     @ObservedObject private var downloads = ModelDownloadManager.shared
     @ObservedObject private var appearance = AppearanceManager.shared
     @ObservedObject private var inventory = ModelInventory.shared
+    @ObservedObject private var webPortal = WebPortalManager.shared
 
     @State private var importedModels: [URL] = []
     @State private var importedCoreMLModels: [URL] = []
@@ -32,6 +34,63 @@ struct SettingsView: View {
     @State private var isImporting = false
     @State private var importProgress = ""
     @State private var showResetPersonalityAlert = false
+    @State private var showClearMemoriesAlert = false
+    @State private var showClearFeedbackAlert = false
+    @State private var showFeedbackDetail = false
+    /// In-progress rename text for a remembered Web Portal device, keyed by `WebPortalDevice.id`.
+    /// Only entries actually being edited exist here — everything else reads `device.name` directly.
+    @State private var webPortalDeviceNameDrafts: [String: String] = [:]
+
+    /// Captured from the main `ScrollView`'s own `ScrollViewReader` via `.onAppear` — see
+    /// `sectionJumpBar()`'s doc comment for why the jump bar reads this instead of taking a
+    /// proxy directly.
+    @State private var jumpProxy: ScrollViewProxy? = nil
+
+    /// A destructive action awaiting the user's confirmation — shared by every "delete this
+    /// installed model" / "discard this partial download" button in the file so they follow the
+    /// same confirm-before-destroying pattern `showResetPersonalityAlert` already established,
+    /// without each row needing its own `@State` flag.
+    private enum PendingDeletion: Identifiable {
+        case llmModel(URL)
+        case coreMLModel(URL)
+        case diffusionModel(URL)
+        case partialDownload(CatalogModel)
+
+        var id: String {
+            switch self {
+            case .llmModel(let url): return "llm-\(url.path)"
+            case .coreMLModel(let url): return "coreml-\(url.path)"
+            case .diffusionModel(let url): return "diffusion-\(url.path)"
+            case .partialDownload(let model): return "partial-\(model.id)"
+            }
+        }
+
+        var label: String {
+            switch self {
+            case .llmModel(let url), .coreMLModel(let url), .diffusionModel(let url):
+                return url.lastPathComponent
+            case .partialDownload(let model):
+                return model.displayName
+            }
+        }
+
+        var message: String {
+            switch self {
+            case .llmModel, .coreMLModel, .diffusionModel:
+                return "Delete \"\(label)\"? You'll need to download or import it again to use it."
+            case .partialDownload:
+                return "Discard the partial download of \"\(label)\"? The bytes already fetched will be deleted, and resuming will start over from the beginning."
+            }
+        }
+
+        var confirmTitle: String {
+            switch self {
+            case .partialDownload: return "Discard"
+            default: return "Delete"
+            }
+        }
+    }
+    @State private var pendingDeletion: PendingDeletion? = nil
 
     // Diffusion model import
     @State private var importedDiffusionModels: [URL] = []
@@ -57,323 +116,99 @@ struct SettingsView: View {
     @State private var failsafeRequiredRAM = 0.0
     @State private var isFailsafeWarningOnly = false
     
+    /// Section anchors for the jump bar below the nav title — `(id, chip title)` pairs, in the
+    /// order the chips are shown. Grouped by what's actually on screen rather than one chip per
+    /// card: the three model cards (LLM / Core ML / Diffusion) share one "Models" chip, and
+    /// "Diagnostics" lands on Troubleshooting-and-Diagnostics since the two sit back to back.
+    private static let jumpSections: [(id: String, title: String)] = [
+        ("section-models", "Models"),
+        ("section-llm-settings", "LLM Settings"),
+        ("section-rag", "RAG"),
+        ("section-memory", "Memory"),
+        ("section-internet", "Internet"),
+        ("section-webportal", "Web Portal"),
+        ("section-personality", "Personality"),
+        ("section-diagnostics", "Diagnostics"),
+        ("section-appearance", "Appearance"),
+        ("section-safety", "Safety & Legal"),
+    ]
+
+    /// Compact horizontal chip row so a 14-card scroll view has some in-page navigation. A
+    /// deliberately small addition — see the call site's comment — not a restructure of the
+    /// screen into a `List`/`Form`.
+    ///
+    /// Takes no `ScrollViewProxy` directly — reads `jumpProxy` instead. `ScrollViewReader`
+    /// wrapping this row *and* the main `ScrollView` as two sibling scroll views (the documented
+    /// "wrap a ScrollView plus an external trigger" pattern, just with the trigger being a
+    /// `ScrollView(.horizontal)` itself instead of a plain `Button`) reliably produced a proxy
+    /// whose `scrollTo` silently did nothing — no crash, no animation, just no scroll — while
+    /// every symptom pointed at the tap itself registering fine. Capturing the proxy from a
+    /// `ScrollViewReader` that wraps *only* the main `ScrollView` (see `body`) and reading it here
+    /// as plain state sidesteps whatever that interaction was, at the cost of one nil check for
+    /// the single frame before `.onAppear` runs.
+    @ViewBuilder
+    private func sectionJumpBar() -> some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(Self.jumpSections, id: \.id) { section in
+                    Text(section.title)
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundColor(Theme.textSecondary)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .background(Capsule().fill(Theme.border.opacity(0.35)))
+                        .overlay(Capsule().stroke(Theme.border, lineWidth: 1))
+                        .contentShape(Capsule())
+                        // A plain `Button` here consistently loses tap-vs-drag disambiguation to
+                        // `ScrollView(.horizontal)`'s own pan gesture — even with `.buttonStyle(.plain)`
+                        // — so the chip row just nudges sideways under a tap. `.highPriorityGesture`
+                        // wins against the ancestor ScrollView's gesture recognizer outright instead
+                        // of leaving disambiguation to SwiftUI's default (loser-takes-nothing).
+                        .highPriorityGesture(
+                            TapGesture().onEnded {
+                                guard let jumpProxy else { return }
+                                withAnimation { jumpProxy.scrollTo(section.id, anchor: .top) }
+                            }
+                        )
+                        // The `highPriorityGesture` tap above makes this chip actionable, but a
+                        // plain `Text` carries no semantics saying so — VoiceOver read it as inert
+                        // static text, making the only in-page navigation aid on this ~2,900-line
+                        // screen unusable without sight.
+                        .accessibilityAddTraits(.isButton)
+                        .accessibilityLabel("Jump to \(section.title.capitalized)")
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
+        }
+        .background(Theme.chrome)
+        .overlay(Rectangle().frame(height: 1).foregroundColor(Theme.border), alignment: .bottom)
+    }
+
     var body: some View {
         NavigationView {
             ZStack {
                 Theme.background
                     .ignoresSafeArea()
-                
+
+                VStack(spacing: 0) {
+                sectionJumpBar()
+                ScrollViewReader { proxy in
                 ScrollView {
                     VStack(spacing: 24) {
 
                         missingModelsBanner
 
-                        VStack(alignment: .leading, spacing: 14) {
-                            HStack {
-                                Image(systemName: "cpu")
-                                    .foregroundColor(Theme.accentCyan)
-                                    .font(.headline)
-                                Text("LOCAL LLM MODELS")
-                                    .font(.system(size: 14, weight: .bold))
-                                    .foregroundColor(Theme.textPrimary)
-                                    .kerning(1.2)
-                                Spacer()
-                                Button(action: { showModelImporter = true }) {
-                                    HStack(spacing: 6) {
-                                        Image(systemName: "plus")
-                                        Text("Import .gguf")
-                                    }
-                                    .font(.system(size: 12, weight: .bold))
-                                    .foregroundColor(Theme.onAccent)
-                                    .padding(.horizontal, 12)
-                                    .padding(.vertical, 6)
-                                    .background(
-                                        RoundedRectangle(cornerRadius: 8)
-                                            .fill(LinearGradient(colors: [Theme.accent, Theme.accentCyan], startPoint: .leading, endPoint: .trailing))
-                                    )
-                                }
-                            }
-                            
-                            if importedModels.isEmpty {
-                                Text("No models installed yet. Download one below, or import a .gguf file you already have.")
-                                    .font(.system(size: 13))
-                                    .foregroundColor(Theme.textSecondary)
-                                    .padding()
-                                    .frame(maxWidth: .infinity, alignment: .center)
-                                    .glassCard(cornerRadius: 12)
-                            } else {
-                                VStack(spacing: 12) {
-                                    ForEach(importedModels, id: \.self) { url in
-                                        modelRow(for: url)
-                                    }
-                                }
-                            }
+                        // `.id(...)` anchors below are the jump bar's scroll targets — see
+                        // `sectionJumpBar`. One anchor per chip; "Models" and "Diagnostics" each
+                        // cover a short run of back-to-back cards, so the anchor sits on the first
+                        // card in that run rather than on every card in it.
+                        localLlmModelsCard
+                            .id("section-models")
 
-                            Divider().background(Theme.border)
+                        coreMLModelsCard
 
-                            VStack(alignment: .leading, spacing: 10) {
-                                Text("DOWNLOAD A CHAT MODEL")
-                                    .font(.system(size: 11, weight: .bold))
-                                    .foregroundColor(Theme.textSecondary)
-                                    .kerning(1.0)
-                                downloadCatalogButton(for: .chat)
-                            }
-
-                            if isImporting {
-                                HStack {
-                                    ProgressView()
-                                        .progressViewStyle(CircularProgressViewStyle(tint: Theme.accentCyan))
-                                    Text(importProgress)
-                                        .font(.system(size: 13, weight: .medium))
-                                        .foregroundColor(Theme.textPrimary)
-                                        .padding(.leading, 8)
-                                    Spacer()
-                                }
-                                .padding()
-                                .background(Theme.background)
-                                .cornerRadius(12)
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 12)
-                                        .stroke(Theme.accentCyan.opacity(0.3), lineWidth: 1)
-                                )
-                            }
-                        }
-                        .glassCard(cornerRadius: 16)
-
-                        VStack(alignment: .leading, spacing: 14) {
-                            HStack {
-                                Image(systemName: "cpu.fill")
-                                    .foregroundColor(Theme.accentCyan)
-                                    .font(.headline)
-                                Text("CORE ML MODELS (ANE)")
-                                    .font(.system(size: 14, weight: .bold))
-                                    .foregroundColor(Theme.textPrimary)
-                                    .kerning(1.2)
-                                Spacer()
-                            }
-
-                            Text("Runs on the Apple Neural Engine instead of the CPU/GPU path the models above use. No file import — catalog only.")
-                                .font(.system(size: 11))
-                                .foregroundColor(Theme.textMuted)
-                                .fixedSize(horizontal: false, vertical: true)
-
-                            if importedCoreMLModels.isEmpty {
-                                Text("No Core ML model installed. Download the one below to try it.")
-                                    .font(.system(size: 13))
-                                    .foregroundColor(Theme.textSecondary)
-                                    .padding()
-                                    .frame(maxWidth: .infinity, alignment: .center)
-                                    .glassCard(cornerRadius: 12)
-                            } else {
-                                VStack(spacing: 12) {
-                                    ForEach(importedCoreMLModels, id: \.self) { url in
-                                        coreMLModelRow(for: url)
-                                    }
-                                }
-                            }
-
-                            Divider().background(Theme.border)
-
-                            VStack(alignment: .leading, spacing: 10) {
-                                Text("DOWNLOAD A CORE ML MODEL")
-                                    .font(.system(size: 11, weight: .bold))
-                                    .foregroundColor(Theme.textSecondary)
-                                    .kerning(1.0)
-                                downloadCatalogButton(for: .coreML)
-                            }
-                        }
-                        .glassCard(cornerRadius: 16)
-
-                        VStack(alignment: .leading, spacing: 14) {
-                            HStack {
-                                Image(systemName: "photo.badge.plus")
-                                    .foregroundColor(Color.purple)
-                                    .font(.headline)
-                                Text("DIFFUSION MODEL")
-                                    .font(.system(size: 14, weight: .bold))
-                                    .foregroundColor(Theme.textPrimary)
-                                    .kerning(1.2)
-                                Spacer()
-                                Button(action: { showDiffusionImporter = true }) {
-                                    HStack(spacing: 6) {
-                                        Image(systemName: "plus")
-                                        Text("Import Model")
-                                    }
-                                    .font(.system(size: 12, weight: .bold))
-                                    .foregroundColor(Theme.onAccent)
-                                    .padding(.horizontal, 12)
-                                    .padding(.vertical, 6)
-                                    .background(
-                                        RoundedRectangle(cornerRadius: 8)
-                                            .fill(LinearGradient(
-                                                colors: [Color.purple, Color.purple.opacity(0.6)],
-                                                startPoint: .leading, endPoint: .trailing))
-                                    )
-                                }
-                            }
-
-                            if importedDiffusionModels.isEmpty {
-                                Text("No diffusion model installed. Download one below, or import a .gguf or .safetensors checkpoint you already have.")
-                                    .font(.system(size: 13))
-                                    .foregroundColor(Theme.textSecondary)
-                                    .padding()
-                                    .frame(maxWidth: .infinity, alignment: .center)
-                                    .glassCard(cornerRadius: 12)
-                            } else {
-                                VStack(spacing: 12) {
-                                    ForEach(importedDiffusionModels, id: \.self) { url in
-                                        diffusionModelRow(for: url)
-                                    }
-                                }
-                            }
-
-                            Divider().background(Theme.border)
-
-                            VStack(alignment: .leading, spacing: 10) {
-                                Text("DOWNLOAD A DIFFUSION MODEL")
-                                    .font(.system(size: 11, weight: .bold))
-                                    .foregroundColor(Theme.textSecondary)
-                                    .kerning(1.0)
-                                downloadCatalogButton(for: .diffusion)
-                            }
-
-                            if isDiffusionImporting {
-                                HStack {
-                                    ProgressView()
-                                        .progressViewStyle(CircularProgressViewStyle(tint: Color.purple))
-                                    Text(diffusionImportProgress)
-                                        .font(.system(size: 13, weight: .medium))
-                                        .foregroundColor(Theme.textPrimary)
-                                        .padding(.leading, 8)
-                                    Spacer()
-                                }
-                                .padding()
-                                .background(Theme.background)
-                                .cornerRadius(12)
-                                .overlay(RoundedRectangle(cornerRadius: 12)
-                                    .stroke(Color.purple.opacity(0.3), lineWidth: 1))
-                            }
-
-                            // Import refusal. These messages explain *what kind* of file was
-                            // picked (a LoRA, a bare VAE, a checkpoint with no VAE baked in),
-                            // so they're given room to wrap rather than being truncated to a
-                            // line — the explanation is the whole value.
-                            if let importError = diffusionImportError {
-                                VStack(alignment: .leading, spacing: 10) {
-                                    HStack(alignment: .top, spacing: 8) {
-                                        Image(systemName: "exclamationmark.triangle.fill")
-                                            .foregroundColor(.orange)
-                                            .font(.system(size: 14))
-                                        Text("Can't use this file")
-                                            .font(.system(size: 13, weight: .bold))
-                                            .foregroundColor(Theme.textPrimary)
-                                        Spacer()
-                                        Button {
-                                            diffusionImportError = nil
-                                        } label: {
-                                            Image(systemName: "xmark")
-                                                .font(.system(size: 12, weight: .bold))
-                                                .foregroundColor(Theme.textSecondary)
-                                        }
-                                        .accessibilityLabel("Dismiss")
-                                    }
-                                    Text(importError)
-                                        .font(.system(size: 12))
-                                        .foregroundColor(Theme.textSecondary)
-                                        .fixedSize(horizontal: false, vertical: true)
-                                        .lineSpacing(3)
-                                }
-                                .padding()
-                                .background(Color.orange.opacity(0.12))
-                                .cornerRadius(12)
-                                .overlay(RoundedRectangle(cornerRadius: 12)
-                                    .stroke(Color.orange.opacity(0.45), lineWidth: 1))
-                            }
-
-                            switch diffusionManager.diffusionLoadState {
-                            case .loading(_, let status):
-                                HStack(spacing: 8) {
-                                    ProgressView()
-                                        .progressViewStyle(CircularProgressViewStyle(tint: Color.purple))
-                                        .scaleEffect(0.8)
-                                    Text(status)
-                                        .font(.system(size: 12, design: .monospaced))
-                                        .foregroundColor(Theme.textSecondary)
-                                }
-                            case .failed(let err):
-                                Text("Error: \(err)")
-                                    .font(.system(size: 12))
-                                    .foregroundColor(.red.opacity(0.8))
-                            default:
-                                EmptyView()
-                            }
-
-                            Divider().background(Theme.border)
-
-                            Text("IMAGE GEN SETTINGS")
-                                .font(.system(size: 11, weight: .bold))
-                                .foregroundColor(Theme.textSecondary)
-                                .kerning(1.0)
-
-                            VStack(alignment: .leading, spacing: 6) {
-                                HStack {
-                                    Text("Inference Steps:")
-                                        .font(.system(size: 13))
-                                        .foregroundColor(Theme.textSecondary)
-                                    Spacer()
-                                    Text("\(diffusionManager.steps)")
-                                        .font(.system(size: 13, weight: .bold, design: .monospaced))
-                                        .foregroundColor(Color.purple)
-                                }
-                                Slider(value: Binding(
-                                    get: { Double(diffusionManager.steps) },
-                                    set: { diffusionManager.steps = Int($0) }
-                                ), in: 4...50, step: 1)
-                                .accentColor(Color.purple)
-                            }
-
-                            Divider().background(Theme.border)
-
-                            VStack(alignment: .leading, spacing: 6) {
-                                HStack {
-                                    Text("CFG Scale (Prompt Strength):")
-                                        .font(.system(size: 13))
-                                        .foregroundColor(Theme.textSecondary)
-                                    Spacer()
-                                    Text(String(format: "%.1f", diffusionManager.cfgScale))
-                                        .font(.system(size: 13, weight: .bold, design: .monospaced))
-                                        .foregroundColor(Color.purple)
-                                }
-                                Slider(value: $diffusionManager.cfgScale, in: 1.0...12.0, step: 0.5)
-                                    .accentColor(Color.purple)
-                            }
-
-                            Divider().background(Theme.border)
-
-                            VStack(alignment: .leading, spacing: 8) {
-                                Text("Output Resolution:")
-                                    .font(.system(size: 13))
-                                    .foregroundColor(Theme.textSecondary)
-                                HStack(spacing: 8) {
-                                    ForEach([256, 512, 768], id: \.self) { size in
-                                        Button(action: { diffusionManager.outputSize = size }) {
-                                            Text("\(size)")
-                                                .font(.system(size: 12, weight: .bold, design: .monospaced))
-                                                .foregroundColor(diffusionManager.outputSize == size ? Theme.onAccent : Theme.textSecondary)
-                                                .padding(.horizontal, 12)
-                                                .padding(.vertical, 6)
-                                                .background(
-                                                    RoundedRectangle(cornerRadius: 8)
-                                                        .fill(diffusionManager.outputSize == size
-                                                            ? Color.purple
-                                                            : Theme.border.opacity(0.4))
-                                                )
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        .glassCard(cornerRadius: 16)
+                        diffusionModelCard
                         .fileImporter(
                             isPresented: $showDiffusionImporter,
                             allowedContentTypes: [UTType.data],
@@ -383,567 +218,46 @@ struct SettingsView: View {
                         }
                         .onAppear { loadDiffusionModels() }
 
-                        VStack(alignment: .leading, spacing: 12) {
-                            HStack {
-                                Image(systemName: "slider.horizontal.3")
-                                    .foregroundColor(Theme.accent)
-                                Text("CUSTOM SYSTEM INSTRUCTIONS")
-                                    .font(.system(size: 14, weight: .bold))
-                                    .foregroundColor(Theme.textPrimary)
-                                    .kerning(1.2)
-                            }
-                            
-                            TextEditor(text: $customInstructions)
-                                .scrollContentBackground(.hidden) // Fix for iOS 16+ white background washout
-                                .font(.system(size: 13, design: .monospaced))
-                                .foregroundColor(Theme.textPrimary)
-                                .padding(4)
-                                .frame(minHeight: 80)
-                                .background(Theme.background.opacity(0.5))
-                                .cornerRadius(8)
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 8)
-                                        .stroke(Theme.border, lineWidth: 1)
-                                )
-                        }
-                        .glassCard(cornerRadius: 16)
+                        customSystemInstructionsCard
 
-                        VStack(alignment: .leading, spacing: 14) {
-                            HStack {
-                                Image(systemName: "slider.horizontal.below.rectangle")
-                                    .foregroundColor(Theme.accentCyan)
-                                Text("LLM SETTINGS")
-                                    .font(.system(size: 14, weight: .bold))
-                                    .foregroundColor(Theme.textPrimary)
-                                    .kerning(1.2)
-                            }
-                            
-                            Divider().background(Theme.border)
+                        llmSettingsCard
+                            .id("section-llm-settings")
 
-                            // The Core ML backend has no adjustable context window — whatever
-                            // `loadedContextWindow` reports is baked into the model graph, not
-                            // something `contextTokenLimit` governs. Showing the GGUF slider here
-                            // would offer a control that does nothing for the model that's
-                            // actually loaded. The two Core ML engines mean different things by
-                            // that number, though (`coreMLContextIsSliding` — see its doc comment
-                            // on `LLMManager`), so the description can't just hardcode either
-                            // engine's specific behavior the way this used to hardcode OpenELM's.
-                            if llmManager.activeBackend == .coreML {
-                                VStack(alignment: .leading, spacing: 6) {
-                                    HStack {
-                                        Text("Context Window:")
-                                            .font(.system(size: 13))
-                                            .foregroundColor(Theme.textSecondary)
-                                        Spacer()
-                                        Text(llmManager.coreMLContextIsSliding
-                                             ? "\(llmManager.loadedContextWindow) tokens (sliding)"
-                                             : "\(llmManager.loadedContextWindow) tokens (fixed)")
-                                            .font(.system(size: 13, weight: .bold, design: .monospaced))
-                                            .foregroundColor(Theme.accent)
-                                    }
-                                    Text(llmManager.coreMLContextIsSliding
-                                         ? "This Core ML model has no adjustable context. Once a conversation passes \(llmManager.loadedContextWindow) tokens, the earliest turns are gradually forgotten rather than the reply being cut off."
-                                         : "This Core ML model has no adjustable context — \(llmManager.loadedContextWindow) tokens total, prompt and reply combined.")
-                                        .font(.system(size: 11))
-                                        .foregroundColor(Theme.textMuted)
-                                        .fixedSize(horizontal: false, vertical: true)
-                                }
-                            } else {
-                            VStack(alignment: .leading, spacing: 8) {
-                                HStack {
-                                    Text("Context Window Limit:")
-                                        .font(.system(size: 13))
-                                        .foregroundColor(Theme.textSecondary)
-                                    Spacer()
-                                    Text("\(llmManager.contextTokenLimit) tokens")
-                                        .font(.system(size: 13, weight: .bold, design: .monospaced))
-                                        .foregroundColor(Theme.accent)
-                                }
+                        ragConfigCard
+                            .id("section-rag")
 
-                                // The slider's upper bound is the device ceiling, not a fixed
-                                // 32768. On a 4 GB phone the old slider let you dial in a number
-                                // that was quietly cut to a quarter of itself at load time,
-                                // which just made the setting a lie.
-                                let ceiling = llmManager.deviceContextCeiling
-                                Slider(value: Binding(
-                                    get: { Double(min(llmManager.contextTokenLimit, ceiling)) },
-                                    set: { newValue in
-                                        let val = min(Int(newValue), ceiling)
-                                        llmManager.contextTokenLimit = val
-                                        llmManager.contextLimitAutoAdjustedTo = nil
-                                        if val > llmManager.safeContextLimit {
-                                            showContextWarningPopup = true
-                                        }
-                                    }
-                                ), in: 512...Double(ceiling), step: 256)
-                                .accentColor(Theme.accent)
+                        conversationalMemoriesCard
+                            .id("section-memory")
 
-                                if let adjusted = llmManager.contextLimitAutoAdjustedTo {
-                                    HStack(alignment: .top, spacing: 6) {
-                                        Image(systemName: "info.circle.fill")
-                                            .font(.system(size: 11))
-                                            .foregroundColor(.orange)
-                                        Text("Lowered to \(adjusted) tokens to fit this device's \(String(format: "%.0f", llmManager.systemMemoryGB)) GB of memory. You can still set it lower.")
-                                            .font(.system(size: 11))
-                                            .foregroundColor(.orange)
-                                            .fixedSize(horizontal: false, vertical: true)
-                                    }
-                                } else {
-                                    // Naming which bound is binding. "Maximum for this device"
-                                    // was wrong whenever the model, not the hardware, was the
-                                    // limit — and that is the common case, since most models are
-                                    // trained well below what a recent iPhone could allocate.
-                                    Text(llmManager.loadedTrainedContext > 0
-                                         && llmManager.loadedTrainedContext <= ceiling
-                                         ? "Maximum for this model: \(ceiling) tokens — it was trained for \(llmManager.loadedTrainedContext)."
-                                         : "Maximum for this device: \(ceiling) tokens.")
-                                        .font(.system(size: 11))
-                                        .foregroundColor(Theme.textMuted)
-                                }
-                            }
-                            }
+                        internetAccessCard
+                            .id("section-internet")
 
+                        webPortalCard
+                            .id("section-webportal")
 
-                            Divider().background(Theme.border)
+                        personalityMatrixCard
+                            .id("section-personality")
 
-                            // Same reasoning as the Context Window gate above: a Core ML model's
-                            // reply is always cut off by its own context window (128 tokens total
-                            // for OpenELM; the sliding cache's own bookkeeping for the Llama
-                            // pipeline) long before this slider's value could ever bind — showing
-                            // it un-gated offered a number the model could structurally never
-                            // reach, e.g. "512 tokens" sitting next to a model capped at 128 total.
-                            if llmManager.activeBackend == .coreML {
-                                Text("Reply length for this Core ML model is bounded by its context window above, not by a separate output limit.")
-                                    .font(.system(size: 11))
-                                    .foregroundColor(Theme.textMuted)
-                                    .fixedSize(horizontal: false, vertical: true)
-                            } else {
-                            VStack(alignment: .leading, spacing: 8) {
-                                HStack {
-                                    Text("Max Output Limit:")
-                                        .font(.system(size: 13))
-                                        .foregroundColor(Theme.textSecondary)
-                                    Spacer()
-                                    Text("\(llmManager.maxTokens) tokens")
-                                        .font(.system(size: 13, weight: .bold, design: .monospaced))
-                                        .foregroundColor(Theme.accent)
-                                }
+                        responseFeedbackCard
 
-                                Slider(value: Binding(
-                                    get: { Double(llmManager.maxTokens) },
-                                    set: { llmManager.maxTokens = Int($0) }
-                                ), in: 64...8192, step: 128)
-                                .accentColor(Theme.accent)
-                            }
-                            }
-
-                            Divider().background(Theme.border)
-                            
-                            VStack(alignment: .leading, spacing: 8) {
-                                HStack {
-                                    Text("Temperature (Creativity):")
-                                        .font(.system(size: 13))
-                                        .foregroundColor(Theme.textSecondary)
-                                    Spacer()
-                                    if llmManager.highVariabilityEnabled {
-                                        Text("HIGH (2.50)")
-                                            .font(.system(size: 13, weight: .bold, design: .monospaced))
-                                            .foregroundColor(.orange)
-                                    } else {
-                                        Text(String(format: "%.2f", llmManager.temperature))
-                                            .font(.system(size: 13, weight: .bold, design: .monospaced))
-                                            .foregroundColor(Theme.accent)
-                                    }
-                                }
-                                
-                                Slider(value: $llmManager.temperature, in: 0.0...2.0, step: 0.05)
-                                    .accentColor(llmManager.highVariabilityEnabled ? .gray : Theme.accent)
-                                    .disabled(llmManager.highVariabilityEnabled)
-                                    .opacity(llmManager.highVariabilityEnabled ? 0.5 : 1.0)
-                                    
-                                Toggle(isOn: $llmManager.highVariabilityEnabled) {
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text("High Variability")
-                                            .font(.system(size: 13))
-                                            .foregroundColor(llmManager.highVariabilityEnabled ? .orange : Theme.textSecondary)
-                                        Text("Overrides temperature with a very high value. Output becomes far less predictable.")
-                                            .font(.system(size: 11))
-                                            .foregroundColor(Theme.textMuted)
-                                    }
-                                }
-                                .toggleStyle(SwitchToggleStyle(tint: .orange))
-                            }
-                        }
-                        .glassCard(cornerRadius: 16)
-
-                        VStack(alignment: .leading, spacing: 14) {
-                            HStack {
-                                Image(systemName: "doc.text.magnifyingglass")
-                                    .foregroundColor(Theme.accentCyan)
-                                Text("RAG CONFIG")
-                                    .font(.system(size: 14, weight: .bold))
-                                    .foregroundColor(Theme.textPrimary)
-                                    .kerning(1.2)
-                                Spacer()
-                                Toggle("", isOn: $enableRAG)
-                                    .toggleStyle(SwitchToggleStyle(tint: Theme.accent))
-                                    .labelsHidden()
-                            }
-                            
-                            if enableRAG {
-                                Divider().background(Theme.border)
-                                NavigationLink(destination: MindscapeView(ragManager: ragManager)) {
-                                    HStack {
-                                        Image(systemName: "brain.filled.head.profile")
-                                            .foregroundColor(Theme.accentCyan)
-                                        Text("Open Mindscape")
-                                            .font(.system(size: 14, weight: .bold))
-                                            .foregroundColor(Theme.textPrimary)
-                                        Spacer()
-                                        Image(systemName: "chevron.right")
-                                            .foregroundColor(Theme.textSecondary)
-                                            .font(.system(size: 12))
-                                    }
-                                    .padding(.vertical, 8)
-                                }
-                            }
-                        }
-                        .glassCard(cornerRadius: 16)
-
-                        VStack(alignment: .leading, spacing: 14) {
-                            HStack {
-                                Image(systemName: "brain.head.profile")
-                                    .foregroundColor(Theme.accentRose)
-                                Text("CONVERSATIONAL MEMORIES")
-                                    .font(.system(size: 14, weight: .bold))
-                                    .foregroundColor(Theme.textPrimary)
-                                    .kerning(1.2)
-                                Spacer()
-                                Toggle("", isOn: $enableMemories)
-                                    .toggleStyle(SwitchToggleStyle(tint: Theme.accentRose))
-                                    .labelsHidden()
-                            }
-                            
-                            if enableMemories {
-                                Divider().background(Theme.border)
-                                
-                                HStack {
-                                    Text("EXTRACTED PREFERENCES")
-                                        .font(.system(size: 11, weight: .semibold))
-                                        .foregroundColor(Theme.textSecondary)
-                                    Spacer()
-                                    Button(action: { memoryManager.clearAllMemories() }) {
-                                        Text("Clear All")
-                                            .font(.system(size: 12, weight: .semibold))
-                                            .foregroundColor(.red.opacity(0.8))
-                                    }
-                                }
-                                
-                                if memoryManager.memories.isEmpty {
-                                    Text("No memories extracted yet. Tell DarkAI things like 'I prefer Python' or 'My name is John' to build long-term memory.")
-                                        .font(.system(size: 13))
-                                        .foregroundColor(Theme.textMuted)
-                                        .padding(.vertical, 8)
-                                } else {
-                                    VStack(alignment: .leading, spacing: 8) {
-                                        ForEach(Array(memoryManager.memories.enumerated()), id: \.element.id) { index, memory in
-                                            memoryRow(memory, index: index)
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        .glassCard(cornerRadius: 16)
-
-                        VStack(alignment: .leading, spacing: 14) {
-                            HStack {
-                                Image(systemName: "globe")
-                                    .foregroundColor(Theme.accentCyan)
-                                Text("INTERNET ACCESS")
-                                    .font(.system(size: 14, weight: .bold))
-                                    .foregroundColor(Theme.textPrimary)
-                                    .kerning(1.2)
-                                Spacer()
-                                Toggle("", isOn: $webSearchManager.isEnabled)
-                                    .toggleStyle(SwitchToggleStyle(tint: Theme.accentCyan))
-                                    .labelsHidden()
-                            }
-
-                            Text("Off by default — \(AppInfo.displayName) never uses the internet on its own. When on, the assistant will *ask* before searching for anything (like current weather or recent events); it never searches automatically. Only your search text is sent out, to Open-Meteo, DuckDuckGo, and — if you add a key below — Brave. No account, no identifiers.")
-                                .font(.system(size: 12))
-                                .foregroundColor(Theme.textSecondary)
-                                .lineSpacing(3)
-
-                            if webSearchManager.isEnabled {
-                                Divider().background(Theme.border)
-
-                                Text("SEARCH API KEY (OPTIONAL)")
-                                    .font(.system(size: 11, weight: .semibold))
-                                    .foregroundColor(Theme.textSecondary)
-
-                                Text("Weather, and factual questions Wikipedia can answer, already work for free with no setup. A Brave Search API key adds real web search — needed for recent news, live scores, prices, and anything else that changes day to day.")
-                                    .font(.system(size: 12))
-                                    .foregroundColor(Theme.textMuted)
-
-                                SecureField("Brave Search API key", text: $webSearchManager.braveAPIKey)
-                                    .font(.system(size: 13, design: .monospaced))
-                                    .padding(10)
-                                    .background(Theme.background.opacity(0.4))
-                                    .cornerRadius(8)
-                                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(Theme.border, lineWidth: 1))
-                                    .autocorrectionDisabled()
-                                    #if os(iOS)
-                                    .textInputAutocapitalization(.never)
-                                    #endif
-
-                                HStack(spacing: 6) {
-                                    Image(systemName: webSearchManager.hasBraveKey ? "checkmark.circle.fill" : "info.circle")
-                                        .foregroundColor(webSearchManager.hasBraveKey ? .green : Theme.textMuted)
-                                        .font(.system(size: 11))
-                                    Text(webSearchManager.hasBraveKey
-                                         ? "Key saved on this device (Keychain) — full web search is active."
-                                         : "No key set — searches use the free weather and Wikipedia lookups, which can't answer questions about recent events.")
-                                        .font(.system(size: 11))
-                                        .foregroundColor(Theme.textMuted)
-                                }
-
-                                Link(destination: URL(string: "https://brave.com/search/api/")!) {
-                                    HStack(spacing: 4) {
-                                        Text("Get a Brave Search API key")
-                                        Image(systemName: "arrow.up.right")
-                                    }
-                                    .font(.system(size: 12, weight: .semibold))
-                                    .foregroundColor(Theme.accentCyan)
-                                }
-                            }
-                        }
-                        .glassCard(cornerRadius: 16)
-
-                        VStack(alignment: .leading, spacing: 12) {
-                            HStack {
-                                Image(systemName: "person.text.rectangle")
-                                    .foregroundColor(Theme.accentRose)
-                                Text("Personality Matrix")
-                                    .font(.system(size: 14, weight: .bold))
-                                    .foregroundColor(Theme.textPrimary)
-                                Spacer()
-                                if personalityManager.isMature {
-                                    Text("[ADAPTED]")
-                                        .font(.system(size: 11, weight: .bold, design: .monospaced))
-                                        .foregroundColor(Theme.onAccent)
-                                        .padding(.horizontal, 8)
-                                        .padding(.vertical, 4)
-                                        .background(Theme.accentRose)
-                                        .cornerRadius(6)
-                                } else {
-                                    Text("[LEARNING...]")
-                                        .font(.system(size: 11, weight: .bold, design: .monospaced))
-                                        .foregroundColor(Theme.textSecondary)
-                                        .padding(.horizontal, 8)
-                                        .padding(.vertical, 4)
-                                        .background(Theme.textSecondary.opacity(0.2))
-                                        .cornerRadius(6)
-                                }
-                                
-                                Text(personalityManager.databaseSizeString)
-                                    .font(.system(size: 11, weight: .bold, design: .monospaced))
-                                    .foregroundColor(Theme.accentRose)
-                                    .padding(.horizontal, 8)
-                                    .padding(.vertical, 4)
-                                    .background(Theme.accentRose.opacity(0.15))
-                                    .cornerRadius(6)
-                            }
-                            
-                            Text("\(AppInfo.displayName) gradually adapts its tone to how you write. It builds one profile shared by every model, and everything it learns stays on this device. Resetting erases it completely.")
-                                .font(.system(size: 13))
-                                .foregroundColor(Theme.textSecondary)
-                                .lineSpacing(4)
-                            
-                            Button(action: {
-                                showResetPersonalityAlert = true
-                            }) {
-                                HStack {
-                                    Image(systemName: "trash")
-                                    Text("Reset Personality")
-                                }
-                                .font(.system(size: 13, weight: .bold))
-                                .foregroundColor(Theme.textPrimary)
-                                .padding(.vertical, 10)
-                                .frame(maxWidth: .infinity)
-                                .background(Theme.accentRose.opacity(0.2))
-                                .cornerRadius(8)
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 8)
-                                        .stroke(Theme.accentRose.opacity(0.5), lineWidth: 1)
-                                )
-                            }
-                            .alert("Reset Personality?", isPresented: $showResetPersonalityAlert) {
-                                Button("Cancel", role: .cancel) { }
-                                Button("Reset", role: .destructive) {
-                                    personalityManager.resetPersonality()
-                                }
-                            } message: {
-                                Text("This will erase every learned speech pattern, for all models. This action cannot be undone.")
-                            }
-                        }
-                        .glassCard(cornerRadius: 16)
-                        
                         // Recovery. Sits ahead of Diagnostics on purpose: someone scrolling here
                         // after an out-of-memory error wants the fix before the log of it.
-                        VStack(alignment: .leading, spacing: 14) {
-                            HStack {
-                                Image(systemName: "arrow.clockwise.circle")
-                                    .foregroundColor(Theme.accentCyan)
-                                Text("TROUBLESHOOTING")
-                                    .font(.system(size: 14, weight: .bold))
-                                    .foregroundColor(Theme.textPrimary)
-                                    .kerning(1.2)
-                                Spacer()
-                            }
+                        troubleshootingCard
+                            .id("section-diagnostics")
 
-                            ResetModelsButton(llmManager: llmManager, diffusionManager: diffusionManager)
-                        }
-                        .glassCard(cornerRadius: 16)
+                        diagnosticsLogsCard
 
-                        VStack(alignment: .leading, spacing: 14) {
-                            HStack {
-                                Image(systemName: "ladybug")
-                                    .foregroundColor(.yellow)
-                                Text("DIAGNOSTICS LOGS")
-                                    .font(.system(size: 14, weight: .bold))
-                                    .foregroundColor(Theme.textPrimary)
-                                    .kerning(1.2)
-                                Spacer()
-                            }
-                            
-                            Divider().background(Theme.border)
-                            
-                            NavigationLink {
-                                LogExportView()
-                            } label: {
-                                HStack {
-                                    Text("View & Export Logs")
-                                        .font(.system(size: 13, weight: .medium))
-                                        .foregroundColor(Theme.textPrimary)
-                                    Spacer()
-                                    Image(systemName: "chevron.right")
-                                        .font(.system(size: 12))
-                                        .foregroundColor(Theme.textSecondary)
-                                }
-                                .padding()
-                                .background(Theme.cardBackground)
-                                .cornerRadius(12)
-                            }
-                        }
-                        .glassCard(cornerRadius: 16)
+                        appearanceCard
+                            .id("section-appearance")
 
-                        VStack(alignment: .leading, spacing: 14) {
-                            HStack {
-                                Image(systemName: "paintbrush.fill")
-                                    .foregroundColor(Theme.accentCyan)
-                                Text("APPEARANCE")
-                                    .font(.system(size: 14, weight: .bold))
-                                    .foregroundColor(Theme.textPrimary)
-                                    .kerning(1.2)
-                                Spacer()
-                            }
-
-                            VStack(spacing: 0) {
-                                ForEach(AppearanceMode.allCases) { mode in
-                                    Button {
-                                        withAnimation(.easeInOut(duration: 0.2)) {
-                                            appearance.mode = mode
-                                        }
-                                    } label: {
-                                        HStack(spacing: 12) {
-                                            Image(systemName: mode.icon)
-                                                .foregroundColor(appearance.mode == mode ? Theme.accent : Theme.textSecondary)
-                                                .frame(width: 22)
-                                            VStack(alignment: .leading, spacing: 2) {
-                                                Text(mode.title)
-                                                    .font(.system(size: 14, weight: .medium))
-                                                    .foregroundColor(Theme.textPrimary)
-                                                Text(mode.subtitle)
-                                                    .font(.system(size: 11))
-                                                    .foregroundColor(Theme.textMuted)
-                                            }
-                                            Spacer()
-                                            Image(systemName: appearance.mode == mode ? "largecircle.fill.circle" : "circle")
-                                                .foregroundColor(appearance.mode == mode ? Theme.accent : Theme.textMuted)
-                                        }
-                                        .padding(.vertical, 11)
-                                        .contentShape(Rectangle())
-                                    }
-                                    if mode != AppearanceMode.allCases.last {
-                                        Divider().background(Theme.border)
-                                    }
-                                }
-                            }
-
-                            Text("This changes the app's colors and text contrast. The Home Screen icon stays the same in every mode.")
-                                .font(.system(size: 11))
-                                .foregroundColor(Theme.textMuted)
-                                .lineSpacing(3)
-                        }
-                        .glassCard(cornerRadius: 16)
-
-                        VStack(alignment: .leading, spacing: 14) {
-                            HStack {
-                                Image(systemName: "checkmark.shield.fill")
-                                    .foregroundColor(.green)
-                                Text("SAFETY & LEGAL")
-                                    .font(.system(size: 14, weight: .bold))
-                                    .foregroundColor(Theme.textPrimary)
-                                    .kerning(1.2)
-                                Spacer()
-                            }
-
-                            Divider().background(Theme.border)
-
-                            NavigationLink {
-                                SafetyLegalView()
-                            } label: {
-                                HStack {
-                                    VStack(alignment: .leading, spacing: 3) {
-                                        Text("Content Policy, Terms & Reporting")
-                                            .font(.system(size: 13, weight: .medium))
-                                            .foregroundColor(Theme.textPrimary)
-                                        Text("Filter is always on · Report generated content")
-                                            .font(.system(size: 11))
-                                            .foregroundColor(Theme.textMuted)
-                                    }
-                                    Spacer()
-                                    Image(systemName: "chevron.right")
-                                        .font(.system(size: 12))
-                                        .foregroundColor(Theme.textSecondary)
-                                }
-                                .padding()
-                                .background(Theme.cardBackground)
-                                .cornerRadius(12)
-                            }
-
-                            Divider().background(Theme.border)
-
-                            HStack {
-                                Text("Storage used by \(AppInfo.displayName)")
-                                    .font(.system(size: 13))
-                                    .foregroundColor(Theme.textSecondary)
-                                Spacer()
-                                Text(String(format: "%.2f GB", storageUsedGB))
-                                    .font(.system(size: 13, weight: .bold, design: .monospaced))
-                                    .foregroundColor(Theme.accentCyan)
-                            }
-
-                            Text("Models, generated images, and logs are stored on this device only and are excluded from iCloud backup. Deleting the app removes all of it.")
-                                .font(.system(size: 11))
-                                .foregroundColor(Theme.textMuted)
-                                .lineSpacing(3)
-                        }
-                        .glassCard(cornerRadius: 16)
+                        safetyLegalCard
+                            .id("section-safety")
 
                     }
                     .padding()
                 }
+                .onAppear { jumpProxy = proxy }
+                } // closes ScrollViewReader
 
                 if case let .loading(progress, status) = llmManager.loadState {
                     ZStack {
@@ -989,106 +303,9 @@ struct SettingsView: View {
                         )
                     }
                 }
+                } // closes VStack(spacing: 0) wrapping the jump bar + scroll content
 
-                if showFailsafePopup {
-                    ZStack {
-                        Color.black.opacity(0.5)
-                            .ignoresSafeArea()
-                        
-                        VStack(spacing: 20) {
-                            Image(systemName: isFailsafeWarningOnly ? "exclamationmark.triangle" : "xmark.octagon")
-                                .font(.system(size: 48))
-                                .foregroundColor(isFailsafeWarningOnly ? .yellow : .red)
-                                .neonGlow(color: isFailsafeWarningOnly ? .yellow : .red, radius: 10)
-                            
-                            Text(isFailsafeWarningOnly ? "MEMORY ALLOCATION WARNING" : "MEMORY FAILSAFE TRIGGERED")
-                                .font(.system(size: 16, weight: .bold))
-                                .foregroundColor(Theme.textPrimary)
-                                .kerning(1.2)
-                            
-                            Text(failsafeMessage)
-                                .font(.system(size: 13))
-                                .foregroundColor(Theme.textSecondary)
-                                .multilineTextAlignment(.center)
-                                .lineSpacing(4)
-                            
-                            VStack(spacing: 8) {
-                                HStack {
-                                    Text("This device's RAM:")
-                                        .foregroundColor(Theme.textMuted)
-                                    Spacer()
-                                    Text(String(format: "%.1f GB", llmManager.systemMemoryGB))
-                                        .foregroundColor(Theme.textPrimary)
-                                }
-                                HStack {
-                                    Text("Estimated Model Footprint:")
-                                        .foregroundColor(Theme.textMuted)
-                                    Spacer()
-                                    Text(String(format: "%.1f GB", failsafeRequiredRAM))
-                                        .foregroundColor(isFailsafeWarningOnly ? .yellow : .red)
-                                }
-                            }
-                            .font(.system(size: 12, design: .monospaced))
-                            .padding()
-                            .background(Theme.background)
-                            .cornerRadius(10)
-                            
-                            // A model in the `.dangerous` band has no "load anyway" button.
-                            // Overriding it reliably ends in a jetsam kill, and an app that
-                            // hands the user a button whose documented outcome is termination
-                            // is failing Guideline 2.1 — the correct answer is to refuse and
-                            // point at a model that fits.
-                            HStack(spacing: 16) {
-                                Button(action: {
-                                    showFailsafePopup = false
-                                    selectedModelToLoad = nil
-                                    pendingDiffusionModelToLoad = nil
-                                }) {
-                                    Text(isFailsafeWarningOnly ? "Cancel" : "OK")
-                                        .font(.system(size: 14, weight: .bold))
-                                        .foregroundColor(Theme.textPrimary)
-                                        .frame(maxWidth: .infinity)
-                                        .padding(.vertical, 12)
-                                        .background(
-                                            RoundedRectangle(cornerRadius: 10)
-                                                .stroke(Theme.border, lineWidth: 1.5)
-                                        )
-                                }
-
-                                if isFailsafeWarningOnly {
-                                    Button(action: {
-                                        if let url = selectedModelToLoad {
-                                            llmManager.loadModel(at: url, forceLoad: true)
-                                        } else if let url = pendingDiffusionModelToLoad {
-                                            diffusionManager.lastDiffusionModelPath = url.path
-                                        }
-                                        showFailsafePopup = false
-                                        selectedModelToLoad = nil
-                                        pendingDiffusionModelToLoad = nil
-                                    }) {
-                                        Text("Load Anyway")
-                                            .font(.system(size: 14, weight: .bold))
-                                            .foregroundColor(.black)
-                                            .frame(maxWidth: .infinity)
-                                            .padding(.vertical, 12)
-                                            .background(
-                                                RoundedRectangle(cornerRadius: 10)
-                                                    .fill(Color.yellow.opacity(0.8))
-                                            )
-                                    }
-                                }
-                            }
-                        }
-                        .padding(26)
-                        .frame(width: 320)
-                        .background(Theme.cardBackground)
-                        .cornerRadius(20)
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 20)
-                                .stroke(isFailsafeWarningOnly ? Color.yellow.opacity(0.4) : Color.red.opacity(0.4), lineWidth: 1.5)
-                        )
-                    }
-                }
+                failsafePopupOverlay
             }
             .navigationTitle("DarkAI Settings")
             .navigationBarTitleDisplayMode(.inline)
@@ -1117,6 +334,26 @@ struct SettingsView: View {
             } message: {
                 Text("Please select a valid .gguf model file.")
             }
+            .alert(
+                pendingDeletion?.confirmTitle ?? "Delete",
+                isPresented: Binding(get: { pendingDeletion != nil }, set: { if !$0 { pendingDeletion = nil } }),
+                presenting: pendingDeletion
+            ) { deletion in
+                Button("Cancel", role: .cancel) { pendingDeletion = nil }
+                Button(deletion.confirmTitle, role: .destructive) {
+                    confirmPendingDeletion(deletion)
+                }
+            } message: { deletion in
+                Text(deletion.message)
+            }
+            .alert("Clear All Memories?", isPresented: $showClearMemoriesAlert) {
+                Button("Cancel", role: .cancel) { }
+                Button("Clear All", role: .destructive) {
+                    memoryManager.clearAllMemories()
+                }
+            } message: {
+                Text("This erases every extracted preference, identity fact, and event. This can't be undone.")
+            }
             .fileImporter(
                 isPresented: $showModelImporter,
                 allowedContentTypes: [.item],
@@ -1128,7 +365,7 @@ struct SettingsView: View {
                         copyModelToAppDocuments(from: firstUrl)
                     }
                 case .failure(let error):
-                    print("Model import error: \(error.localizedDescription)")
+                    LogManager.shared.log("Model import error: \(error.localizedDescription)")
                 }
             }
 
@@ -1174,6 +411,7 @@ struct SettingsView: View {
                     .foregroundColor(Theme.textSecondary)
                     .font(.system(size: 14))
             }
+            .accessibilityLabel("Remove memory")
         }
         .padding(8)
         .background(Theme.background.opacity(0.4))
@@ -1198,13 +436,1394 @@ struct SettingsView: View {
         }
     }
 
-    // MARK: - Download catalog
+    // MARK: - Failsafe popup
 
-    /// Curated, developer-vetted models the user can fetch without leaving the app.
-    ///
-    /// This is what keeps the app usable on a fresh install. Before it existed the only way to
-    /// get a model in was to find a `.gguf` elsewhere and side-load it through Files — which is
-    /// fine for the person who built the app and useless to everyone else, reviewers included.
+    @ViewBuilder
+    private var failsafePopupOverlay: some View {
+            if showFailsafePopup {
+                ZStack {
+                    Color.black.opacity(0.5)
+                        .ignoresSafeArea()
+                    
+                    VStack(spacing: 20) {
+                        Image(systemName: isFailsafeWarningOnly ? "exclamationmark.triangle" : "xmark.octagon")
+                            .font(.system(size: 48))
+                            .foregroundColor(isFailsafeWarningOnly ? .yellow : .red)
+                            .neonGlow(color: isFailsafeWarningOnly ? .yellow : .red, radius: 10)
+                        
+                        Text(isFailsafeWarningOnly ? "MEMORY ALLOCATION WARNING" : "MEMORY FAILSAFE TRIGGERED")
+                            .font(.system(size: 16, weight: .bold))
+                            .foregroundColor(Theme.textPrimary)
+                            .kerning(1.2)
+                        
+                        Text(failsafeMessage)
+                            .font(.system(size: 13))
+                            .foregroundColor(Theme.textSecondary)
+                            .multilineTextAlignment(.center)
+                            .lineSpacing(4)
+                        
+                        VStack(spacing: 8) {
+                            HStack {
+                                Text("This device's RAM:")
+                                    .foregroundColor(Theme.textMuted)
+                                Spacer()
+                                Text(String(format: "%.1f GB", llmManager.systemMemoryGB))
+                                    .foregroundColor(Theme.textPrimary)
+                            }
+                            HStack {
+                                Text("Estimated Model Footprint:")
+                                    .foregroundColor(Theme.textMuted)
+                                Spacer()
+                                Text(String(format: "%.1f GB", failsafeRequiredRAM))
+                                    .foregroundColor(isFailsafeWarningOnly ? .yellow : .red)
+                            }
+                        }
+                        .font(.system(size: 12, design: .monospaced))
+                        .padding()
+                        .background(Theme.background)
+                        .cornerRadius(10)
+                        
+                        // A model in the `.dangerous` band has no "load anyway" button.
+                        // Overriding it reliably ends in a jetsam kill, and an app that
+                        // hands the user a button whose documented outcome is termination
+                        // is failing Guideline 2.1 — the correct answer is to refuse and
+                        // point at a model that fits.
+                        HStack(spacing: 16) {
+                            Button(action: {
+                                showFailsafePopup = false
+                                selectedModelToLoad = nil
+                                pendingDiffusionModelToLoad = nil
+                            }) {
+                                Text(isFailsafeWarningOnly ? "Cancel" : "OK")
+                                    .font(.system(size: 14, weight: .bold))
+                                    .foregroundColor(Theme.textPrimary)
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 12)
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 10)
+                                            .stroke(Theme.border, lineWidth: 1.5)
+                                    )
+                            }
+
+                            if isFailsafeWarningOnly {
+                                Button(action: {
+                                    if let url = selectedModelToLoad {
+                                        llmManager.loadModel(at: url, forceLoad: true)
+                                    } else if let url = pendingDiffusionModelToLoad {
+                                        diffusionManager.lastDiffusionModelPath = url.path
+                                    }
+                                    showFailsafePopup = false
+                                    selectedModelToLoad = nil
+                                    pendingDiffusionModelToLoad = nil
+                                }) {
+                                    Text("Load Anyway")
+                                        .font(.system(size: 14, weight: .bold))
+                                        .foregroundColor(.black)
+                                        .frame(maxWidth: .infinity)
+                                        .padding(.vertical, 12)
+                                        .background(
+                                            RoundedRectangle(cornerRadius: 10)
+                                                .fill(Color.yellow.opacity(0.8))
+                                        )
+                                }
+                            }
+                        }
+                    }
+                    .padding(26)
+                    .frame(width: 320)
+                    .background(Theme.cardBackground)
+                    .cornerRadius(20)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 20)
+                            .stroke(isFailsafeWarningOnly ? Color.yellow.opacity(0.4) : Color.red.opacity(0.4), lineWidth: 1.5)
+                    )
+                }
+            }
+    }
+
+    // MARK: - Top-level settings cards
+    //
+    // Each one used to be inlined directly in `body`'s giant ViewBuilder closure. Once enough
+    // of them accumulated there, the type checker started failing outright with "unable to
+    // type-check this expression in reasonable time" — not a style preference, a hard compile
+    // error — so every top-level card now lives in its own property, each type-checked
+    // independently and referenced from `body` by name.
+
+    private var localLlmModelsCard: some View {
+                    VStack(alignment: .leading, spacing: 14) {
+                        HStack {
+                            Image(systemName: "cpu")
+                                .foregroundColor(Theme.accentCyan)
+                                .font(.headline)
+                            Text("LOCAL LLM MODELS")
+                                .font(.system(size: 14, weight: .bold))
+                                .foregroundColor(Theme.textPrimary)
+                                .kerning(1.2)
+                            Spacer()
+                            Button(action: { showModelImporter = true }) {
+                                HStack(spacing: 6) {
+                                    Image(systemName: "plus")
+                                    Text("Import .gguf")
+                                }
+                                .font(.system(size: 12, weight: .bold))
+                                .foregroundColor(Theme.onAccent)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 6)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 8)
+                                        .fill(LinearGradient(colors: [Theme.accent, Theme.accentCyan], startPoint: .leading, endPoint: .trailing))
+                                )
+                            }
+                        }
+                        
+                        if importedModels.isEmpty {
+                            Text("No models installed yet. Download one below, or import a .gguf file you already have.")
+                                .font(.system(size: 13))
+                                .foregroundColor(Theme.textSecondary)
+                                .padding()
+                                .frame(maxWidth: .infinity, alignment: .center)
+                                .glassCard(cornerRadius: 12)
+                        } else {
+                            VStack(spacing: 12) {
+                                ForEach(importedModels, id: \.self) { url in
+                                    modelRow(for: url)
+                                }
+                            }
+                        }
+
+                        Divider().background(Theme.border)
+
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text("DOWNLOAD A CHAT MODEL")
+                                .font(.system(size: 11, weight: .bold))
+                                .foregroundColor(Theme.textSecondary)
+                                .kerning(1.0)
+                            downloadCatalogButton(for: .chat)
+                        }
+
+                        if isImporting {
+                            HStack {
+                                ProgressView()
+                                    .progressViewStyle(CircularProgressViewStyle(tint: Theme.accentCyan))
+                                Text(importProgress)
+                                    .font(.system(size: 13, weight: .medium))
+                                    .foregroundColor(Theme.textPrimary)
+                                    .padding(.leading, 8)
+                                Spacer()
+                            }
+                            .padding()
+                            .background(Theme.background)
+                            .cornerRadius(12)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 12)
+                                    .stroke(Theme.accentCyan.opacity(0.3), lineWidth: 1)
+                            )
+                        }
+                    }
+                    .glassCard(cornerRadius: 16)
+    }
+
+    private var coreMLModelsCard: some View {
+                    VStack(alignment: .leading, spacing: 14) {
+                        HStack {
+                            Image(systemName: "cpu.fill")
+                                .foregroundColor(Theme.accentCyan)
+                                .font(.headline)
+                            Text("CORE ML MODELS (ANE)")
+                                .font(.system(size: 14, weight: .bold))
+                                .foregroundColor(Theme.textPrimary)
+                                .kerning(1.2)
+                            Spacer()
+                        }
+
+                        Text("Runs on the Apple Neural Engine instead of the CPU/GPU path the models above use. No file import — catalog only.")
+                            .font(.system(size: 11))
+                            .foregroundColor(Theme.textMuted)
+                            .fixedSize(horizontal: false, vertical: true)
+
+                        if importedCoreMLModels.isEmpty {
+                            Text("No Core ML model installed. Download the one below to try it.")
+                                .font(.system(size: 13))
+                                .foregroundColor(Theme.textSecondary)
+                                .padding()
+                                .frame(maxWidth: .infinity, alignment: .center)
+                                .glassCard(cornerRadius: 12)
+                        } else {
+                            VStack(spacing: 12) {
+                                ForEach(importedCoreMLModels, id: \.self) { url in
+                                    coreMLModelRow(for: url)
+                                }
+                            }
+                        }
+
+                        // A load refused here (most commonly the memory pre-flight declining a
+                        // model that doesn't fit) previously had nowhere to show in this screen —
+                        // `llmManager.loadState`'s `.failed` case was only ever rendered in
+                        // `ModelBannerView` on the main chat screen, sitting behind this modal
+                        // Settings sheet the whole time. Tapping Load looked like it silently did
+                        // nothing: the button briefly disabled itself and re-enabled, no error
+                        // visible anywhere the user was actually looking. Gated on `activeBackend
+                        // == .coreML` so a llama.cpp failure elsewhere doesn't show up in the
+                        // wrong card.
+                        if case .failed(let err) = llmManager.loadState, llmManager.activeBackend == .coreML {
+                            VStack(alignment: .leading, spacing: 8) {
+                                HStack(alignment: .top, spacing: 8) {
+                                    Image(systemName: "exclamationmark.triangle.fill")
+                                        .foregroundColor(.orange)
+                                        .font(.system(size: 13))
+                                    Text(err)
+                                        .font(.system(size: 12))
+                                        .foregroundColor(Theme.textSecondary)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                                // Only the memory pre-flight has a real override — a "Memory
+                                // Failsafe" refusal is a policy call this device's owner is free
+                                // to overrule for their own hardware, unlike (say) a missing or
+                                // corrupt file, which forcing wouldn't fix. `forceLoad` skips
+                                // exactly and only that check (`loadCoreMLModel`'s `if !forceLoad`
+                                // guard); every other validation in the load path still runs.
+                                if err.hasPrefix("Memory Failsafe"), let url = llmManager.activeModelURL {
+                                    Button {
+                                        llmManager.loadModel(at: url, forceLoad: true)
+                                    } label: {
+                                        Text("Load Anyway")
+                                            .font(.system(size: 12, weight: .bold))
+                                            .foregroundColor(.orange)
+                                    }
+                                }
+                            }
+                            .padding(10)
+                            .background(Color.orange.opacity(0.12))
+                            .cornerRadius(10)
+                            .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.orange.opacity(0.4), lineWidth: 1))
+                        }
+
+                        Divider().background(Theme.border)
+
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text("DOWNLOAD A CORE ML MODEL")
+                                .font(.system(size: 11, weight: .bold))
+                                .foregroundColor(Theme.textSecondary)
+                                .kerning(1.0)
+                            downloadCatalogButton(for: .coreML)
+                        }
+                    }
+                    .glassCard(cornerRadius: 16)
+    }
+
+    private var diffusionModelCard: some View {
+                    VStack(alignment: .leading, spacing: 14) {
+                        HStack {
+                            Image(systemName: "photo.badge.plus")
+                                .foregroundColor(Color.purple)
+                                .font(.headline)
+                            Text("DIFFUSION MODEL")
+                                .font(.system(size: 14, weight: .bold))
+                                .foregroundColor(Theme.textPrimary)
+                                .kerning(1.2)
+                            Spacer()
+                            Button(action: { showDiffusionImporter = true }) {
+                                HStack(spacing: 6) {
+                                    Image(systemName: "plus")
+                                    Text("Import Model")
+                                }
+                                .font(.system(size: 12, weight: .bold))
+                                .foregroundColor(Theme.onAccent)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 6)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 8)
+                                        .fill(LinearGradient(
+                                            colors: [Color.purple, Color.purple.opacity(0.6)],
+                                            startPoint: .leading, endPoint: .trailing))
+                                )
+                            }
+                        }
+
+                        if importedDiffusionModels.isEmpty {
+                            Text("No diffusion model installed. Download one below, or import a .gguf or .safetensors checkpoint you already have.")
+                                .font(.system(size: 13))
+                                .foregroundColor(Theme.textSecondary)
+                                .padding()
+                                .frame(maxWidth: .infinity, alignment: .center)
+                                .glassCard(cornerRadius: 12)
+                        } else {
+                            VStack(spacing: 12) {
+                                ForEach(importedDiffusionModels, id: \.self) { url in
+                                    diffusionModelRow(for: url)
+                                }
+                            }
+                        }
+
+                        Divider().background(Theme.border)
+
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text("DOWNLOAD A DIFFUSION MODEL")
+                                .font(.system(size: 11, weight: .bold))
+                                .foregroundColor(Theme.textSecondary)
+                                .kerning(1.0)
+                            downloadCatalogButton(for: .diffusion)
+                        }
+
+                        if isDiffusionImporting {
+                            HStack {
+                                ProgressView()
+                                    .progressViewStyle(CircularProgressViewStyle(tint: Color.purple))
+                                Text(diffusionImportProgress)
+                                    .font(.system(size: 13, weight: .medium))
+                                    .foregroundColor(Theme.textPrimary)
+                                    .padding(.leading, 8)
+                                Spacer()
+                            }
+                            .padding()
+                            .background(Theme.background)
+                            .cornerRadius(12)
+                            .overlay(RoundedRectangle(cornerRadius: 12)
+                                .stroke(Color.purple.opacity(0.3), lineWidth: 1))
+                        }
+
+                        // Import refusal. These messages explain *what kind* of file was
+                        // picked (a LoRA, a bare VAE, a checkpoint with no VAE baked in),
+                        // so they're given room to wrap rather than being truncated to a
+                        // line — the explanation is the whole value.
+                        if let importError = diffusionImportError {
+                            VStack(alignment: .leading, spacing: 10) {
+                                HStack(alignment: .top, spacing: 8) {
+                                    Image(systemName: "exclamationmark.triangle.fill")
+                                        .foregroundColor(.orange)
+                                        .font(.system(size: 14))
+                                    Text("Can't use this file")
+                                        .font(.system(size: 13, weight: .bold))
+                                        .foregroundColor(Theme.textPrimary)
+                                    Spacer()
+                                    Button {
+                                        diffusionImportError = nil
+                                    } label: {
+                                        Image(systemName: "xmark")
+                                            .font(.system(size: 12, weight: .bold))
+                                            .foregroundColor(Theme.textSecondary)
+                                    }
+                                    .accessibilityLabel("Dismiss")
+                                }
+                                Text(importError)
+                                    .font(.system(size: 12))
+                                    .foregroundColor(Theme.textSecondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                    .lineSpacing(3)
+                            }
+                            .padding()
+                            .background(Color.orange.opacity(0.12))
+                            .cornerRadius(12)
+                            .overlay(RoundedRectangle(cornerRadius: 12)
+                                .stroke(Color.orange.opacity(0.45), lineWidth: 1))
+                        }
+
+                        switch diffusionManager.diffusionLoadState {
+                        case .loading(_, let status):
+                            HStack(spacing: 8) {
+                                ProgressView()
+                                    .progressViewStyle(CircularProgressViewStyle(tint: Color.purple))
+                                    .scaleEffect(0.8)
+                                Text(status)
+                                    .font(.system(size: 12, design: .monospaced))
+                                    .foregroundColor(Theme.textSecondary)
+                            }
+                        case .failed(let err):
+                            Text("Error: \(err)")
+                                .font(.system(size: 12))
+                                .foregroundColor(.red.opacity(0.8))
+                        default:
+                            EmptyView()
+                        }
+
+                        Divider().background(Theme.border)
+
+                        Text("IMAGE GEN SETTINGS")
+                            .font(.system(size: 11, weight: .bold))
+                            .foregroundColor(Theme.textSecondary)
+                            .kerning(1.0)
+
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack {
+                                Text("Inference Steps:")
+                                    .font(.system(size: 13))
+                                    .foregroundColor(Theme.textSecondary)
+                                Spacer()
+                                Text("\(diffusionManager.steps)")
+                                    .font(.system(size: 13, weight: .bold, design: .monospaced))
+                                    .foregroundColor(Color.purple)
+                            }
+                            Slider(value: Binding(
+                                get: { Double(diffusionManager.steps) },
+                                set: { diffusionManager.steps = Int($0) }
+                            ), in: 4...50, step: 1)
+                            .accentColor(Color.purple)
+                            .accessibilityLabel("Inference steps")
+                            .accessibilityValue("\(diffusionManager.steps) steps")
+                        }
+
+                        Divider().background(Theme.border)
+
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack {
+                                Text("CFG Scale (Prompt Strength):")
+                                    .font(.system(size: 13))
+                                    .foregroundColor(Theme.textSecondary)
+                                Spacer()
+                                Text(String(format: "%.1f", diffusionManager.cfgScale))
+                                    .font(.system(size: 13, weight: .bold, design: .monospaced))
+                                    .foregroundColor(Color.purple)
+                            }
+                            Slider(value: $diffusionManager.cfgScale, in: 1.0...12.0, step: 0.5)
+                                .accentColor(Color.purple)
+                                .accessibilityLabel("CFG scale, prompt strength")
+                                .accessibilityValue(String(format: "%.1f", diffusionManager.cfgScale))
+                        }
+
+                        Divider().background(Theme.border)
+
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Output Resolution:")
+                                .font(.system(size: 13))
+                                .foregroundColor(Theme.textSecondary)
+                            HStack(spacing: 8) {
+                                ForEach([256, 512, 768], id: \.self) { size in
+                                    Button(action: { diffusionManager.outputSize = size }) {
+                                        Text("\(size)")
+                                            .font(.system(size: 12, weight: .bold, design: .monospaced))
+                                            .foregroundColor(diffusionManager.outputSize == size ? Theme.onAccent : Theme.textSecondary)
+                                            .padding(.horizontal, 12)
+                                            .padding(.vertical, 6)
+                                            .background(
+                                                RoundedRectangle(cornerRadius: 8)
+                                                    .fill(diffusionManager.outputSize == size
+                                                        ? Color.purple
+                                                        : Theme.border.opacity(0.4))
+                                            )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    .glassCard(cornerRadius: 16)
+    }
+
+    private var customSystemInstructionsCard: some View {
+                    VStack(alignment: .leading, spacing: 12) {
+                        HStack {
+                            Image(systemName: "slider.horizontal.3")
+                                .foregroundColor(Theme.accent)
+                            Text("CUSTOM SYSTEM INSTRUCTIONS")
+                                .font(.system(size: 14, weight: .bold))
+                                .foregroundColor(Theme.textPrimary)
+                                .kerning(1.2)
+                        }
+                        
+                        TextEditor(text: $customInstructions)
+                            .scrollContentBackground(.hidden) // Fix for iOS 16+ white background washout
+                            .font(.system(size: 13, design: .monospaced))
+                            .foregroundColor(Theme.textPrimary)
+                            .padding(4)
+                            .frame(minHeight: 80)
+                            .background(Theme.background.opacity(0.5))
+                            .cornerRadius(8)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 8)
+                                    .stroke(Theme.border, lineWidth: 1)
+                            )
+                    }
+                    .glassCard(cornerRadius: 16)
+    }
+
+    private var llmSettingsCard: some View {
+                    VStack(alignment: .leading, spacing: 14) {
+                        HStack {
+                            Image(systemName: "slider.horizontal.below.rectangle")
+                                .foregroundColor(Theme.accentCyan)
+                            Text("LLM SETTINGS")
+                                .font(.system(size: 14, weight: .bold))
+                                .foregroundColor(Theme.textPrimary)
+                                .kerning(1.2)
+                        }
+                        
+                        Divider().background(Theme.border)
+
+                        // The Core ML backend has no adjustable context window — whatever
+                        // `loadedContextWindow` reports is baked into the model graph, not
+                        // something `contextTokenLimit` governs. Showing the GGUF slider here
+                        // would offer a control that does nothing for the model that's
+                        // actually loaded. The two Core ML engines mean different things by
+                        // that number, though (`coreMLContextIsSliding` — see its doc comment
+                        // on `LLMManager`), so the description can't just hardcode either
+                        // engine's specific behavior the way this used to hardcode OpenELM's.
+                        if llmManager.activeBackend == .coreML {
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack {
+                                    Text("Context Window:")
+                                        .font(.system(size: 13))
+                                        .foregroundColor(Theme.textSecondary)
+                                    Spacer()
+                                    Text(llmManager.coreMLContextIsSliding
+                                         ? "\(llmManager.loadedContextWindow) tokens (sliding)"
+                                         : "\(llmManager.loadedContextWindow) tokens (fixed)")
+                                        .font(.system(size: 13, weight: .bold, design: .monospaced))
+                                        .foregroundColor(Theme.accent)
+                                }
+                                Text(llmManager.coreMLContextIsSliding
+                                     ? "This Core ML model has no adjustable context. Once a conversation passes \(llmManager.loadedContextWindow) tokens, the earliest turns are gradually forgotten rather than the reply being cut off."
+                                     : "This Core ML model has no adjustable context — \(llmManager.loadedContextWindow) tokens total, prompt and reply combined.")
+                                    .font(.system(size: 11))
+                                    .foregroundColor(Theme.textMuted)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                        } else {
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack {
+                                Text("Context Window Limit:")
+                                    .font(.system(size: 13))
+                                    .foregroundColor(Theme.textSecondary)
+                                Spacer()
+                                Text("\(llmManager.contextTokenLimit) tokens")
+                                    .font(.system(size: 13, weight: .bold, design: .monospaced))
+                                    .foregroundColor(Theme.accent)
+                            }
+
+                            // The slider's upper bound is the device ceiling, not a fixed
+                            // 32768. On a 4 GB phone the old slider let you dial in a number
+                            // that was quietly cut to a quarter of itself at load time,
+                            // which just made the setting a lie.
+                            let ceiling = llmManager.deviceContextCeiling
+                            Slider(value: Binding(
+                                get: { Double(min(llmManager.contextTokenLimit, ceiling)) },
+                                set: { newValue in
+                                    let val = min(Int(newValue), ceiling)
+                                    llmManager.contextTokenLimit = val
+                                    llmManager.contextLimitAutoAdjustedTo = nil
+                                    if val > llmManager.safeContextLimit {
+                                        showContextWarningPopup = true
+                                    }
+                                }
+                            ), in: 512...Double(ceiling), step: 256)
+                            .accentColor(Theme.accent)
+                            .accessibilityLabel("Context window limit")
+                            .accessibilityValue("\(llmManager.contextTokenLimit) tokens")
+
+                            if let adjusted = llmManager.contextLimitAutoAdjustedTo {
+                                HStack(alignment: .top, spacing: 6) {
+                                    Image(systemName: "info.circle.fill")
+                                        .font(.system(size: 11))
+                                        .foregroundColor(.orange)
+                                    Text("Lowered to \(adjusted) tokens to fit this device's \(String(format: "%.0f", llmManager.systemMemoryGB)) GB of memory. You can still set it lower.")
+                                        .font(.system(size: 11))
+                                        .foregroundColor(.orange)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                            } else {
+                                // Naming which bound is binding. "Maximum for this device"
+                                // was wrong whenever the model, not the hardware, was the
+                                // limit — and that is the common case, since most models are
+                                // trained well below what a recent iPhone could allocate.
+                                Text(llmManager.loadedTrainedContext > 0
+                                     && llmManager.loadedTrainedContext <= ceiling
+                                     ? "Maximum for this model: \(ceiling) tokens — it was trained for \(llmManager.loadedTrainedContext)."
+                                     : "Maximum for this device: \(ceiling) tokens.")
+                                    .font(.system(size: 11))
+                                    .foregroundColor(Theme.textMuted)
+                            }
+                        }
+                        }
+
+
+                        Divider().background(Theme.border)
+
+                        // Same reasoning as the Context Window gate above: a Core ML model's
+                        // reply is always cut off by its own context window (128 tokens total
+                        // for OpenELM; the sliding cache's own bookkeeping for the Llama
+                        // pipeline) long before this slider's value could ever bind — showing
+                        // it un-gated offered a number the model could structurally never
+                        // reach, e.g. "512 tokens" sitting next to a model capped at 128 total.
+                        if llmManager.activeBackend == .coreML {
+                            Text("Reply length for this Core ML model is bounded by its context window above, not by a separate output limit.")
+                                .font(.system(size: 11))
+                                .foregroundColor(Theme.textMuted)
+                                .fixedSize(horizontal: false, vertical: true)
+                        } else {
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack {
+                                Text("Max Output Limit:")
+                                    .font(.system(size: 13))
+                                    .foregroundColor(Theme.textSecondary)
+                                Spacer()
+                                Text("\(llmManager.maxTokens) tokens")
+                                    .font(.system(size: 13, weight: .bold, design: .monospaced))
+                                    .foregroundColor(Theme.accent)
+                            }
+
+                            Slider(value: Binding(
+                                get: { Double(llmManager.maxTokens) },
+                                set: { llmManager.maxTokens = Int($0) }
+                            ), in: 64...8192, step: 128)
+                            .accentColor(Theme.accent)
+                            .accessibilityLabel("Max output limit")
+                            .accessibilityValue("\(llmManager.maxTokens) tokens")
+                        }
+                        }
+
+                        Divider().background(Theme.border)
+                        
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack {
+                                Text("Temperature (Creativity):")
+                                    .font(.system(size: 13))
+                                    .foregroundColor(Theme.textSecondary)
+                                Spacer()
+                                if llmManager.highVariabilityEnabled {
+                                    Text("HIGH (2.50)")
+                                        .font(.system(size: 13, weight: .bold, design: .monospaced))
+                                        .foregroundColor(.orange)
+                                } else {
+                                    Text(String(format: "%.2f", llmManager.temperature))
+                                        .font(.system(size: 13, weight: .bold, design: .monospaced))
+                                        .foregroundColor(Theme.accent)
+                                }
+                            }
+                            
+                            Slider(value: $llmManager.temperature, in: 0.0...2.0, step: 0.05)
+                                .accentColor(llmManager.highVariabilityEnabled ? .gray : Theme.accent)
+                                .disabled(llmManager.highVariabilityEnabled)
+                                .opacity(llmManager.highVariabilityEnabled ? 0.5 : 1.0)
+                                .accessibilityLabel("Temperature, creativity")
+                                .accessibilityValue(llmManager.highVariabilityEnabled ? "High, 2.50, overridden by High Variability" : String(format: "%.2f", llmManager.temperature))
+
+                            Toggle(isOn: $llmManager.highVariabilityEnabled) {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("High Variability")
+                                        .font(.system(size: 13))
+                                        .foregroundColor(llmManager.highVariabilityEnabled ? .orange : Theme.textSecondary)
+                                    Text("Overrides temperature with a very high value. Output becomes far less predictable.")
+                                        .font(.system(size: 11))
+                                        .foregroundColor(Theme.textMuted)
+                                }
+                            }
+                            .toggleStyle(SwitchToggleStyle(tint: .orange))
+                        }
+                    }
+                    .glassCard(cornerRadius: 16)
+    }
+
+    private var ragConfigCard: some View {
+                    VStack(alignment: .leading, spacing: 14) {
+                        HStack {
+                            Image(systemName: "doc.text.magnifyingglass")
+                                .foregroundColor(Theme.accentCyan)
+                            Text("RAG CONFIG")
+                                .font(.system(size: 14, weight: .bold))
+                                .foregroundColor(Theme.textPrimary)
+                                .kerning(1.2)
+                            Spacer()
+                            Toggle("", isOn: $enableRAG)
+                                .toggleStyle(SwitchToggleStyle(tint: Theme.accent))
+                                .labelsHidden()
+                                .accessibilityLabel("RAG")
+                                .accessibilityValue(enableRAG ? "On" : "Off")
+                        }
+                        
+                        if enableRAG {
+                            Divider().background(Theme.border)
+                            NavigationLink(destination: MindscapeView(ragManager: ragManager)) {
+                                HStack {
+                                    Image(systemName: "brain.filled.head.profile")
+                                        .foregroundColor(Theme.accentCyan)
+                                    Text("Open Mindscape")
+                                        .font(.system(size: 14, weight: .bold))
+                                        .foregroundColor(Theme.textPrimary)
+                                    Spacer()
+                                    Image(systemName: "chevron.right")
+                                        .foregroundColor(Theme.textSecondary)
+                                        .font(.system(size: 12))
+                                }
+                                .padding(.vertical, 8)
+                            }
+                        }
+                    }
+                    .glassCard(cornerRadius: 16)
+    }
+
+    private var conversationalMemoriesCard: some View {
+                    VStack(alignment: .leading, spacing: 14) {
+                        HStack {
+                            Image(systemName: "brain.head.profile")
+                                .foregroundColor(Theme.accentRose)
+                            Text("CONVERSATIONAL MEMORIES")
+                                .font(.system(size: 14, weight: .bold))
+                                .foregroundColor(Theme.textPrimary)
+                                .kerning(1.2)
+                            Spacer()
+                            Toggle("", isOn: $enableMemories)
+                                .toggleStyle(SwitchToggleStyle(tint: Theme.accentRose))
+                                .labelsHidden()
+                                .accessibilityLabel("Conversational memories")
+                                .accessibilityValue(enableMemories ? "On" : "Off")
+                        }
+                        
+                        if enableMemories {
+                            Divider().background(Theme.border)
+                            
+                            HStack {
+                                Text("EXTRACTED PREFERENCES")
+                                    .font(.system(size: 11, weight: .semibold))
+                                    .foregroundColor(Theme.textSecondary)
+                                Spacer()
+                                Button(action: { showClearMemoriesAlert = true }) {
+                                    Text("Clear All")
+                                        .font(.system(size: 12, weight: .semibold))
+                                        .foregroundColor(.red.opacity(0.8))
+                                }
+                            }
+                            
+                            if memoryManager.memories.isEmpty {
+                                Text("No memories extracted yet. Tell DarkAI things like 'I prefer Python' or 'My name is John' to build long-term memory.")
+                                    .font(.system(size: 13))
+                                    .foregroundColor(Theme.textMuted)
+                                    .padding(.vertical, 8)
+                            } else {
+                                VStack(alignment: .leading, spacing: 8) {
+                                    ForEach(Array(memoryManager.memories.enumerated()), id: \.element.id) { index, memory in
+                                        memoryRow(memory, index: index)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    .glassCard(cornerRadius: 16)
+    }
+
+    private var internetAccessCard: some View {
+                    VStack(alignment: .leading, spacing: 14) {
+                        HStack {
+                            Image(systemName: "globe")
+                                .foregroundColor(Theme.accentCyan)
+                            Text("INTERNET ACCESS")
+                                .font(.system(size: 14, weight: .bold))
+                                .foregroundColor(Theme.textPrimary)
+                                .kerning(1.2)
+                            Spacer()
+                            Toggle("", isOn: $webSearchManager.isEnabled)
+                                .toggleStyle(SwitchToggleStyle(tint: Theme.accentCyan))
+                                .labelsHidden()
+                                .accessibilityLabel("Internet access")
+                                .accessibilityValue(webSearchManager.isEnabled ? "On" : "Off")
+                        }
+
+                        Text("Off by default — \(AppInfo.displayName) never uses the internet on its own. When on, the assistant will *ask* before searching for anything (like current weather or recent events); it never searches automatically. Only your search text is sent out, to Open-Meteo, DuckDuckGo, and — if you add a key below — Brave. No account, no identifiers.")
+                            .font(.system(size: 12))
+                            .foregroundColor(Theme.textSecondary)
+                            .lineSpacing(3)
+
+                        if webSearchManager.isEnabled {
+                            Divider().background(Theme.border)
+
+                            Text("SEARCH API KEY (OPTIONAL)")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundColor(Theme.textSecondary)
+
+                            Text("Weather, and factual questions Wikipedia can answer, already work for free with no setup. A Brave Search API key adds real web search — needed for recent news, live scores, prices, and anything else that changes day to day.")
+                                .font(.system(size: 12))
+                                .foregroundColor(Theme.textMuted)
+
+                            SecureField("Brave Search API key", text: $webSearchManager.braveAPIKey)
+                                .font(.system(size: 13, design: .monospaced))
+                                .padding(10)
+                                .background(Theme.background.opacity(0.4))
+                                .cornerRadius(8)
+                                .overlay(RoundedRectangle(cornerRadius: 8).stroke(Theme.border, lineWidth: 1))
+                                .autocorrectionDisabled()
+                                #if os(iOS)
+                                .textInputAutocapitalization(.never)
+                                #endif
+
+                            HStack(spacing: 6) {
+                                Image(systemName: webSearchManager.hasBraveKey ? "checkmark.circle.fill" : "info.circle")
+                                    .foregroundColor(webSearchManager.hasBraveKey ? .green : Theme.textMuted)
+                                    .font(.system(size: 11))
+                                Text(webSearchManager.hasBraveKey
+                                     ? "Key saved on this device (Keychain) — full web search is active."
+                                     : "No key set — searches use the free weather and Wikipedia lookups, which can't answer questions about recent events.")
+                                    .font(.system(size: 11))
+                                    .foregroundColor(Theme.textMuted)
+                            }
+
+                            if let braveAPIKeyURL = URL(string: "https://brave.com/search/api/") {
+                            Link(destination: braveAPIKeyURL) {
+                                HStack(spacing: 4) {
+                                    Text("Get a Brave Search API key")
+                                    Image(systemName: "arrow.up.right")
+                                }
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundColor(Theme.accentCyan)
+                            }
+                            }
+                        }
+                    }
+                    .glassCard(cornerRadius: 16)
+    }
+
+    /// Chat-only in this first version, on purpose — see `WebPortalManager`'s doc comment.
+    /// Settings, image generation, and file uploads still require the app itself.
+    private var webPortalCard: some View {
+                    VStack(alignment: .leading, spacing: 14) {
+                        HStack {
+                            Image(systemName: "network")
+                                .foregroundColor(Theme.accentCyan)
+                            Text("WEB PORTAL")
+                                .font(.system(size: 14, weight: .bold))
+                                .foregroundColor(Theme.textPrimary)
+                                .kerning(1.2)
+                            Spacer()
+                            Toggle("", isOn: $webPortal.isEnabled)
+                                .toggleStyle(SwitchToggleStyle(tint: Theme.accentCyan))
+                                .labelsHidden()
+                                .accessibilityLabel("Web Portal")
+                                .accessibilityValue(webPortal.isEnabled ? "On" : "Off")
+                        }
+
+                        Text("Off by default. When on, \(AppInfo.displayName) serves a chat page on your local Wi-Fi network — open the address below in a browser on another device on the *same* network to keep chatting from there. There's no external server involved and nothing leaves your Wi-Fi; a PIN gates access.")
+                            .font(.system(size: 12))
+                            .foregroundColor(Theme.textSecondary)
+                            .lineSpacing(3)
+
+                        if webPortal.isEnabled {
+                            Divider().background(Theme.border)
+
+                            if webPortal.isRunning, let address = webPortal.addressDescription {
+                                HStack(spacing: 6) {
+                                    Image(systemName: "checkmark.circle.fill")
+                                        .foregroundColor(.green)
+                                        .font(.system(size: 11))
+                                    Text("Running")
+                                        .font(.system(size: 11, weight: .semibold))
+                                        .foregroundColor(Theme.textSecondary)
+                                }
+
+                                Text("ADDRESS")
+                                    .font(.system(size: 11, weight: .semibold))
+                                    .foregroundColor(Theme.textSecondary)
+
+                                Text(address)
+                                    .font(.system(size: 15, weight: .bold, design: .monospaced))
+                                    .foregroundColor(Theme.textPrimary)
+                                    .textSelection(.enabled)
+                                    .padding(10)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .background(Theme.background.opacity(0.4))
+                                    .cornerRadius(8)
+                                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(Theme.border, lineWidth: 1))
+                            } else if let error = webPortal.lastError {
+                                HStack(alignment: .top, spacing: 6) {
+                                    Image(systemName: "exclamationmark.triangle.fill")
+                                        .foregroundColor(.orange)
+                                        .font(.system(size: 11))
+                                    Text(error)
+                                        .font(.system(size: 12))
+                                        .foregroundColor(Theme.textSecondary)
+                                }
+                            }
+
+                            Text("PIN")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundColor(Theme.textSecondary)
+
+                            HStack {
+                                Text(webPortal.pin)
+                                    .font(.system(size: 22, weight: .bold, design: .monospaced))
+                                    .foregroundColor(Theme.accentCyan)
+                                    .kerning(4)
+                                    .textSelection(.enabled)
+                                    .accessibilityLabel("PIN \(webPortal.pin.map(String.init).joined(separator: " "))")
+
+                                Spacer()
+
+                                Button {
+                                    webPortal.regeneratePin()
+                                } label: {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: "arrow.clockwise")
+                                        Text("Regenerate")
+                                    }
+                                    .font(.system(size: 12, weight: .semibold))
+                                    .foregroundColor(Theme.accentCyan)
+                                }
+                            }
+                            .padding(10)
+                            .background(Theme.background.opacity(0.4))
+                            .cornerRadius(8)
+                            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Theme.border, lineWidth: 1))
+
+                            Text("Enter this PIN once per browser to sign in — after that, the browser is remembered below and won't ask again. Regenerating the PIN forgets every remembered browser at once.")
+                                .font(.system(size: 11))
+                                .foregroundColor(Theme.textMuted)
+
+                            if !webPortal.devices.isEmpty {
+                                Divider().background(Theme.border)
+
+                                Text("REMEMBERED BROWSERS")
+                                    .font(.system(size: 11, weight: .semibold))
+                                    .foregroundColor(Theme.textSecondary)
+
+                                VStack(alignment: .leading, spacing: 8) {
+                                    ForEach(webPortal.devices) { device in
+                                        webPortalDeviceRow(device)
+                                    }
+                                }
+                            }
+
+                            Text("Chat only for now — settings, image generation, and file uploads still need the app on your phone.")
+                                .font(.system(size: 11))
+                                .foregroundColor(Theme.textMuted)
+                        }
+                    }
+                    .glassCard(cornerRadius: 16)
+    }
+
+    /// One remembered Web Portal browser. Follows the same "draft until Save" pattern as
+    /// `feedbackRow`'s delete affordance — the name field starts as an editable guess derived from
+    /// the browser's own User-Agent string (`WebPortalManager.friendlyName`), and "Save" only
+    /// appears once the draft actually differs from what's stored, so an idle glance at the list
+    /// never shows a stray commit button.
+    @ViewBuilder
+    private func webPortalDeviceRow(_ device: WebPortalDevice) -> some View {
+        let draft = Binding<String>(
+            get: { webPortalDeviceNameDrafts[device.id] ?? device.name },
+            set: { webPortalDeviceNameDrafts[device.id] = $0 }
+        )
+        let isDirty = (webPortalDeviceNameDrafts[device.id] ?? device.name) != device.name
+
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                TextField("Device name", text: draft)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(Theme.textPrimary)
+                    .textFieldStyle(.plain)
+
+                if isDirty {
+                    Button {
+                        webPortal.renameDevice(id: device.id, name: draft.wrappedValue)
+                        webPortalDeviceNameDrafts[device.id] = nil
+                    } label: {
+                        Text("Save")
+                            .font(.system(size: 11, weight: .bold))
+                            .foregroundColor(Theme.accentCyan)
+                    }
+                }
+
+                Button {
+                    webPortal.removeDevice(id: device.id)
+                    webPortalDeviceNameDrafts[device.id] = nil
+                } label: {
+                    Image(systemName: "trash")
+                        .font(.system(size: 12))
+                        .foregroundColor(Theme.textSecondary)
+                }
+                .accessibilityLabel("Remove \(device.name)")
+            }
+
+            HStack(spacing: 4) {
+                Text("Last active")
+                Text(device.lastSeen, style: .relative)
+            }
+            .font(.system(size: 10))
+            .foregroundColor(Theme.textMuted)
+        }
+        .padding(10)
+        .background(Theme.background.opacity(0.4))
+        .cornerRadius(8)
+    }
+
+    private var personalityMatrixCard: some View {
+                    VStack(alignment: .leading, spacing: 12) {
+                        HStack {
+                            Image(systemName: "person.text.rectangle")
+                                .foregroundColor(Theme.accentRose)
+                            Text("Personality Matrix")
+                                .font(.system(size: 14, weight: .bold))
+                                .foregroundColor(Theme.textPrimary)
+                            Spacer()
+                            if personalityManager.isMature {
+                                Text("[ADAPTED]")
+                                    .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                    .foregroundColor(Theme.onAccent)
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 4)
+                                    .background(Theme.accentRose)
+                                    .cornerRadius(6)
+                            } else {
+                                Text("[LEARNING...]")
+                                    .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                    .foregroundColor(Theme.textSecondary)
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 4)
+                                    .background(Theme.textSecondary.opacity(0.2))
+                                    .cornerRadius(6)
+                            }
+                            
+                            Text(personalityManager.databaseSizeString)
+                                .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                .foregroundColor(Theme.accentRose)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4)
+                                .background(Theme.accentRose.opacity(0.15))
+                                .cornerRadius(6)
+                        }
+                        
+                        Text("\(AppInfo.displayName) gradually adapts its tone to how you write. It builds one profile shared by every model, and everything it learns stays on this device. Resetting erases it completely.")
+                            .font(.system(size: 13))
+                            .foregroundColor(Theme.textSecondary)
+                            .lineSpacing(4)
+                        
+                        Button(action: {
+                            showResetPersonalityAlert = true
+                        }) {
+                            HStack {
+                                Image(systemName: "trash")
+                                Text("Reset Personality")
+                            }
+                            .font(.system(size: 13, weight: .bold))
+                            .foregroundColor(Theme.textPrimary)
+                            .padding(.vertical, 10)
+                            .frame(maxWidth: .infinity)
+                            .background(Theme.accentRose.opacity(0.2))
+                            .cornerRadius(8)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 8)
+                                    .stroke(Theme.accentRose.opacity(0.5), lineWidth: 1)
+                            )
+                        }
+                        .alert("Reset Personality?", isPresented: $showResetPersonalityAlert) {
+                            Button("Cancel", role: .cancel) { }
+                            Button("Reset", role: .destructive) {
+                                personalityManager.resetPersonality()
+                            }
+                        } message: {
+                            Text("This will erase every learned speech pattern, for all models. This action cannot be undone.")
+                        }
+                    }
+                    .glassCard(cornerRadius: 16)
+    }
+
+    /// Review surface for the rate-up/rate-down feedback left on individual replies (see the
+    /// message context menu in `ContentView.swift`). Shown here for the same reason
+    /// `conversationalMemoriesCard` shows extracted memories: whatever's quietly shaping future
+    /// prompts should stay inspectable and removable, not just something the user is told exists.
+    private var responseFeedbackCard: some View {
+                    VStack(alignment: .leading, spacing: 14) {
+                        Button(action: { withAnimation(.easeInOut(duration: 0.2)) { showFeedbackDetail.toggle() } }) {
+                            HStack {
+                                Image(systemName: "hand.thumbsup")
+                                    .foregroundColor(Theme.accentCyan)
+                                Text("RESPONSE FEEDBACK")
+                                    .font(.system(size: 14, weight: .bold))
+                                    .foregroundColor(Theme.textPrimary)
+                                    .kerning(1.2)
+                                Spacer()
+                                let upCount = feedbackManager.feedback.filter { $0.rating == .up }.count
+                                let downCount = feedbackManager.feedback.filter { $0.rating == .down }.count
+                                Text("\(upCount) up · \(downCount) down")
+                                    .font(.system(size: 11, weight: .semibold))
+                                    .foregroundColor(Theme.textSecondary)
+                                Image(systemName: showFeedbackDetail ? "chevron.up" : "chevron.down")
+                                    .font(.system(size: 11, weight: .bold))
+                                    .foregroundColor(Theme.textSecondary)
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+
+                        if showFeedbackDetail {
+                        Text("Rate a reply from its context menu (touch and hold it). Down-voted replies teach the assistant what to avoid in future responses — up-votes are just kept here for your own reference.")
+                            .font(.system(size: 12))
+                            .foregroundColor(Theme.textMuted)
+
+                        if !feedbackManager.avoidDirectives.isEmpty {
+                            Divider().background(Theme.border)
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text("CURRENTLY AVOIDING")
+                                    .font(.system(size: 11, weight: .semibold))
+                                    .foregroundColor(Theme.textSecondary)
+                                Text(feedbackManager.avoidDirectives)
+                                    .font(.system(size: 12))
+                                    .foregroundColor(Theme.textPrimary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                            .padding(10)
+                            .background(Theme.background.opacity(0.4))
+                            .cornerRadius(8)
+                        }
+
+                        let allDownVotes = feedbackManager.feedback.filter { $0.rating == .down }.reversed()
+                        // Capped display, not a capped store — `feedbackManager` keeps everything up
+                        // to its own `maxStoredFeedback`; this just stops one prolific down-voter
+                        // from turning an already-expanded card into an unbounded scroll of rows.
+                        let downVotes = Array(allDownVotes.prefix(15))
+                        if !downVotes.isEmpty {
+                            Divider().background(Theme.border)
+                            HStack {
+                                Text("DOWN-VOTED REPLIES")
+                                    .font(.system(size: 11, weight: .semibold))
+                                    .foregroundColor(Theme.textSecondary)
+                                Spacer()
+                                Button(action: { showClearFeedbackAlert = true }) {
+                                    Text("Clear All")
+                                        .font(.system(size: 12, weight: .semibold))
+                                        .foregroundColor(.red.opacity(0.8))
+                                }
+                            }
+                            VStack(alignment: .leading, spacing: 8) {
+                                ForEach(downVotes, id: \.id) { entry in
+                                    feedbackRow(entry)
+                                }
+                            }
+                            if allDownVotes.count > downVotes.count {
+                                Text("+ \(allDownVotes.count - downVotes.count) more not shown")
+                                    .font(.system(size: 11))
+                                    .foregroundColor(Theme.textMuted)
+                            }
+                        }
+                        } // end if showFeedbackDetail
+                    }
+                    .alert("Clear All Feedback?", isPresented: $showClearFeedbackAlert) {
+                        Button("Cancel", role: .cancel) { }
+                        Button("Clear All", role: .destructive) {
+                            feedbackManager.clearAll()
+                        }
+                    } message: {
+                        Text("This removes every rating and stops steering replies away from anything you've down-voted. This can't be undone.")
+                    }
+                    .glassCard(cornerRadius: 16)
+    }
+
+    private func feedbackRow(_ entry: ResponseFeedback) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(entry.userPrompt)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(Theme.textPrimary)
+                        .lineLimit(2)
+                    Text(entry.assistantResponse)
+                        .font(.system(size: 12))
+                        .foregroundColor(Theme.textSecondary)
+                        .lineLimit(2)
+                    if let reason = entry.reason {
+                        Text("Reason: \(reason)")
+                            .font(.system(size: 11))
+                            .foregroundColor(Theme.textMuted)
+                            .lineLimit(2)
+                    }
+                }
+                Spacer(minLength: 4)
+                Button(action: { feedbackManager.delete(entry.id) }) {
+                    Image(systemName: "xmark.circle")
+                        .foregroundColor(Theme.textSecondary)
+                        .font(.system(size: 14))
+                }
+                .accessibilityLabel("Delete feedback")
+            }
+        }
+        .padding(8)
+        .background(Theme.background.opacity(0.4))
+        .cornerRadius(8)
+    }
+
+    private var troubleshootingCard: some View {
+                    VStack(alignment: .leading, spacing: 14) {
+                        HStack {
+                            Image(systemName: "arrow.clockwise.circle")
+                                .foregroundColor(Theme.accentCyan)
+                            Text("TROUBLESHOOTING")
+                                .font(.system(size: 14, weight: .bold))
+                                .foregroundColor(Theme.textPrimary)
+                                .kerning(1.2)
+                            Spacer()
+                        }
+
+                        ResetModelsButton(llmManager: llmManager, diffusionManager: diffusionManager)
+                    }
+                    .glassCard(cornerRadius: 16)
+    }
+
+    private var diagnosticsLogsCard: some View {
+                    VStack(alignment: .leading, spacing: 14) {
+                        HStack {
+                            Image(systemName: "ladybug")
+                                .foregroundColor(.yellow)
+                            Text("DIAGNOSTICS LOGS")
+                                .font(.system(size: 14, weight: .bold))
+                                .foregroundColor(Theme.textPrimary)
+                                .kerning(1.2)
+                            Spacer()
+                        }
+                        
+                        Divider().background(Theme.border)
+                        
+                        NavigationLink {
+                            LogExportView()
+                        } label: {
+                            HStack {
+                                Text("View & Export Logs")
+                                    .font(.system(size: 13, weight: .medium))
+                                    .foregroundColor(Theme.textPrimary)
+                                Spacer()
+                                Image(systemName: "chevron.right")
+                                    .font(.system(size: 12))
+                                    .foregroundColor(Theme.textSecondary)
+                            }
+                            .padding()
+                            .background(Theme.cardBackground)
+                            .cornerRadius(12)
+                        }
+                    }
+                    .glassCard(cornerRadius: 16)
+    }
+
+    private var safetyLegalCard: some View {
+                    VStack(alignment: .leading, spacing: 14) {
+                        HStack {
+                            Image(systemName: "checkmark.shield.fill")
+                                .foregroundColor(.green)
+                            Text("SAFETY & LEGAL")
+                                .font(.system(size: 14, weight: .bold))
+                                .foregroundColor(Theme.textPrimary)
+                                .kerning(1.2)
+                            Spacer()
+                        }
+
+                        Divider().background(Theme.border)
+
+                        // Surfaced here rather than only in the Diffusion card: this is about
+                        // what happens to a generated image after the fact, which reads as a
+                        // safety posture more than an image-gen tuning knob. Pulled out to its
+                        // own view (rather than inlined) partly for reuse and partly because
+                        // this card's ViewBuilder body is already large enough that the type
+                        // checker times out on one more inline conditional branch.
+                        imageSafetyWarningBanner
+
+                        NavigationLink {
+                            SafetyLegalView()
+                        } label: {
+                            HStack {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text("Content Policy, Terms & Reporting")
+                                        .font(.system(size: 13, weight: .medium))
+                                        .foregroundColor(Theme.textPrimary)
+                                    Text("Filter is always on · Report generated content")
+                                        .font(.system(size: 11))
+                                        .foregroundColor(Theme.textMuted)
+                                }
+                                Spacer()
+                                Image(systemName: "chevron.right")
+                                    .font(.system(size: 12))
+                                    .foregroundColor(Theme.textSecondary)
+                            }
+                            .padding()
+                            .background(Theme.cardBackground)
+                            .cornerRadius(12)
+                        }
+
+                        Divider().background(Theme.border)
+
+                        HStack {
+                            Text("Storage used by \(AppInfo.displayName)")
+                                .font(.system(size: 13))
+                                .foregroundColor(Theme.textSecondary)
+                            Spacer()
+                            Text(String(format: "%.2f GB", storageUsedGB))
+                                .font(.system(size: 13, weight: .bold, design: .monospaced))
+                                .foregroundColor(Theme.accentCyan)
+                        }
+
+                        Text("Models, generated images, and logs are stored on this device only and are excluded from iCloud backup. Deleting the app removes all of it.")
+                            .font(.system(size: 11))
+                            .foregroundColor(Theme.textMuted)
+                            .lineSpacing(3)
+                    }
+                    .glassCard(cornerRadius: 16)
+    }
+
+    /// Extracted out of `body` (like `imageSafetyWarningBanner` above it) purely to keep the
+    /// type checker's per-expression budget from tipping over — the top-level `body` ViewBuilder
+    /// closure is long enough on its own that one more large inline card risks a "reasonable
+    /// time" type-check failure, independent of this card's own complexity.
+    private var appearanceCard: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Image(systemName: "paintbrush.fill")
+                    .foregroundColor(Theme.accentCyan)
+                Text("APPEARANCE")
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundColor(Theme.textPrimary)
+                    .kerning(1.2)
+                Spacer()
+            }
+
+            VStack(spacing: 0) {
+                ForEach(AppearanceMode.allCases) { mode in
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            appearance.mode = mode
+                        }
+                    } label: {
+                        HStack(spacing: 12) {
+                            Image(systemName: mode.icon)
+                                .foregroundColor(appearance.mode == mode ? Theme.accent : Theme.textSecondary)
+                                .frame(width: 22)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(mode.title)
+                                    .font(.system(size: 14, weight: .medium))
+                                    .foregroundColor(Theme.textPrimary)
+                                Text(mode.subtitle)
+                                    .font(.system(size: 11))
+                                    .foregroundColor(Theme.textMuted)
+                            }
+                            Spacer()
+                            Image(systemName: appearance.mode == mode ? "largecircle.fill.circle" : "circle")
+                                .foregroundColor(appearance.mode == mode ? Theme.accent : Theme.textMuted)
+                        }
+                        .padding(.vertical, 11)
+                        .contentShape(Rectangle())
+                    }
+                    if mode != AppearanceMode.allCases.last {
+                        Divider().background(Theme.border)
+                    }
+                }
+            }
+
+            Text("This changes the app's colors and text contrast. The Home Screen icon stays the same in every mode.")
+                .font(.system(size: 11))
+                .foregroundColor(Theme.textMuted)
+                .lineSpacing(3)
+        }
+        .glassCard(cornerRadius: 16)
+    }
+
+    @ViewBuilder
+    private var imageSafetyWarningBanner: some View {
+        if !ImageSafetyAnalyzer.isSystemAnalyzerAvailable {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundColor(.orange)
+                    .font(.system(size: 13))
+                Text("Enhanced on-device image safety analysis isn't available on this device — a more basic filter is used instead.")
+                    .font(.system(size: 12))
+                    .foregroundColor(Theme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(10)
+            .background(Color.orange.opacity(0.12))
+            .cornerRadius(10)
+            .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.orange.opacity(0.4), lineWidth: 1))
+        }
+    }
+
     /// Shown when a model the app recorded as installed is no longer on disk.
     ///
     /// Without this the same situation renders as an empty model list, which reads as "the update
@@ -1414,7 +2033,6 @@ struct SettingsView: View {
         }
     }
 
-    /// A row for a catalog model not yet installed — the list this appears in already filters
     /// Lists every catalog model, whether installed or not, so its details stay readable either
     /// way — only the trailing control (checkmark / Get / Resume / progress) changes per state.
     @ViewBuilder
@@ -1515,7 +2133,7 @@ struct SettingsView: View {
                         .foregroundColor(.orange)
                         .fixedSize(horizontal: false, vertical: true)
                     Spacer(minLength: 4)
-                    Button("Discard") { downloads.discardPartial(for: model) }
+                    Button("Discard") { pendingDeletion = .partialDownload(model) }
                         .font(.system(size: 10, weight: .semibold))
                         .foregroundColor(Theme.textMuted)
                 }
@@ -1553,7 +2171,7 @@ struct SettingsView: View {
             
             HStack(spacing: 8) {
                 if !isLoaded {
-                    Button(action: { deleteModel(at: url, isDiffusion: false) }) {
+                    Button(action: { pendingDeletion = .llmModel(url) }) {
                         Image(systemName: "trash")
                             .font(.system(size: 12))
                             .foregroundColor(Theme.textSecondary)
@@ -1562,8 +2180,9 @@ struct SettingsView: View {
                             .background(Theme.border)
                             .cornerRadius(8)
                     }
+                    .accessibilityLabel("Delete \(url.lastPathComponent)")
                 }
-            
+
                 if isLoaded {
                 Button(action: {
                     llmManager.unloadModel()
@@ -1631,7 +2250,7 @@ struct SettingsView: View {
 
             HStack(spacing: 8) {
                 if !isLoaded {
-                    Button(action: { deleteCoreMLModel(at: url) }) {
+                    Button(action: { pendingDeletion = .coreMLModel(url) }) {
                         Image(systemName: "trash")
                             .font(.system(size: 12))
                             .foregroundColor(Theme.textSecondary)
@@ -1640,6 +2259,7 @@ struct SettingsView: View {
                             .background(Theme.border)
                             .cornerRadius(8)
                     }
+                    .accessibilityLabel("Delete \(url.lastPathComponent)")
                 }
 
                 if isLoaded {
@@ -1788,15 +2408,36 @@ struct SettingsView: View {
             .map { installDirectory.appendingPathComponent($0.fileName) }
     }
 
+    /// Carries out whichever destructive action the user just confirmed in the shared
+    /// `pendingDeletion` alert.
+    private func confirmPendingDeletion(_ deletion: PendingDeletion) {
+        switch deletion {
+        case .llmModel(let url):
+            deleteModel(at: url, isDiffusion: false)
+        case .coreMLModel(let url):
+            deleteCoreMLModel(at: url)
+        case .diffusionModel(let url):
+            deleteModel(at: url, isDiffusion: true)
+        case .partialDownload(let model):
+            downloads.discardPartial(for: model)
+        }
+        pendingDeletion = nil
+    }
+
     private func deleteCoreMLModel(at url: URL) {
         do {
             if FileManager.default.fileExists(atPath: url.path) {
                 try FileManager.default.removeItem(at: url)
             }
             ModelInventory.shared.forget(fileName: url.lastPathComponent, kind: .coreML)
+            // `ModelDownloadManager.isInstalled` caches its result — a deliberate deletion is the
+            // other event (besides a download completing) that can change what it returns.
+            if let catalogModel = ModelCatalog.model(withFileName: url.lastPathComponent) {
+                downloads.invalidateInstalledCache(for: catalogModel.id)
+            }
             refreshCoreMLModelList()
         } catch {
-            print("Failed to delete Core ML model: \(error.localizedDescription)")
+            LogManager.shared.log("Failed to delete Core ML model: \(error.localizedDescription)")
         }
     }
 
@@ -1808,13 +2449,16 @@ struct SettingsView: View {
             // Drop the ledger entry too, so a deliberate deletion is never reported back as a
             // model that went missing on its own.
             ModelInventory.shared.forget(fileName: url.lastPathComponent, kind: isDiffusion ? .diffusion : .chat)
+            if let catalogModel = ModelCatalog.model(withFileName: url.lastPathComponent) {
+                downloads.invalidateInstalledCache(for: catalogModel.id)
+            }
             if isDiffusion {
                 loadDiffusionModels()
             } else {
                 refreshModelList()
             }
         } catch {
-            print("Failed to delete model: \(error.localizedDescription)")
+            LogManager.shared.log("Failed to delete model: \(error.localizedDescription)")
         }
     }
     
@@ -1929,7 +2573,7 @@ struct SettingsView: View {
 
             HStack(spacing: 8) {
                 if !isSelected {
-                    Button(action: { deleteModel(at: url, isDiffusion: true) }) {
+                    Button(action: { pendingDeletion = .diffusionModel(url) }) {
                         Image(systemName: "trash")
                             .font(.system(size: 12))
                             .foregroundColor(Theme.textSecondary)
@@ -1938,6 +2582,7 @@ struct SettingsView: View {
                             .background(Theme.cardBackground)
                             .overlay(RoundedRectangle(cornerRadius: 6).stroke(Theme.border, lineWidth: 1))
                     }
+                    .accessibilityLabel("Delete \(url.lastPathComponent)")
                 }
             
                 if isSelected {
@@ -2166,6 +2811,13 @@ private struct MindscapeDocumentRow: View {
     let doc: RAGDocument
     @ObservedObject var ragManager: RAGManager
 
+    /// Decoded once via `.task(id:)` below and cached in `DecodedImageCache` — without this,
+    /// `ragManager.imageData(for:)` (a disk read) and `UIImage(data:)` (a decode) ran inline in
+    /// `body`, so every visible image row re-read-and-redecoded from disk on every unrelated
+    /// `ragManager` publish (any document added anywhere, not just this one), not just on first
+    /// render.
+    @State private var decodedImage: UIImage? = nil
+
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
@@ -2181,13 +2833,17 @@ private struct MindscapeDocumentRow: View {
                     Image(systemName: "trash")
                         .foregroundColor(.red)
                 }
+                .accessibilityLabel("Delete \(doc.name)")
             }
 
-            if doc.imageFileName != nil,
-               let imgData = ragManager.imageData(for: doc),
-               let uiImage = UIImage(data: imgData),
-               let imageURL = ragManager.imageURL(for: doc) {
-                MindscapeImageContent(doc: doc, uiImage: uiImage, imageURL: imageURL)
+            if doc.imageFileName != nil {
+                if let uiImage = decodedImage, let imageURL = ragManager.imageURL(for: doc) {
+                    MindscapeImageContent(doc: doc, uiImage: uiImage, imageURL: imageURL)
+                } else {
+                    ProgressView()
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 220)
+                }
             } else {
                 MindscapeTextContent(doc: doc)
             }
@@ -2196,6 +2852,17 @@ private struct MindscapeDocumentRow: View {
         .background(Theme.cardBackground)
         .cornerRadius(12)
         .overlay(RoundedRectangle(cornerRadius: 12).stroke(Theme.border, lineWidth: 1))
+        .task(id: doc.imageFileName) {
+            guard let fileName = doc.imageFileName, decodedImage == nil else { return }
+            let key = "mindscape:\(fileName)" as NSString
+            if let cached = DecodedImageCache.shared.object(forKey: key) {
+                decodedImage = cached
+                return
+            }
+            guard let imgData = ragManager.imageData(for: doc), let image = UIImage(data: imgData) else { return }
+            DecodedImageCache.shared.setObject(image, forKey: key)
+            decodedImage = image
+        }
     }
 }
 
@@ -2255,7 +2922,7 @@ struct MindscapeView: View {
             )
 
             ScrollView {
-                VStack(spacing: 12) {
+                LazyVStack(spacing: 12) {
                     if ragManager.documents.isEmpty {
                         Text("No entries yet. Import a text document or a JSON study guide / journal below, or generate an image — generated images are added here automatically.")
                             .font(.system(size: 13))
@@ -2463,9 +3130,7 @@ struct MindscapeView: View {
             isParsingJSON = false
             switch outcome {
             case .success(let result):
-                for document in result.documents {
-                    ragManager.ingestDocument(name: document.name, content: document.content)
-                }
+                ragManager.ingestDocuments(result.documents.map { (name: $0.name, content: $0.content) })
                 withAnimation {
                     importNote = ImportNote(text: result.summary, isError: false, icon: result.kind.icon)
                 }
